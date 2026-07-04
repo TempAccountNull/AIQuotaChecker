@@ -1,0 +1,31 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.14.37301.10 d17.14
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AIQuotaChecker", "AIQuotaChecker.vcxproj", "{EFDDA04C-9D29-4B7E-8B38-01E8A2328AFB}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Debug|x86 = Debug|x86
+		Release|x64 = Release|x64
+		Release|x86 = Release|x86
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{EFDDA04C-9D29-4B7E-8B38-01E8A2328AFB}.Debug|x64.ActiveCfg = Debug|x64
+		{EFDDA04C-9D29-4B7E-8B38-01E8A2328AFB}.Debug|x64.Build.0 = Debug|x64
+		{EFDDA04C-9D29-4B7E-8B38-01E8A2328AFB}.Debug|x86.ActiveCfg = Debug|Win32
+		{EFDDA04C-9D29-4B7E-8B38-01E8A2328AFB}.Debug|x86.Build.0 = Debug|Win32
+		{EFDDA04C-9D29-4B7E-8B38-01E8A2328AFB}.Release|x64.ActiveCfg = Release|x64
+		{EFDDA04C-9D29-4B7E-8B38-01E8A2328AFB}.Release|x64.Build.0 = Release|x64
+		{EFDDA04C-9D29-4B7E-8B38-01E8A2328AFB}.Release|x86.ActiveCfg = Release|Win32
+		{EFDDA04C-9D29-4B7E-8B38-01E8A2328AFB}.Release|x86.Build.0 = Release|Win32
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {77B4C610-1C91-447B-BA65-7B3059AD6244}
+	EndGlobalSection
+EndGlobal
