@@ -46,7 +46,7 @@ const char* ResetTime::Description(int mode) const
 {
     switch (ClampMode(mode)) {
     case Flip:
-        return "Boxed flip-clock countdown with animated seconds";
+        return "Per-digit flip-clock countdown; changing digits flip in their own boxes";
     case Digital:
         return "Digital countdown with seconds";
     case Static:

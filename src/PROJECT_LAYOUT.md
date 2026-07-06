@@ -28,7 +28,8 @@ src/Providers/ZAi        Z.Ai provider, snapshot parser, notifier
 src/Tools                helper scripts
 ```
 
-- ResetTime: reset countdown modes, including static, digital, and boxed flip-clock rendering support.
+- ResetTime: reset countdown modes, including static, digital, and per-digit flip-clock rendering support.
+- Flip mode renders each HH:MM:SS digit as its own split box and flips only the digits that change.
 
 
 ## Global

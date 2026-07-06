@@ -231,15 +231,64 @@ static std::string DisplayPercentFromUiBar(const UiBar& bar)
     return text;
 }
 
-struct FlipClockSegment
+struct FlipClockElement
 {
-    std::string value;
-    bool animate = false;
+    enum Kind
+    {
+        Digit,
+        Separator,
+        Text
+    } kind = Text;
+
+    char digit = '0';
+    std::string text;
+    std::string key;
 };
 
-static std::vector<FlipClockSegment> BuildFlipClockSegments(long long resetAtUnixSeconds)
+struct FlipDigitVisualState
 {
-    long long secondsLeft = resetAtUnixSeconds - static_cast<long long>(std::time(nullptr));
+    char current = '\0';
+    char previous = '\0';
+    double changedAt = 0.0;
+};
+
+static std::unordered_map<std::string, FlipDigitVisualState> g_flipDigitStates;
+
+static void PushFlipDigit(std::vector<FlipClockElement>& elements, const std::string& keyPrefix, int& digitIndex, char value)
+{
+    FlipClockElement element;
+    element.kind = FlipClockElement::Digit;
+    element.digit = value;
+    element.key = keyPrefix + ":" + std::to_string(digitIndex++);
+    elements.push_back(element);
+}
+
+static void PushFlipDigits(std::vector<FlipClockElement>& elements, const std::string& keyPrefix, int& digitIndex, const std::string& value)
+{
+    for (char ch : value) {
+        PushFlipDigit(elements, keyPrefix, digitIndex, ch);
+    }
+}
+
+static void PushFlipText(std::vector<FlipClockElement>& elements, const std::string& text)
+{
+    FlipClockElement element;
+    element.kind = FlipClockElement::Text;
+    element.text = text;
+    elements.push_back(element);
+}
+
+static void PushFlipSeparator(std::vector<FlipClockElement>& elements, const std::string& text)
+{
+    FlipClockElement element;
+    element.kind = FlipClockElement::Separator;
+    element.text = text;
+    elements.push_back(element);
+}
+
+static std::vector<FlipClockElement> BuildFlipClockElements(const UiBar& bar)
+{
+    long long secondsLeft = bar.resetAtUnixSeconds - static_cast<long long>(std::time(nullptr));
 
     if (secondsLeft < 0) {
         secondsLeft = 0;
@@ -252,82 +301,213 @@ static std::vector<FlipClockSegment> BuildFlipClockSegments(long long resetAtUni
     long long minutes = secondsLeft / 60;
     long long seconds = secondsLeft % 60;
 
-    std::vector<FlipClockSegment> segments;
+    std::vector<FlipClockElement> elements;
+    std::string keyPrefix = bar.label + ":" + std::to_string(bar.resetAtUnixSeconds);
+    int digitIndex = 0;
 
     if (days > 0) {
-        segments.push_back({ std::to_string(days) + "d", false });
+        PushFlipDigits(elements, keyPrefix, digitIndex, std::to_string(days));
+        PushFlipText(elements, "d ");
     }
 
-    segments.push_back({ TwoDigit(hours), false });
-    segments.push_back({ TwoDigit(minutes), false });
-    segments.push_back({ TwoDigit(seconds), true });
-    return segments;
+    PushFlipDigits(elements, keyPrefix, digitIndex, TwoDigit(hours));
+    PushFlipSeparator(elements, ":");
+    PushFlipDigits(elements, keyPrefix, digitIndex, TwoDigit(minutes));
+    PushFlipSeparator(elements, ":");
+    PushFlipDigits(elements, keyPrefix, digitIndex, TwoDigit(seconds));
+    return elements;
 }
 
-static float FlipSegmentWidth(const std::string& value)
+static float FlipDigitWidth()
 {
-    return std::max(30.0f, ImGui::CalcTextSize(value.c_str()).x + 16.0f);
+    return 18.0f;
 }
 
-static float FlipClockWidth(const std::vector<FlipClockSegment>& segments, const std::string& percentText)
+static float FlipDigitHeight()
 {
-    const float gap = 5.0f;
-    const float colonGap = 5.0f;
+    return 24.0f;
+}
+
+static float FlipElementWidth(const FlipClockElement& element)
+{
+    if (element.kind == FlipClockElement::Digit) {
+        return FlipDigitWidth();
+    }
+
+    float textWidth = ImGui::CalcTextSize(element.text.c_str()).x;
+
+    if (element.kind == FlipClockElement::Separator) {
+        return textWidth + 6.0f;
+    }
+
+    return textWidth + 3.0f;
+}
+
+static float FlipClockWidth(const std::vector<FlipClockElement>& elements, const std::string& percentText)
+{
     float width = ImGui::CalcTextSize("Resets in").x + 8.0f;
 
-    for (size_t i = 0; i < segments.size(); ++i) {
-        width += FlipSegmentWidth(segments[i].value);
-
-        if (i + 1 < segments.size()) {
-            width += ImGui::CalcTextSize(":").x + colonGap * 2.0f;
-        }
+    for (const FlipClockElement& element : elements) {
+        width += FlipElementWidth(element);
     }
 
     if (!percentText.empty()) {
-        width += gap + ImGui::CalcTextSize(percentText.c_str()).x;
+        width += 8.0f + ImGui::CalcTextSize(percentText.c_str()).x;
     }
 
     return width;
 }
 
-static void DrawFlipSegment(ImDrawList* draw, ImVec2 pos, float width, float height, const std::string& value, bool animate)
+static bool UpdateFlipDigitState(const std::string& key, char value, char& current, char& previous, float& phase)
 {
-    const float rounding = 4.0f;
-    ImVec2 max(pos.x + width, pos.y + height);
-    ImVec2 midLeft(pos.x, pos.y + height * 0.5f);
-    ImVec2 midRight(pos.x + width, pos.y + height * 0.5f);
+    static constexpr double kFlipDurationSeconds = 0.58;
 
-    draw->AddRectFilled(pos, ImVec2(max.x, pos.y + height * 0.5f), Color(43, 43, 43), rounding, ImDrawFlags_RoundCornersTop);
-    draw->AddRectFilled(ImVec2(pos.x, pos.y + height * 0.5f), max, Color(25, 25, 25), rounding, ImDrawFlags_RoundCornersBottom);
-    draw->AddRect(pos, max, Color(86, 86, 86), rounding);
-    draw->AddLine(midLeft, midRight, Color(10, 10, 10));
-    draw->AddLine(ImVec2(pos.x + 1.0f, pos.y + height * 0.5f + 1.0f), ImVec2(pos.x + width - 1.0f, pos.y + height * 0.5f + 1.0f), Color(62, 62, 62));
+    double now = ImGui::GetTime();
+    FlipDigitVisualState& state = g_flipDigitStates[key];
 
-    if (animate) {
-        float phase = static_cast<float>(std::fmod(ImGui::GetTime(), 1.0));
-        int alpha = static_cast<int>((1.0f - phase) * 72.0f);
-        draw->AddRectFilled(pos, ImVec2(max.x, pos.y + height * 0.5f), IM_COL32(255, 255, 255, alpha), rounding, ImDrawFlags_RoundCornersTop);
-
-        float foldY = pos.y + 2.0f + (height - 4.0f) * phase;
-        draw->AddLine(ImVec2(pos.x + 2.0f, foldY), ImVec2(max.x - 2.0f, foldY), IM_COL32(255, 255, 255, static_cast<int>((1.0f - phase) * 120.0f)));
+    if (state.current == '\0') {
+        state.current = value;
+        state.previous = value;
+        state.changedAt = now - kFlipDurationSeconds;
+    }
+    else if (state.current != value) {
+        state.previous = state.current;
+        state.current = value;
+        state.changedAt = now;
     }
 
-    ImVec2 textSize = ImGui::CalcTextSize(value.c_str());
-    draw->AddText(
-        ImVec2(pos.x + (width - textSize.x) * 0.5f, pos.y + (height - textSize.y) * 0.5f),
-        Color(238, 238, 238),
-        value.c_str()
-    );
+    current = state.current;
+    previous = state.previous;
+    phase = static_cast<float>((now - state.changedAt) / kFlipDurationSeconds);
+
+    if (phase < 0.0f) {
+        phase = 0.0f;
+    }
+    else if (phase > 1.0f) {
+        phase = 1.0f;
+    }
+
+    return phase < 1.0f && current != previous;
+}
+
+static void DrawDigitTextClipped(ImDrawList* draw, ImVec2 pos, float width, float height, char digit, ImVec2 clipMin, ImVec2 clipMax, ImU32 color)
+{
+    char text[2] = { digit, '\0' };
+    ImVec2 textSize = ImGui::CalcTextSize(text);
+    ImVec2 textPos(pos.x + (width - textSize.x) * 0.5f, pos.y + (height - textSize.y) * 0.5f);
+
+    draw->PushClipRect(clipMin, clipMax, true);
+    draw->AddText(textPos, color, text);
+    draw->PopClipRect();
+}
+
+static void DrawFlipDigitBox(ImDrawList* draw, ImVec2 pos, float width, float height, const std::string& key, char value)
+{
+    const float rounding = 4.0f;
+    const float halfHeight = height * 0.5f;
+    ImVec2 max(pos.x + width, pos.y + height);
+    ImVec2 topMax(pos.x + width, pos.y + halfHeight);
+    ImVec2 bottomMin(pos.x, pos.y + halfHeight);
+    ImVec2 midLeft(pos.x, pos.y + halfHeight);
+    ImVec2 midRight(pos.x + width, pos.y + halfHeight);
+
+    char current = value;
+    char previous = value;
+    float phase = 1.0f;
+    bool flipping = UpdateFlipDigitState(key, value, current, previous, phase);
+
+    char topDigit = current;
+    char bottomDigit = current;
+
+    if (flipping) {
+        if (phase < 0.5f) {
+            topDigit = previous;
+            bottomDigit = current;
+        }
+        else {
+            topDigit = current;
+            bottomDigit = current;
+        }
+    }
+
+    draw->AddRectFilled(pos, topMax, Color(43, 43, 43), rounding, ImDrawFlags_RoundCornersTop);
+    draw->AddRectFilled(bottomMin, max, Color(25, 25, 25), rounding, ImDrawFlags_RoundCornersBottom);
+    draw->AddRect(pos, max, Color(86, 86, 86), rounding);
+
+    DrawDigitTextClipped(draw, pos, width, height, topDigit, pos, topMax, Color(238, 238, 238));
+    DrawDigitTextClipped(draw, pos, width, height, bottomDigit, bottomMin, max, Color(238, 238, 238));
+
+    if (flipping) {
+        if (phase < 0.5f) {
+            float local = phase * 2.0f;
+            int alpha = static_cast<int>(70.0f + local * 85.0f);
+            draw->AddRectFilled(pos, topMax, IM_COL32(0, 0, 0, alpha), rounding, ImDrawFlags_RoundCornersTop);
+
+            float flapHeight = std::max(2.0f, halfHeight * (1.0f - local));
+            draw->AddRectFilled(
+                ImVec2(pos.x + 1.0f, pos.y + halfHeight - flapHeight),
+                ImVec2(max.x - 1.0f, pos.y + halfHeight),
+                IM_COL32(18, 18, 18, 185),
+                2.0f
+            );
+            DrawDigitTextClipped(
+                draw,
+                pos,
+                width,
+                height,
+                previous,
+                ImVec2(pos.x, pos.y + halfHeight - flapHeight),
+                ImVec2(max.x, pos.y + halfHeight),
+                IM_COL32(238, 238, 238, 220)
+            );
+        }
+        else {
+            float local = (phase - 0.5f) * 2.0f;
+            int alpha = static_cast<int>((1.0f - local) * 110.0f);
+            draw->AddRectFilled(bottomMin, max, IM_COL32(255, 255, 255, alpha), rounding, ImDrawFlags_RoundCornersBottom);
+
+            float flapHeight = std::max(2.0f, halfHeight * local);
+            draw->AddRectFilled(
+                bottomMin,
+                ImVec2(max.x, bottomMin.y + flapHeight),
+                IM_COL32(38, 38, 38, 185),
+                2.0f
+            );
+            DrawDigitTextClipped(
+                draw,
+                pos,
+                width,
+                height,
+                current,
+                bottomMin,
+                ImVec2(max.x, bottomMin.y + flapHeight),
+                IM_COL32(238, 238, 238, 230)
+            );
+        }
+    }
+
+    draw->AddLine(midLeft, midRight, Color(9, 9, 9));
+    draw->AddLine(ImVec2(pos.x + 1.0f, pos.y + halfHeight + 1.0f), ImVec2(pos.x + width - 1.0f, pos.y + halfHeight + 1.0f), Color(62, 62, 62));
+}
+
+static void DrawFlipElement(ImDrawList* draw, ImVec2 pos, const FlipClockElement& element)
+{
+    if (element.kind == FlipClockElement::Digit) {
+        DrawFlipDigitBox(draw, pos, FlipDigitWidth(), FlipDigitHeight(), element.key, element.digit);
+        return;
+    }
+
+    ImVec2 textSize = ImGui::CalcTextSize(element.text.c_str());
+    float y = pos.y + (FlipDigitHeight() - textSize.y) * 0.5f;
+    draw->AddText(ImVec2(pos.x, y), Color(190, 190, 190), element.text.c_str());
 }
 
 static void DrawFlipResetClock(ImDrawList* draw, const ImVec2& rowStart, float barWidth, const UiBar& bar)
 {
-    std::vector<FlipClockSegment> segments = BuildFlipClockSegments(bar.resetAtUnixSeconds);
+    std::vector<FlipClockElement> elements = BuildFlipClockElements(bar);
     std::string percentText = DisplayPercentFromUiBar(bar);
 
-    const float boxHeight = 24.0f;
-    const float colonGap = 5.0f;
-    float totalWidth = FlipClockWidth(segments, percentText);
+    float totalWidth = FlipClockWidth(elements, percentText);
     float x = rowStart.x + std::max(0.0f, barWidth - totalWidth);
     float y = rowStart.y - 3.0f;
 
@@ -336,22 +516,13 @@ static void DrawFlipResetClock(ImDrawList* draw, const ImVec2& rowStart, float b
     draw->AddText(ImVec2(x, rowStart.y), Color(190, 190, 190), prefix);
     x += prefixSize.x + 8.0f;
 
-    for (size_t i = 0; i < segments.size(); ++i) {
-        float boxWidth = FlipSegmentWidth(segments[i].value);
-        DrawFlipSegment(draw, ImVec2(x, y), boxWidth, boxHeight, segments[i].value, segments[i].animate);
-        x += boxWidth;
-
-        if (i + 1 < segments.size()) {
-            const char* colon = ":";
-            ImVec2 colonSize = ImGui::CalcTextSize(colon);
-            x += colonGap;
-            draw->AddText(ImVec2(x, rowStart.y), Color(190, 190, 190), colon);
-            x += colonSize.x + colonGap;
-        }
+    for (const FlipClockElement& element : elements) {
+        DrawFlipElement(draw, ImVec2(x, y), element);
+        x += FlipElementWidth(element);
     }
 
     if (!percentText.empty()) {
-        x += 5.0f;
+        x += 8.0f;
         draw->AddText(ImVec2(x, rowStart.y), Color(190, 190, 190), percentText.c_str());
     }
 }
