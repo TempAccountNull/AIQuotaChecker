@@ -15,6 +15,16 @@
 
 #pragma comment(lib, "winhttp.lib")
 
+#ifndef WINHTTP_OPTION_DECOMPRESSION
+#define WINHTTP_OPTION_DECOMPRESSION 118
+#endif
+#ifndef WINHTTP_DECOMPRESSION_FLAG_GZIP
+#define WINHTTP_DECOMPRESSION_FLAG_GZIP 0x00000001
+#endif
+#ifndef WINHTTP_DECOMPRESSION_FLAG_DEFLATE
+#define WINHTTP_DECOMPRESSION_FLAG_DEFLATE 0x00000002
+#endif
+
 namespace Network
 {
     std::string Client::ToLowerCopy(std::string text) const
@@ -239,6 +249,9 @@ namespace Network
             WinHttpCloseHandle(session);
             throw std::runtime_error("WinHttpOpenRequest failed");
         }
+
+        DWORD decompressionFlags = WINHTTP_DECOMPRESSION_FLAG_GZIP | WINHTTP_DECOMPRESSION_FLAG_DEFLATE;
+        WinHttpSetOption(request, WINHTTP_OPTION_DECOMPRESSION, &decompressionFlags, sizeof(decompressionFlags));
 
         if (!headers.empty()) {
             WinHttpAddRequestHeaders(

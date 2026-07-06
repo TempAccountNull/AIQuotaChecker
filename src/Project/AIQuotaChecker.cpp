@@ -26,6 +26,7 @@
 #include "Text.hpp"
 #include "Math.hpp"
 #include "Format.hpp"
+#include "GrokProvider.hpp"
 #include "ZAiProvider.hpp"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
@@ -138,6 +139,7 @@ namespace
         CodexProvider::get_instance()->ApplyRuntime(g_notifyPosition, repeatSeconds);
         ClaudeProvider::get_instance()->ApplyRuntime(g_notifyPosition, repeatSeconds);
         ZAiProvider::get_instance()->ApplyRuntime(g_notifyPosition, repeatSeconds);
+        GrokProvider::get_instance()->ApplyRuntime(g_notifyPosition, repeatSeconds);
     }
 
     static void LoadAppSettings()
@@ -156,6 +158,7 @@ namespace
         CodexProvider::get_instance()->LoadSettings(settings);
         ClaudeProvider::get_instance()->LoadSettings(settings);
         ZAiProvider::get_instance()->LoadSettings(settings);
+        GrokProvider::get_instance()->LoadSettings(settings);
 
         ApplySettingsToRuntime();
     }
@@ -174,6 +177,7 @@ namespace
         CodexProvider::get_instance()->SaveSettings(settings);
         ClaudeProvider::get_instance()->SaveSettings(settings);
         ZAiProvider::get_instance()->SaveSettings(settings);
+        GrokProvider::get_instance()->SaveSettings(settings);
 
         return AppSettings::Save(settings);
     }
@@ -191,6 +195,11 @@ namespace
     static void RefreshZAiAsync()
     {
         ZAiProvider::get_instance()->RefreshAsync();
+    }
+
+    static void RefreshGrokAsync()
+    {
+        GrokProvider::get_instance()->RefreshAsync();
     }
 
     static void CreateRenderTarget()
@@ -352,11 +361,13 @@ namespace
         static LONGLONG nextCodexRefresh = 0;
         static LONGLONG nextClaudeRefresh = 0;
         static LONGLONG nextZAiRefresh = 0;
+        static LONGLONG nextGrokRefresh = 0;
 
         if (!g_autoRefreshEnabled) {
             nextCodexRefresh = 0;
             nextClaudeRefresh = 0;
             nextZAiRefresh = 0;
+            nextGrokRefresh = 0;
             return;
         }
 
@@ -380,9 +391,14 @@ namespace
             nextZAiRefresh = now + intervalSeconds;
         }
 
+        if (nextGrokRefresh == 0 || nextGrokRefresh - now > intervalSeconds) {
+            nextGrokRefresh = now + intervalSeconds;
+        }
+
         CodexProvider* codex = CodexProvider::get_instance();
         ClaudeProvider* claude = ClaudeProvider::get_instance();
         ZAiProvider* zai = ZAiProvider::get_instance();
+        GrokProvider* grok = GrokProvider::get_instance();
 
         if (now >= nextCodexRefresh) {
             if (!codex->Loading()->load()) {
@@ -413,6 +429,16 @@ namespace
                 nextZAiRefresh = now + 5;
             }
         }
+
+        if (now >= nextGrokRefresh) {
+            if (!grok->Loading()->load()) {
+                grok->RefreshAsync();
+                nextGrokRefresh = now + intervalSeconds;
+            }
+            else {
+                nextGrokRefresh = now + 5;
+            }
+        }
     }
 
     static void PollAppNotifications()
@@ -423,6 +449,7 @@ namespace
         CodexProvider::get_instance()->PollNotifications();
         ClaudeProvider::get_instance()->PollNotifications();
         ZAiProvider::get_instance()->PollNotifications();
+        GrokProvider::get_instance()->PollNotifications();
     }
 
     static void InitializeCoreServices()
@@ -440,6 +467,7 @@ namespace
         CodexProvider::get_instance()->SetRateLimitCallback(RequestAutoRefreshDisableForRateLimit);
         ClaudeProvider::get_instance()->SetRateLimitCallback(RequestAutoRefreshDisableForRateLimit);
         ZAiProvider::get_instance()->SetRateLimitCallback(RequestAutoRefreshDisableForRateLimit);
+        GrokProvider::get_instance()->SetRateLimitCallback(RequestAutoRefreshDisableForRateLimit);
     }
 
     static void InitializeRendererState()
@@ -447,19 +475,24 @@ namespace
         CodexProvider* codex = CodexProvider::get_instance();
         ClaudeProvider* claude = ClaudeProvider::get_instance();
         ZAiProvider* zai = ZAiProvider::get_instance();
+        GrokProvider* grok = GrokProvider::get_instance();
 
         g_rendererState.shouldClose = &g_shouldClose;
+        g_rendererState.device = g_device;
 
         g_rendererState.codexMutex = codex->StateMutex();
         g_rendererState.claudeMutex = claude->StateMutex();
         g_rendererState.zaiMutex = zai->StateMutex();
+        g_rendererState.grokMutex = grok->StateMutex();
         g_rendererState.codexState = codex->Snapshot();
         g_rendererState.claudeState = claude->Snapshot();
         g_rendererState.zaiState = zai->Snapshot();
+        g_rendererState.grokState = grok->Snapshot();
 
         g_rendererState.codexLoading = codex->Loading();
         g_rendererState.claudeLoading = claude->Loading();
         g_rendererState.zaiLoading = zai->Loading();
+        g_rendererState.grokLoading = grok->Loading();
 
         g_rendererState.showRemaining = &g_showRemaining;
         g_rendererState.showResetDateDetails = &g_showResetDateDetails;
@@ -479,13 +512,16 @@ namespace
         g_rendererState.codexNotifySettings = codex->NotifySettings();
         g_rendererState.claudeNotifySettings = claude->NotifySettings();
         g_rendererState.zaiNotifySettings = zai->NotifySettings();
+        g_rendererState.grokNotifySettings = grok->NotifySettings();
         g_rendererState.codexQuotaWarnings = codex->QuotaWarnings();
         g_rendererState.claudeQuotaWarnings = claude->QuotaWarnings();
         g_rendererState.zaiQuotaWarnings = zai->QuotaWarnings();
+        g_rendererState.grokQuotaWarnings = grok->QuotaWarnings();
 
         g_rendererState.refreshCodexAsync = RefreshCodexAsync;
         g_rendererState.refreshClaudeAsync = RefreshClaudeAsync;
         g_rendererState.refreshZAiAsync = RefreshZAiAsync;
+        g_rendererState.refreshGrokAsync = RefreshGrokAsync;
         g_rendererState.saveAppSettings = SaveAppSettings;
         g_rendererState.applySettingsToRuntime = ApplySettingsToRuntime;
     }
@@ -529,6 +565,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
 
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
     InitializeCoreServices();
     InitializeProviders();
     InitializeRendererState();
@@ -542,6 +580,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
     CodexProvider::get_instance()->RefreshAsync();
     ClaudeProvider::get_instance()->RefreshAsync();
     ZAiProvider::get_instance()->RefreshAsync();
+    GrokProvider::get_instance()->RefreshAsync();
 
     bool done = false;
 
@@ -589,6 +628,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
         g_swapChain->Present(1, 0);
     }
 
+    Renderer::ReleaseTabImages();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
@@ -597,6 +637,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 
     DestroyWindow(g_hwnd);
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
+    CoUninitialize();
 
     return 0;
 }

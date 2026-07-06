@@ -76,7 +76,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>Global.hpp</PrecompiledHeaderFile>
     </ClCompile>
@@ -96,7 +96,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>Global.hpp</PrecompiledHeaderFile>
     </ClCompile>
@@ -116,7 +116,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpplatest</LanguageStandard>
       <LanguageStandard_C>stdclatest</LanguageStandard_C>
-      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>Global.hpp</PrecompiledHeaderFile>
     </ClCompile>
@@ -138,7 +138,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpplatest</LanguageStandard>
       <LanguageStandard_C>stdclatest</LanguageStandard_C>
-      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>Global.hpp</PrecompiledHeaderFile>
     </ClCompile>
@@ -175,6 +175,9 @@
     <ClInclude Include="src\Providers\ZAi\ZAi.hpp" />
     <ClInclude Include="src\Providers\ZAi\ZAiNotifier.hpp" />
     <ClInclude Include="src\Providers\ZAi\ZAiProvider.hpp" />
+    <ClInclude Include="src\Providers\Grok\Grok.hpp" />
+    <ClInclude Include="src\Providers\Grok\GrokNotifier.hpp" />
+    <ClInclude Include="src\Providers\Grok\GrokProvider.hpp" />
     <ClInclude Include="src\Global\Global.hpp" />
   </ItemGroup>
   <ItemGroup>
@@ -202,6 +205,9 @@
     <ClCompile Include="src\Providers\ZAi\ZAi.cpp" />
     <ClCompile Include="src\Providers\ZAi\ZAiNotifier.cpp" />
     <ClCompile Include="src\Providers\ZAi\ZAiProvider.cpp" />
+    <ClCompile Include="src\Providers\Grok\Grok.cpp" />
+    <ClCompile Include="src\Providers\Grok\GrokNotifier.cpp" />
+    <ClCompile Include="src\Providers\Grok\GrokProvider.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="src\Resources\AIQuotaChecker.rc" />
@@ -209,10 +215,32 @@
   <ItemGroup>
     <Image Include="src\Resources\AIQuotaChecker.ico" />
     <Image Include="src\Resources\small.ico" />
+    <Image Include="src\Resources\images\Claude.ico" />
+    <Image Include="src\Resources\images\Codex.ico" />
+    <Image Include="src\Resources\images\Grok.ico" />
+    <Image Include="src\Resources\images\ZAi.ico" />
   </ItemGroup>
   <ItemGroup>
     <None Include="src\Tools\check-codex-resets.cmd" />
     <None Include="src\Tools\check-codex-resets.ps1" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="src\Resources\images\Claude.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>images\Claude.ico</TargetPath>
+    </Content>
+    <Content Include="src\Resources\images\Codex.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>images\Codex.ico</TargetPath>
+    </Content>
+    <Content Include="src\Resources\images\Grok.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>images\Grok.ico</TargetPath>
+    </Content>
+    <Content Include="src\Resources\images\ZAi.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>images\ZAi.ico</TargetPath>
+    </Content>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

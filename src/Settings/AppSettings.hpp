@@ -31,6 +31,11 @@ namespace AppSettings
         QuotaWarningRule turbo;
     };
 
+    struct GrokQuotaWarnings
+    {
+        QuotaWarningRule weekly;
+    };
+
     struct ProviderNotifications
     {
         bool enabled = true;
@@ -53,10 +58,12 @@ namespace AppSettings
         ProviderNotifications codex;
         ProviderNotifications claude;
         ProviderNotifications zai;
+        ProviderNotifications grok;
 
         CodexQuotaWarnings codexQuotaWarnings;
         ClaudeQuotaWarnings claudeQuotaWarnings;
         ZAiQuotaWarnings zaiQuotaWarnings;
+        GrokQuotaWarnings grokQuotaWarnings;
     };
 
     std::wstring GetSettingsIniPath();

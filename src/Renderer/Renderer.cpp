@@ -7,6 +7,9 @@
 #include "ResetTime.hpp"
 
 #include <windows.h>
+#include <d3d11.h>
+#include <wincodec.h>
+#include <filesystem>
 
 #include <algorithm>
 #include <chrono>
@@ -16,15 +19,20 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <imgui.h>
 
 #include "NotifyGUI.hpp"
+#include "Resource.h"
 #include "CodexNotifier.hpp"
 #include "ClaudeNotifier.hpp"
 #include "ZAiNotifier.hpp"
+#include "GrokNotifier.hpp"
 #include "AppSettings.hpp"
+
+#pragma comment(lib, "windowscodecs.lib")
 
 namespace Renderer
 {
@@ -35,16 +43,203 @@ namespace Renderer
         return *g_state;
     }
 
+    struct TabImage
+    {
+        ID3D11ShaderResourceView* srv = nullptr;
+        int width = 0;
+        int height = 0;
+        bool attempted = false;
+    };
+
+    static TabImage g_codexTabImage;
+    static TabImage g_claudeTabImage;
+    static TabImage g_zaiTabImage;
+    static TabImage g_grokTabImage;
+
+    static std::filesystem::path ExeDirectory()
+    {
+        wchar_t exePath[MAX_PATH]{};
+        DWORD len = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+
+        if (len == 0 || len >= MAX_PATH) {
+            return std::filesystem::current_path();
+        }
+
+        std::filesystem::path path(std::wstring(exePath, len));
+        return path.parent_path();
+    }
+
+    static std::filesystem::path FindTabImagePath(const wchar_t* fileName)
+    {
+        std::filesystem::path exeDir = ExeDirectory();
+        std::vector<std::filesystem::path> candidates = {
+            exeDir / L"images" / fileName,
+            exeDir / L"Resources" / L"images" / fileName,
+            exeDir / L"src" / L"Resources" / L"images" / fileName,
+            exeDir / L".." / L".." / L"src" / L"Resources" / L"images" / fileName,
+            std::filesystem::current_path() / L"src" / L"Resources" / L"images" / fileName,
+            std::filesystem::current_path() / L"Resources" / L"images" / fileName
+        };
+
+        for (const std::filesystem::path& candidate : candidates) {
+            std::error_code ec;
+            if (std::filesystem::exists(candidate, ec)) {
+                return candidate;
+            }
+        }
+
+        return {};
+    }
+
+    static void ReleaseTabImage(TabImage& image)
+    {
+        if (image.srv) {
+            image.srv->Release();
+            image.srv = nullptr;
+        }
+
+        image.width = 0;
+        image.height = 0;
+        image.attempted = false;
+    }
+
+    void ReleaseTabImages()
+    {
+        ReleaseTabImage(g_codexTabImage);
+        ReleaseTabImage(g_claudeTabImage);
+        ReleaseTabImage(g_zaiTabImage);
+        ReleaseTabImage(g_grokTabImage);
+    }
+
+    static bool LoadTextureFromFile(const std::filesystem::path& path, TabImage& image)
+    {
+        if (!R().device || path.empty()) {
+            return false;
+        }
+
+        IWICImagingFactory* factory = nullptr;
+        IWICBitmapDecoder* decoder = nullptr;
+        IWICBitmapFrameDecode* frame = nullptr;
+        IWICFormatConverter* converter = nullptr;
+
+        HRESULT hr = CoCreateInstance(
+            CLSID_WICImagingFactory,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&factory)
+        );
+
+        if (FAILED(hr)) {
+            return false;
+        }
+
+        hr = factory->CreateDecoderFromFilename(
+            path.c_str(),
+            nullptr,
+            GENERIC_READ,
+            WICDecodeMetadataCacheOnLoad,
+            &decoder
+        );
+
+        if (SUCCEEDED(hr)) {
+            hr = decoder->GetFrame(0, &frame);
+        }
+
+        if (SUCCEEDED(hr)) {
+            hr = factory->CreateFormatConverter(&converter);
+        }
+
+        if (SUCCEEDED(hr)) {
+            hr = converter->Initialize(
+                frame,
+                GUID_WICPixelFormat32bppRGBA,
+                WICBitmapDitherTypeNone,
+                nullptr,
+                0.0,
+                WICBitmapPaletteTypeCustom
+            );
+        }
+
+        UINT width = 0;
+        UINT height = 0;
+
+        if (SUCCEEDED(hr)) {
+            hr = converter->GetSize(&width, &height);
+        }
+
+        std::vector<unsigned char> pixels;
+
+        if (SUCCEEDED(hr) && width > 0 && height > 0) {
+            pixels.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4);
+            hr = converter->CopyPixels(nullptr, width * 4, static_cast<UINT>(pixels.size()), pixels.data());
+        }
+
+        if (SUCCEEDED(hr)) {
+            D3D11_TEXTURE2D_DESC desc{};
+            desc.Width = width;
+            desc.Height = height;
+            desc.MipLevels = 1;
+            desc.ArraySize = 1;
+            desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            desc.SampleDesc.Count = 1;
+            desc.Usage = D3D11_USAGE_DEFAULT;
+            desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+            D3D11_SUBRESOURCE_DATA subResource{};
+            subResource.pSysMem = pixels.data();
+            subResource.SysMemPitch = width * 4;
+
+            ID3D11Texture2D* texture = nullptr;
+            hr = R().device->CreateTexture2D(&desc, &subResource, &texture);
+
+            if (SUCCEEDED(hr)) {
+                D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+                srvDesc.Format = desc.Format;
+                srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                srvDesc.Texture2D.MipLevels = 1;
+
+                hr = R().device->CreateShaderResourceView(texture, &srvDesc, &image.srv);
+                texture->Release();
+            }
+        }
+
+        if (converter) converter->Release();
+        if (frame) frame->Release();
+        if (decoder) decoder->Release();
+        if (factory) factory->Release();
+
+        if (FAILED(hr) || !image.srv) {
+            return false;
+        }
+
+        image.width = static_cast<int>(width);
+        image.height = static_cast<int>(height);
+        return true;
+    }
+
+    static TabImage& EnsureTabImage(TabImage& image, const wchar_t* fileName)
+    {
+        if (!image.attempted) {
+            image.attempted = true;
+            LoadTextureFromFile(FindTabImagePath(fileName), image);
+        }
+
+        return image;
+    }
+
 #define g_shouldClose (*R().shouldClose)
 #define g_codexMutex (*R().codexMutex)
 #define g_claudeMutex (*R().claudeMutex)
 #define g_zaiMutex (*R().zaiMutex)
+#define g_grokMutex (*R().grokMutex)
 #define g_codexState (*R().codexState)
 #define g_claudeState (*R().claudeState)
 #define g_zaiState (*R().zaiState)
+#define g_grokState (*R().grokState)
 #define g_codexLoading (*R().codexLoading)
 #define g_claudeLoading (*R().claudeLoading)
 #define g_zaiLoading (*R().zaiLoading)
+#define g_grokLoading (*R().grokLoading)
 #define g_showRemaining (*R().showRemaining)
 #define g_showResetDateDetails (*R().showResetDateDetails)
 #define g_resetDisplayMode (*R().resetDisplayMode)
@@ -58,12 +253,15 @@ namespace Renderer
 #define g_codexNotifySettings (*R().codexNotifySettings)
 #define g_claudeNotifySettings (*R().claudeNotifySettings)
 #define g_zaiNotifySettings (*R().zaiNotifySettings)
+#define g_grokNotifySettings (*R().grokNotifySettings)
 #define g_codexQuotaWarnings (*R().codexQuotaWarnings)
 #define g_claudeQuotaWarnings (*R().claudeQuotaWarnings)
 #define g_zaiQuotaWarnings (*R().zaiQuotaWarnings)
+#define g_grokQuotaWarnings (*R().grokQuotaWarnings)
 #define RefreshCodexAsync (R().refreshCodexAsync)
 #define RefreshClaudeAsync (R().refreshClaudeAsync)
 #define RefreshZAiAsync (R().refreshZAiAsync)
+#define RefreshGrokAsync (R().refreshGrokAsync)
 #define SaveAppSettings (R().saveAppSettings)
 #define ApplySettingsToRuntime (R().applySettingsToRuntime)
 
@@ -703,9 +901,14 @@ static void DrawUnifiedUsageCard(const char* title, const std::vector<UiBar>& ba
         }
 
         if (!bar.detailValue1.empty() || !bar.detailLabel1.empty() || !bar.detailValue2.empty() || !bar.detailLabel2.empty()) {
-            cardHeight += 48.0f;
+            cardHeight += 72.0f;
         }
     }
+
+    // The card is owner-drawn while the row content still advances ImGui's
+    // layout cursor. Use a conservative footer/row pad so Claude's credit
+    // details and Grok's extra-credit row cannot clip at the card bottom.
+    cardHeight += 36.0f + static_cast<float>(bars.size()) * 18.0f;
 
     ImGui::BeginChild(title, ImVec2(cardWidth, cardHeight), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
@@ -1093,6 +1296,43 @@ static std::vector<UiBar> BuildZAiBars(const ZAi::Snapshot& snapshot) {
     return bars;
 }
 
+static std::vector<UiBar> BuildGrokBars(const Grok::Snapshot& snapshot) {
+    std::vector<UiBar> bars;
+
+    if (snapshot.weeklyLimit.valid) {
+        UiBar row;
+        row.label = snapshot.weeklyLimit.title;
+        row.sublabel = snapshot.weeklyLimit.subtitle;
+        row.rightText = BuildResetRightText(snapshot.weeklyLimit.resetText, snapshot.weeklyLimit.usedPercent, snapshot.weeklyLimit.resetAtUnixSeconds);
+        row.resetAtUnixSeconds = snapshot.weeklyLimit.resetAtUnixSeconds;
+        row.usedPercent = snapshot.weeklyLimit.usedPercent;
+        row.valid = true;
+        row.red = false;
+        row.white = true;
+        row.thin = false;
+        bars.push_back(row);
+    }
+
+    if (snapshot.extraCredits.valid) {
+        UiBar row;
+        row.label = snapshot.extraCredits.balanceText;
+        row.sublabel = "Extra Usage Credits";
+        row.rightText = "";
+        row.usedPercent = snapshot.extraCredits.usedPercent;
+        row.valid = true;
+        row.red = false;
+        row.white = true;
+        row.thin = true;
+        row.detailValue1 = snapshot.extraCredits.usedText;
+        row.detailLabel1 = "On-demand used";
+        row.detailValue2 = snapshot.extraCredits.balanceText;
+        row.detailLabel2 = "Credit balance";
+        bars.push_back(row);
+    }
+
+    return bars;
+}
+
 static void DrawZAiDetailsCard(const ZAi::Snapshot& snapshot, float cardWidth) {
     if (snapshot.details.empty()) {
         return;
@@ -1230,6 +1470,43 @@ static void DrawZAiTab() {
     }
 
     DrawZAiDetailsCard(snapshot, cardWidth);
+}
+
+static void DrawGrokTab() {
+    Grok::Snapshot snapshot;
+
+    {
+        std::lock_guard<std::mutex> lock(g_grokMutex);
+        snapshot = g_grokState;
+    }
+
+    float contentWidth = ImGui::GetContentRegionAvail().x;
+    float cardWidth = contentWidth;
+
+    ImGui::TextUnformatted("Grok / xAI usage");
+    ImGui::SameLine();
+
+    if (g_grokLoading) {
+        ImGui::TextDisabled("Loading");
+    }
+    else {
+        ImGui::TextDisabled(g_autoRefreshEnabled ? "Auto refresh on" : "Auto refresh off");
+    }
+
+    if (!snapshot.statusText.empty() && snapshot.statusText != "Updated") {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
+        ImGui::TextWrapped("%s", snapshot.statusText.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::Spacing();
+
+    std::string title = snapshot.plan.empty() ? "Grok" : snapshot.plan;
+    std::vector<UiBar> bars = BuildGrokBars(snapshot);
+
+    if (!bars.empty()) {
+        DrawUnifiedUsageCard(title.c_str(), bars, cardWidth);
+    }
 }
 
 static void DrawSettingsHeader(const char* title)
@@ -1417,6 +1694,7 @@ static void DrawSettingsGeneralCard(float contentWidth)
             CodexNotifier::SetPosition(g_notifyPosition);
             ClaudeNotifier::SetPosition(g_notifyPosition);
             ZAiNotifier::SetPosition(g_notifyPosition);
+            GrokNotifier::SetPosition(g_notifyPosition);
         }
 
         ImGui::TextDisabled(g_showNotificationsInsideWindow ? "inside window" : "outside screen");
@@ -1444,6 +1722,7 @@ static void DrawSettingsGeneralCard(float contentWidth)
             CodexNotifier::SetPosition(g_notifyPosition);
             ClaudeNotifier::SetPosition(g_notifyPosition);
             ZAiNotifier::SetPosition(g_notifyPosition);
+            GrokNotifier::SetPosition(g_notifyPosition);
         }
 
         ImGui::TextDisabled(g_showNotificationsInsideWindow ? "inside window" : "outside screen");
@@ -1605,7 +1884,7 @@ static void BeginCleanSettingsCard(const char* id, const char* title, ImVec2 siz
 {
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.105f, 0.105f, 0.105f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.230f, 0.230f, 0.230f, 1.0f));
-    ImGui::BeginChild(id, size, true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::BeginChild(id, size, true);
 
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.86f, 0.86f, 0.86f, 1.0f));
     ImGui::TextUnformatted(title);
@@ -1734,6 +2013,33 @@ static void DrawCleanZAiQuotaWarnings()
     }
 }
 
+static void DrawCleanGrokNotifications()
+{
+    if (ImGui::BeginTable("##grok_notify_table", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
+        ImGui::TableSetupColumn("Option", ImGuiTableColumnFlags_WidthStretch, 0.50f);
+        ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthStretch, 0.50f);
+
+        DrawNotificationToggleRow("Enabled", g_grokNotifySettings.enabled, "Notifications on", "Notifications off");
+        DrawNotificationToggleRow("Prepare reset warning", g_grokNotifySettings.prepareReset, "Before quota resets", "Off");
+        DrawPrepareMinutesRow(g_grokNotifySettings);
+        DrawNotificationToggleRow("Exact reset notification", g_grokNotifySettings.exactReset, "When quota resets", "Off");
+
+        ImGui::EndTable();
+    }
+}
+
+static void DrawCleanGrokQuotaWarnings()
+{
+    if (ImGui::BeginTable("##grok_quota_table", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
+        ImGui::TableSetupColumn("Quota", ImGuiTableColumnFlags_WidthStretch, 0.48f);
+        ImGui::TableSetupColumn("Threshold", ImGuiTableColumnFlags_WidthStretch, 0.52f);
+
+        DrawQuotaRuleSettings("Weekly limit", g_grokQuotaWarnings.weekly);
+
+        ImGui::EndTable();
+    }
+}
+
 static bool DrawSettingsSaveButtonInline()
 {
     bool saved = false;
@@ -1790,9 +2096,10 @@ static void DrawResetTimeModeSettings()
     DrawSettingsMutedText(ResetTime::get_instance()->Description(g_resetDisplayMode));
 }
 
-static void DrawCleanGeneralSettings(float contentWidth)
+static void DrawCleanGeneralSettings(float contentWidth, float contentHeight)
 {
-    BeginCleanSettingsCard("##settings_general", "General", ImVec2(contentWidth, 218.0f));
+    float cardHeight = std::max(340.0f, contentHeight);
+    BeginCleanSettingsCard("##settings_general", "General", ImVec2(contentWidth, cardHeight));
 
     bool wide = contentWidth >= 900.0f;
 
@@ -1830,6 +2137,7 @@ static void DrawCleanGeneralSettings(float contentWidth)
             CodexNotifier::SetPosition(g_notifyPosition);
             ClaudeNotifier::SetPosition(g_notifyPosition);
             ZAiNotifier::SetPosition(g_notifyPosition);
+            GrokNotifier::SetPosition(g_notifyPosition);
         }
 
         DrawSettingsMutedText(g_showNotificationsInsideWindow ? "Inside the app window" : "Outside the app window");
@@ -1870,6 +2178,7 @@ static void DrawCleanGeneralSettings(float contentWidth)
             CodexNotifier::SetPosition(g_notifyPosition);
             ClaudeNotifier::SetPosition(g_notifyPosition);
             ZAiNotifier::SetPosition(g_notifyPosition);
+            GrokNotifier::SetPosition(g_notifyPosition);
         }
 
         DrawSettingsMutedText(g_showNotificationsInsideWindow ? "Inside the app window" : "Outside the app window");
@@ -1915,54 +2224,218 @@ static void DrawZAiSettingsCard(float width, float height)
     ImGui::PopID();
 }
 
+static void DrawGrokSettingsCard(float width, float height)
+{
+    ImGui::PushID("##grok_settings_card");
+    BeginCleanSettingsCard("##grok_settings_card", "Grok", ImVec2(width, height));
+
+    DrawSettingsSubHeader("Notifications");
+    DrawCleanGrokNotifications();
+
+    ImGui::Spacing();
+    DrawSettingsSubHeader("Quota warnings");
+    DrawCleanGrokQuotaWarnings();
+
+    EndCleanSettingsCard();
+    ImGui::PopID();
+}
+
+enum class ActiveSettingsTab
+{
+    General,
+    Codex,
+    Claude,
+    Grok,
+    ZAi
+};
+
+static ActiveSettingsTab g_activeSettingsTab = ActiveSettingsTab::General;
+
+static void DrawSettingsSideTab(const char* label, ActiveSettingsTab tab)
+{
+    bool selected = g_activeSettingsTab == tab;
+
+    ImGui::PushID(label);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f, 0.92f, 0.92f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Button, selected ? ImVec4(0.150f, 0.310f, 0.470f, 1.0f) : ImVec4(0.130f, 0.130f, 0.130f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, selected ? ImVec4(0.180f, 0.370f, 0.560f, 1.0f) : ImVec4(0.190f, 0.220f, 0.250f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.170f, 0.350f, 0.540f, 1.0f));
+
+    if (ImGui::Button(label, ImVec2(-1.0f, 32.0f))) {
+        g_activeSettingsTab = tab;
+    }
+
+    ImGui::PopStyleColor(4);
+    ImGui::PopID();
+}
+
+static void DrawSelectedSettingsPage(float width, float height)
+{
+    height = std::max(260.0f, height);
+
+    switch (g_activeSettingsTab) {
+    case ActiveSettingsTab::General:
+        DrawCleanGeneralSettings(width, height);
+        break;
+    case ActiveSettingsTab::Codex:
+        DrawProviderSettingsCard("##codex_settings_card", "Codex", g_codexNotifySettings, true, width, height);
+        break;
+    case ActiveSettingsTab::Claude:
+        DrawProviderSettingsCard("##claude_settings_card", "Claude", g_claudeNotifySettings, false, width, height);
+        break;
+    case ActiveSettingsTab::Grok:
+        DrawGrokSettingsCard(width, height);
+        break;
+    case ActiveSettingsTab::ZAi:
+        DrawZAiSettingsCard(width, height);
+        break;
+    }
+}
+
 static void DrawSettingsTab()
 {
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(7.0f, 4.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(9.0f, 5.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 7.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(8.0f, 5.0f));
 
     float contentWidth = ImGui::GetContentRegionAvail().x;
+    float contentHeight = ImGui::GetContentRegionAvail().y;
+    float sideWidth = std::min(170.0f, std::max(150.0f, contentWidth * 0.16f));
 
-    DrawCleanGeneralSettings(contentWidth);
-    ImGui::Spacing();
+    ImGui::BeginChild("##settings_side_tabs", ImVec2(sideWidth, contentHeight), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    DrawSettingsSideTab("General", ActiveSettingsTab::General);
+    DrawSettingsSideTab("Codex", ActiveSettingsTab::Codex);
+    DrawSettingsSideTab("Claude", ActiveSettingsTab::Claude);
+    DrawSettingsSideTab("Grok", ActiveSettingsTab::Grok);
+    DrawSettingsSideTab("Z.Ai", ActiveSettingsTab::ZAi);
+    ImGui::EndChild();
 
-    float columnGap = 12.0f;
-    bool threeColumns = contentWidth >= 930.0f;
-    bool twoColumns = contentWidth >= 780.0f;
-    float availableHeight = ImGui::GetContentRegionAvail().y;
-    float providerHeight = std::max(390.0f, availableHeight - 2.0f);
+    ImGui::SameLine();
 
-    if (threeColumns) {
-        float columnWidth = (contentWidth - columnGap * 2.0f) / 3.0f;
-
-        DrawProviderSettingsCard("##codex_settings_card", "Codex", g_codexNotifySettings, true, columnWidth, providerHeight);
-        ImGui::SameLine(0.0f, columnGap);
-        DrawProviderSettingsCard("##claude_settings_card", "Claude", g_claudeNotifySettings, false, columnWidth, providerHeight);
-        ImGui::SameLine(0.0f, columnGap);
-        DrawZAiSettingsCard(columnWidth, providerHeight);
-    }
-    else if (twoColumns) {
-        float columnWidth = (contentWidth - columnGap) * 0.5f;
-        float firstRowHeight = providerHeight * 0.58f;
-        float secondRowHeight = providerHeight - firstRowHeight - columnGap;
-
-        DrawProviderSettingsCard("##codex_settings_card", "Codex", g_codexNotifySettings, true, columnWidth, firstRowHeight);
-        ImGui::SameLine(0.0f, columnGap);
-        DrawProviderSettingsCard("##claude_settings_card", "Claude", g_claudeNotifySettings, false, columnWidth, firstRowHeight);
-        ImGui::Spacing();
-        DrawZAiSettingsCard(contentWidth, std::max(180.0f, secondRowHeight));
-    }
-    else {
-        DrawProviderSettingsCard("##codex_settings_card", "Codex", g_codexNotifySettings, true, contentWidth, providerHeight);
-        ImGui::Spacing();
-        DrawProviderSettingsCard("##claude_settings_card", "Claude", g_claudeNotifySettings, false, contentWidth, providerHeight);
-        ImGui::Spacing();
-        DrawZAiSettingsCard(contentWidth, 240.0f);
-    }
+    ImGui::BeginChild("##settings_page", ImVec2(std::max(320.0f, contentWidth - sideWidth - ImGui::GetStyle().ItemSpacing.x), contentHeight), true);
+    float pageWidth = ImGui::GetContentRegionAvail().x;
+    float pageHeight = ImGui::GetContentRegionAvail().y;
+    DrawSelectedSettingsPage(pageWidth, pageHeight);
+    ImGui::EndChild();
 
     ApplySettingsToRuntime();
 
     ImGui::PopStyleVar(3);
+}
+
+enum class ActiveMainTab
+{
+    Codex,
+    Claude,
+    ZAi,
+    Grok,
+    Settings
+};
+
+static ActiveMainTab g_activeTab = ActiveMainTab::Codex;
+
+static bool DrawIconTabButton(const char* id, const char* tooltip, TabImage& image, ActiveMainTab tab)
+{
+    bool selected = g_activeTab == tab;
+
+    ImGui::PushID(id);
+
+    ImVec2 buttonSize(46.0f, 34.0f);
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    bool clicked = ImGui::InvisibleButton("##tab_button", buttonSize);
+    bool hovered = ImGui::IsItemHovered();
+
+    if (clicked) {
+        g_activeTab = tab;
+    }
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    ImU32 fill = selected ? Color(38, 79, 120) : Color(34, 34, 34);
+
+    if (hovered && !selected) {
+        fill = Color(48, 58, 68);
+    }
+
+    draw->AddRectFilled(pos, ImVec2(pos.x + buttonSize.x, pos.y + buttonSize.y), fill, 6.0f);
+    draw->AddRect(pos, ImVec2(pos.x + buttonSize.x, pos.y + buttonSize.y), Color(70, 70, 70), 6.0f);
+
+    if (image.srv) {
+        ImVec2 imageSize(24.0f, 24.0f);
+        ImVec2 imagePos(pos.x + (buttonSize.x - imageSize.x) * 0.5f, pos.y + (buttonSize.y - imageSize.y) * 0.5f);
+        draw->AddImage(
+            reinterpret_cast<ImTextureID>(image.srv),
+            imagePos,
+            ImVec2(imagePos.x + imageSize.x, imagePos.y + imageSize.y)
+        );
+    }
+    else {
+        ImVec2 textSize = ImGui::CalcTextSize(tooltip);
+        draw->AddText(
+            ImVec2(pos.x + (buttonSize.x - textSize.x) * 0.5f, pos.y + (buttonSize.y - textSize.y) * 0.5f),
+            Color(235, 235, 235),
+            tooltip
+        );
+    }
+
+    if (hovered) {
+        ImGui::SetTooltip("%s", tooltip);
+    }
+
+    ImGui::PopID();
+
+    return clicked;
+}
+
+static void DrawProviderTabStrip()
+{
+    TabImage& codex = EnsureTabImage(g_codexTabImage, L"Codex.ico");
+    TabImage& claude = EnsureTabImage(g_claudeTabImage, L"Claude.ico");
+    TabImage& zai = EnsureTabImage(g_zaiTabImage, L"ZAi.ico");
+    TabImage& grok = EnsureTabImage(g_grokTabImage, L"Grok.ico");
+
+    DrawIconTabButton("codex", "Codex", codex, ActiveMainTab::Codex);
+    ImGui::SameLine();
+    DrawIconTabButton("claude", "Claude", claude, ActiveMainTab::Claude);
+    ImGui::SameLine();
+    DrawIconTabButton("zai", "Z.Ai", zai, ActiveMainTab::ZAi);
+    ImGui::SameLine();
+    DrawIconTabButton("grok", "Grok", grok, ActiveMainTab::Grok);
+    ImGui::SameLine();
+
+    bool selected = g_activeTab == ActiveMainTab::Settings;
+    ImGui::PushStyleColor(ImGuiCol_Button, selected ? ImVec4(0.150f, 0.310f, 0.470f, 1.0f) : ImVec4(0.135f, 0.135f, 0.135f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.210f, 0.270f, 0.330f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.180f, 0.360f, 0.540f, 1.0f));
+
+    if (ImGui::Button("Settings", ImVec2(96.0f, 34.0f))) {
+        g_activeTab = ActiveMainTab::Settings;
+    }
+
+    ImGui::PopStyleColor(3);
+
+    ImGui::Separator();
+    ImGui::Spacing();
+}
+
+static void DrawActiveMainTab()
+{
+    switch (g_activeTab) {
+    case ActiveMainTab::Codex:
+        DrawCodexTab();
+        break;
+    case ActiveMainTab::Claude:
+        DrawClaudeTab();
+        break;
+    case ActiveMainTab::ZAi:
+        DrawZAiTab();
+        break;
+    case ActiveMainTab::Grok:
+        DrawGrokTab();
+        break;
+    case ActiveMainTab::Settings:
+        DrawSettingsTab();
+        break;
+    }
 }
 
 void RenderMainUi(State& state)
@@ -1986,29 +2459,8 @@ void RenderMainUi(State& state)
 
     ImGui::BeginChild("##main_panel", ImVec2(0.0f, 0.0f), true, ImGuiWindowFlags_NoScrollbar);
 
-    if (ImGui::BeginTabBar("##provider_tabs")) {
-        if (ImGui::BeginTabItem("Codex")) {
-            DrawCodexTab();
-            ImGui::EndTabItem();
-        }
-
-        if (ImGui::BeginTabItem("Claude")) {
-            DrawClaudeTab();
-            ImGui::EndTabItem();
-        }
-
-        if (ImGui::BeginTabItem("Z.Ai")) {
-            DrawZAiTab();
-            ImGui::EndTabItem();
-        }
-
-        if (ImGui::BeginTabItem("Settings")) {
-            DrawSettingsTab();
-            ImGui::EndTabItem();
-        }
-
-        ImGui::EndTabBar();
-    }
+    DrawProviderTabStrip();
+    DrawActiveMainTab();
 
     ImGui::EndChild();
     ImGui::End();

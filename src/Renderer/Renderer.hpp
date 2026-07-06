@@ -7,25 +7,32 @@
 #include "Codex.hpp"
 #include "Claude.hpp"
 #include "ZAi.hpp"
+#include "Grok.hpp"
 #include "NotifyGUI.hpp"
 #include "AppSettings.hpp"
+
+struct ID3D11Device;
 
 namespace Renderer
 {
     struct State
     {
         bool* shouldClose = nullptr;
+        ID3D11Device* device = nullptr;
 
         std::mutex* codexMutex = nullptr;
         std::mutex* claudeMutex = nullptr;
         std::mutex* zaiMutex = nullptr;
+        std::mutex* grokMutex = nullptr;
         Codex::Snapshot* codexState = nullptr;
         Claude::Snapshot* claudeState = nullptr;
         ZAi::Snapshot* zaiState = nullptr;
+        Grok::Snapshot* grokState = nullptr;
 
         std::atomic_bool* codexLoading = nullptr;
         std::atomic_bool* claudeLoading = nullptr;
         std::atomic_bool* zaiLoading = nullptr;
+        std::atomic_bool* grokLoading = nullptr;
 
         bool* showRemaining = nullptr;
         bool* showResetDateDetails = nullptr;
@@ -46,18 +53,22 @@ namespace Renderer
         AppSettings::ProviderNotifications* codexNotifySettings = nullptr;
         AppSettings::ProviderNotifications* claudeNotifySettings = nullptr;
         AppSettings::ProviderNotifications* zaiNotifySettings = nullptr;
+        AppSettings::ProviderNotifications* grokNotifySettings = nullptr;
 
         AppSettings::CodexQuotaWarnings* codexQuotaWarnings = nullptr;
         AppSettings::ClaudeQuotaWarnings* claudeQuotaWarnings = nullptr;
         AppSettings::ZAiQuotaWarnings* zaiQuotaWarnings = nullptr;
+        AppSettings::GrokQuotaWarnings* grokQuotaWarnings = nullptr;
 
         void (*refreshCodexAsync)() = nullptr;
         void (*refreshClaudeAsync)() = nullptr;
         void (*refreshZAiAsync)() = nullptr;
+        void (*refreshGrokAsync)() = nullptr;
         bool (*saveAppSettings)() = nullptr;
         void (*applySettingsToRuntime)() = nullptr;
     };
 
     void ApplyStyle();
+    void ReleaseTabImages();
     void RenderMainUi(State& state);
 }

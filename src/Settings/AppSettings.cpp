@@ -117,6 +117,18 @@ namespace AppSettings
         return ok;
     }
 
+    static void LoadGrokQuotaWarnings(GrokQuotaWarnings& q, const std::wstring& path)
+    {
+        LoadQuotaRule(L"GrokQuotaWarnings", L"WeeklyEnabled", L"WeeklyPercent", q.weekly, path);
+    }
+
+    static bool SaveGrokQuotaWarnings(const GrokQuotaWarnings& q, const std::wstring& path)
+    {
+        bool ok = true;
+        ok = SaveQuotaRule(L"GrokQuotaWarnings", L"WeeklyEnabled", L"WeeklyPercent", q.weekly, path) && ok;
+        return ok;
+    }
+
     std::wstring GetSettingsIniPath()
     {
         wchar_t exePath[MAX_PATH]{};
@@ -182,9 +194,11 @@ namespace AppSettings
         LoadProvider(L"CodexNotifications", settings.codex, path, true);
         LoadProvider(L"ClaudeNotifications", settings.claude, path, false);
         LoadProvider(L"ZAiNotifications", settings.zai, path, false);
+        LoadProvider(L"GrokNotifications", settings.grok, path, false);
         LoadCodexQuotaWarnings(settings.codexQuotaWarnings, path);
         LoadClaudeQuotaWarnings(settings.claudeQuotaWarnings, path);
         LoadZAiQuotaWarnings(settings.zaiQuotaWarnings, path);
+        LoadGrokQuotaWarnings(settings.grokQuotaWarnings, path);
     }
 
     bool Save(const Settings& settings)
@@ -203,9 +217,11 @@ namespace AppSettings
         ok = SaveProvider(L"CodexNotifications", settings.codex, path, true) && ok;
         ok = SaveProvider(L"ClaudeNotifications", settings.claude, path, false) && ok;
         ok = SaveProvider(L"ZAiNotifications", settings.zai, path, false) && ok;
+        ok = SaveProvider(L"GrokNotifications", settings.grok, path, false) && ok;
         ok = SaveCodexQuotaWarnings(settings.codexQuotaWarnings, path) && ok;
         ok = SaveClaudeQuotaWarnings(settings.claudeQuotaWarnings, path) && ok;
         ok = SaveZAiQuotaWarnings(settings.zaiQuotaWarnings, path) && ok;
+        ok = SaveGrokQuotaWarnings(settings.grokQuotaWarnings, path) && ok;
 
         return ok;
     }
