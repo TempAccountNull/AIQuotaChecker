@@ -27,6 +27,10 @@ jobs:
           vs-version: '[17.0,18.0)'
           msbuild-architecture: x64
 
+      - name: Prepare Dear ImGui and JSON dependencies
+        shell: pwsh
+        run: ./tools/prepare_dependencies.ps1 -ProjectRoot $env:GITHUB_WORKSPACE
+
       - name: Build Release x64
         shell: pwsh
         run: |
@@ -34,6 +38,8 @@ jobs:
           $intermediate = Join-Path $env:RUNNER_TEMP 'AIQuotaChecker\x64'
 
           New-Item -ItemType Directory -Force -Path $output, $intermediate | Out-Null
+          $output = $output.TrimEnd('\') + '\'
+          $intermediate = $intermediate.TrimEnd('\') + '\'
 
           msbuild 'AIQuotaChecker.sln' `
             /m `
@@ -54,6 +60,8 @@ jobs:
           $intermediate = Join-Path $env:RUNNER_TEMP 'AIQuotaChecker\x86'
 
           New-Item -ItemType Directory -Force -Path $output, $intermediate | Out-Null
+          $output = $output.TrimEnd('\') + '\'
+          $intermediate = $intermediate.TrimEnd('\') + '\'
 
           msbuild 'AIQuotaChecker.sln' `
             /m `

@@ -70,15 +70,18 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <AIQuotaThirdPartyDir>$(ProjectDir)third_party</AIQuotaThirdPartyDir>
+    <AIQuotaImGuiDir>$(AIQuotaThirdPartyDir)\imgui-1.92.9b</AIQuotaImGuiDir>
+    <AIQuotaJsonDir>$(AIQuotaThirdPartyDir)\nlohmann-json-3.12.0</AIQuotaJsonDir>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
-      <LanguageStandard>stdcpplatest</LanguageStandard>
-      <LanguageStandard_C>stdclatest</LanguageStandard_C>
-      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;$(AIQuotaImGuiDir);$(AIQuotaImGuiDir)\backends;$(AIQuotaJsonDir)\single_include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>Global.hpp</PrecompiledHeaderFile>
     </ClCompile>
@@ -98,9 +101,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
-      <LanguageStandard>stdcpplatest</LanguageStandard>
-      <LanguageStandard_C>stdclatest</LanguageStandard_C>
-      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;$(AIQuotaImGuiDir);$(AIQuotaImGuiDir)\backends;$(AIQuotaJsonDir)\single_include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>Global.hpp</PrecompiledHeaderFile>
     </ClCompile>
@@ -120,7 +121,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpplatest</LanguageStandard>
       <LanguageStandard_C>stdclatest</LanguageStandard_C>
-      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;$(AIQuotaImGuiDir);$(AIQuotaImGuiDir)\backends;$(AIQuotaJsonDir)\single_include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>Global.hpp</PrecompiledHeaderFile>
     </ClCompile>
@@ -142,7 +143,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpplatest</LanguageStandard>
       <LanguageStandard_C>stdclatest</LanguageStandard_C>
-      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;$(AIQuotaImGuiDir);$(AIQuotaImGuiDir)\backends;$(AIQuotaJsonDir)\single_include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>Global.hpp</PrecompiledHeaderFile>
     </ClCompile>
@@ -220,6 +221,26 @@
     <ClCompile Include="src\Providers\Grok\GrokProvider.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="$(AIQuotaImGuiDir)\imgui.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="$(AIQuotaImGuiDir)\imgui_draw.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="$(AIQuotaImGuiDir)\imgui_tables.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="$(AIQuotaImGuiDir)\imgui_widgets.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="$(AIQuotaImGuiDir)\backends\imgui_impl_dx11.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="$(AIQuotaImGuiDir)\backends\imgui_impl_win32.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
     <ResourceCompile Include="src\Resources\AIQuotaChecker.rc" />
   </ItemGroup>
   <ItemGroup>
@@ -255,4 +276,10 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
+  <Target Name="VerifyAIQuotaDependencies" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('$(AIQuotaImGuiDir)\imgui.h')" Text="Dear ImGui is missing. Run tools\prepare_dependencies.ps1 before building." />
+    <Error Condition="!Exists('$(AIQuotaImGuiDir)\backends\imgui_impl_dx11.cpp')" Text="The Dear ImGui DirectX 11 backend is missing." />
+    <Error Condition="!Exists('$(AIQuotaImGuiDir)\backends\imgui_impl_win32.cpp')" Text="The Dear ImGui Win32 backend is missing." />
+    <Error Condition="!Exists('$(AIQuotaJsonDir)\single_include\nlohmann\json.hpp')" Text="nlohmann/json is missing. Run tools\prepare_dependencies.ps1 before building." />
+  </Target>
 </Project>
