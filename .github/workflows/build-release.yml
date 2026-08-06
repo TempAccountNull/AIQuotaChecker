@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   build-release:
-    name: Build Windows releases
+    name: Build Windows x64 release
     runs-on: windows-2022
     timeout-minutes: 30
 
@@ -53,28 +53,6 @@ jobs:
             throw "The x64 build failed with exit code $LASTEXITCODE."
           }
 
-      - name: Build Release x86
-        shell: pwsh
-        run: |
-          $output = Join-Path $env:GITHUB_WORKSPACE 'build\Release\x86'
-          $intermediate = Join-Path $env:RUNNER_TEMP 'AIQuotaChecker\x86'
-
-          New-Item -ItemType Directory -Force -Path $output, $intermediate | Out-Null
-          $output = $output.TrimEnd('\') + '\'
-          $intermediate = $intermediate.TrimEnd('\') + '\'
-
-          msbuild 'AIQuotaChecker.sln' `
-            /m `
-            /t:Build `
-            /p:Configuration=Release `
-            /p:Platform=x86 `
-            "/p:OutDir=$output" `
-            "/p:IntDir=$intermediate"
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "The x86 build failed with exit code $LASTEXITCODE."
-          }
-
       - name: Package release files
         shell: pwsh
         run: |
@@ -83,24 +61,19 @@ jobs:
           $title = "AIQuotaChecker $date - Build $env:GITHUB_RUN_NUMBER"
           $assets = Join-Path $env:GITHUB_WORKSPACE 'release-assets'
           $x64Output = Join-Path $env:GITHUB_WORKSPACE 'build\Release\x64'
-          $x86Output = Join-Path $env:GITHUB_WORKSPACE 'build\Release\x86'
 
           Remove-Item $assets -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $assets | Out-Null
 
-          foreach ($output in @($x64Output, $x86Output)) {
-            if (-not (Test-Path (Join-Path $output 'AIQuotaChecker.exe'))) {
-              throw "Expected build output was not found: $output\AIQuotaChecker.exe"
-            }
-
-            Copy-Item 'README.md' (Join-Path $output 'README.md') -Force
+          if (-not (Test-Path (Join-Path $x64Output 'AIQuotaChecker.exe'))) {
+            throw "Expected build output was not found: $x64Output\AIQuotaChecker.exe"
           }
 
+          Copy-Item 'README.md' (Join-Path $x64Output 'README.md') -Force
+
           $x64Archive = Join-Path $assets "AIQuotaChecker-Windows-x64-$tag.zip"
-          $x86Archive = Join-Path $assets "AIQuotaChecker-Windows-x86-$tag.zip"
 
           Compress-Archive -Path (Join-Path $x64Output '*') -DestinationPath $x64Archive -CompressionLevel Optimal
-          Compress-Archive -Path (Join-Path $x86Output '*') -DestinationPath $x86Archive -CompressionLevel Optimal
 
           $checksumFile = Join-Path $assets 'SHA256SUMS.txt'
           Get-ChildItem $assets -Filter '*.zip' |
