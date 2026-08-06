@@ -56,6 +56,9 @@ namespace
     static bool g_showNotificationsInsideWindow = false;
     static bool g_autoRefreshEnabled = true;
     static int g_autoRefreshMinutes = 1;
+    static int g_claudeAccountSource = 0;
+    static int g_codexAccountSource = 0;
+    static std::string g_codexCustomAuthPath;
 
     static std::atomic_bool g_autoRefreshDisableRequested = false;
     static std::mutex g_autoRefreshWarningMutex;
@@ -136,7 +139,9 @@ namespace
         NotifyGUI::SetInsideWindow(g_showNotificationsInsideWindow);
 
         int repeatSeconds = AutoRefreshIntervalSeconds();
+        CodexProvider::get_instance()->SetAccountSource(g_codexAccountSource, g_codexCustomAuthPath);
         CodexProvider::get_instance()->ApplyRuntime(g_notifyPosition, repeatSeconds);
+        ClaudeProvider::get_instance()->SetAccountSource(g_claudeAccountSource);
         ClaudeProvider::get_instance()->ApplyRuntime(g_notifyPosition, repeatSeconds);
         ZAiProvider::get_instance()->ApplyRuntime(g_notifyPosition, repeatSeconds);
         GrokProvider::get_instance()->ApplyRuntime(g_notifyPosition, repeatSeconds);
@@ -154,6 +159,9 @@ namespace
         g_notifyPositionIndex = settings.notificationPositionIndex;
         g_autoRefreshEnabled = settings.autoRefreshEnabled;
         g_autoRefreshMinutes = AppSettings::ClampAutoRefreshMinutes(settings.autoRefreshMinutes);
+        g_claudeAccountSource = AppSettings::ClampClaudeAccountSource(settings.claudeAccountSource);
+        g_codexAccountSource = AppSettings::ClampCodexAccountSource(settings.codexAccountSource);
+        g_codexCustomAuthPath = settings.codexCustomAuthPath;
 
         CodexProvider::get_instance()->LoadSettings(settings);
         ClaudeProvider::get_instance()->LoadSettings(settings);
@@ -173,6 +181,9 @@ namespace
         settings.notificationPositionIndex = g_notifyPositionIndex;
         settings.autoRefreshEnabled = g_autoRefreshEnabled;
         settings.autoRefreshMinutes = AppSettings::ClampAutoRefreshMinutes(g_autoRefreshMinutes);
+        settings.claudeAccountSource = AppSettings::ClampClaudeAccountSource(g_claudeAccountSource);
+        settings.codexAccountSource = AppSettings::ClampCodexAccountSource(g_codexAccountSource);
+        settings.codexCustomAuthPath = g_codexCustomAuthPath;
 
         CodexProvider::get_instance()->SaveSettings(settings);
         ClaudeProvider::get_instance()->SaveSettings(settings);
@@ -500,6 +511,9 @@ namespace
         g_rendererState.showNotificationsInsideWindow = &g_showNotificationsInsideWindow;
         g_rendererState.autoRefreshEnabled = &g_autoRefreshEnabled;
         g_rendererState.autoRefreshMinutes = &g_autoRefreshMinutes;
+        g_rendererState.claudeAccountSource = &g_claudeAccountSource;
+        g_rendererState.codexAccountSource = &g_codexAccountSource;
+        g_rendererState.codexCustomAuthPath = &g_codexCustomAuthPath;
         g_rendererState.autoRefreshWarning = &g_autoRefreshWarning;
         g_rendererState.autoRefreshWarningMutex = &g_autoRefreshWarningMutex;
 

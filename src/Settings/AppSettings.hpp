@@ -55,6 +55,19 @@ namespace AppSettings
         bool autoRefreshEnabled = true;
         int autoRefreshMinutes = 1;
 
+        // 0 = Auto (Desktop, credentials file, then environment token)
+        // 1 = Claude Desktop only
+        // 2 = Claude Code .credentials.json only
+        // 3 = CLAUDE_CODE_OAUTH_TOKEN only
+        int claudeAccountSource = 0;
+
+        // 0 = Auto (active Codex account, then default auth.json when app-server is unavailable)
+        // 1 = Active Codex account only (app-server)
+        // 2 = Default CODEX_HOME\auth.json only
+        // 3 = Custom auth.json path only
+        int codexAccountSource = 0;
+        std::string codexCustomAuthPath;
+
         ProviderNotifications codex;
         ProviderNotifications claude;
         ProviderNotifications zai;
@@ -73,7 +86,11 @@ namespace AppSettings
     int ClampPrepareMinutes(int value);
     int ClampAutoRefreshMinutes(int value);
     int ClampResetDisplayMode(int value);
+    int ClampClaudeAccountSource(int value);
+    int ClampCodexAccountSource(int value);
 
     void Load(Settings& settings);
     bool Save(const Settings& settings);
+    bool SaveClaudeAccountSource(int value);
+    bool SaveCodexAccountSource(int value, const std::string& customAuthPath);
 }

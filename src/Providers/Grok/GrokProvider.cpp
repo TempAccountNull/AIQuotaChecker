@@ -120,8 +120,12 @@ void GrokProvider::RefreshAsync()
                 self->HandleRateLimit(error);
             }
 
+            Grok::Snapshot failedSnapshot;
+            failedSnapshot.statusText = error;
+            failedSnapshot.lastUpdated = "now";
+
             std::lock_guard<std::mutex> lock(*self->StateMutex());
-            self->Snapshot()->statusText = error;
+            *self->Snapshot() = failedSnapshot;
         }
 
         *self->Loading() = false;

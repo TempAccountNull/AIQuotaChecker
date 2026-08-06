@@ -277,23 +277,9 @@ namespace ZAi
     {
         std::vector<std::string> tokens;
 
-        const char* envNames[] = {
-            "ZCODE_JWT_TOKEN",
-            "ZCODEJWTTOKEN",
-            "ZAI_ZCODE_JWT_TOKEN",
-            "ZAI_ACCESS_TOKEN",
-            "ZCODE_ACCESS_TOKEN",
-            "ZAI_TOKEN"
-        };
-
-        for (const char* name : envNames) {
-            std::string value = Network::get_instance()->GetEnvText(name);
-
-            if (LooksLikeToken(value)) {
-                tokens.push_back(value);
-            }
-        }
-
+        // Prefer the enabled provider in the active ZCode config, then other
+        // credential files. Environment tokens are fallback-only because an old
+        // process environment survives account changes.
         CollectZCodeConfigTokens(tokens);
 
         for (const std::filesystem::path& path : CandidateCredentialFiles()) {
@@ -324,6 +310,23 @@ namespace ZAi
             }
 
             CollectRegexTokens(text, tokens);
+        }
+
+        const char* envNames[] = {
+            "ZCODE_JWT_TOKEN",
+            "ZCODEJWTTOKEN",
+            "ZAI_ZCODE_JWT_TOKEN",
+            "ZAI_ACCESS_TOKEN",
+            "ZCODE_ACCESS_TOKEN",
+            "ZAI_TOKEN"
+        };
+
+        for (const char* name : envNames) {
+            std::string value = Network::get_instance()->GetEnvText(name);
+
+            if (LooksLikeToken(value)) {
+                tokens.push_back(value);
+            }
         }
 
         std::vector<std::string> unique;
@@ -417,32 +420,6 @@ namespace ZAi
         bar.thin = false;
     }
 
-    static bool HasModelBar(const Snapshot& snapshot, const std::string& modelName)
-    {
-        for (const UsageBar& bar : snapshot.bars) {
-            if (NormalizeModelName(bar.label) == modelName) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    static void AddFallbackModelBar(Snapshot& snapshot, const std::string& modelName, double total)
-    {
-        if (HasModelBar(snapshot, modelName)) {
-            return;
-        }
-
-        UsageBar bar;
-        bar.label = modelName;
-        bar.sublabel = Format::get_instance()->IntegerWithCommas(total) + " / " + Format::get_instance()->IntegerWithCommas(total);
-        bar.resetText = "";
-        bar.usedPercent = 0.0f;
-        ApplyZaiBarStyle(bar);
-        snapshot.bars.push_back(bar);
-    }
-
     static void FinalizeZaiBars(Snapshot& snapshot)
     {
         std::vector<UsageBar> unique;
@@ -465,10 +442,6 @@ namespace ZAi
 
         snapshot.bars = unique;
 
-        // ZCode Start Plan currently exposes these two model balances in the UI.
-        // Keep both bars visible even if one endpoint omits a model row.
-        AddFallbackModelBar(snapshot, "GLM-5.2", 3000000.0);
-        AddFallbackModelBar(snapshot, "GLM-5-Turbo", 2000000.0);
 
         std::stable_sort(snapshot.bars.begin(), snapshot.bars.end(), [](const UsageBar& a, const UsageBar& b) {
             return ModelSortRank(a.label) < ModelSortRank(b.label);

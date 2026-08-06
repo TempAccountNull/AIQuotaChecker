@@ -121,6 +121,14 @@ namespace Grok
 
         static GrokAuth LoadAuth()
         {
+            // The signed-in CLI account is represented by auth.json. Prefer it over
+            // inherited environment variables that can still reference an old account.
+            std::filesystem::path authPath = Network::get_instance()->UserProfilePath() / ".grok" / "auth.json";
+
+            if (std::filesystem::exists(authPath)) {
+                return LoadAuthFromFile();
+            }
+
             GrokAuth auth;
             auth.key = Network::get_instance()->GetEnvText("GROK_DEPLOYMENT_KEY");
             auth.userId = Network::get_instance()->GetEnvText("GROK_USER_ID");
@@ -129,7 +137,7 @@ namespace Grok
                 return auth;
             }
 
-            return LoadAuthFromFile();
+            throw std::runtime_error("Grok credentials not found");
         }
 
         static std::wstring BuildHeaders(const GrokAuth& auth)
@@ -218,7 +226,11 @@ namespace Grok
 
             std::string periodType = currentPeriod ? JsonUtils::get_instance()->String(*currentPeriod, "type") : std::string();
 
-            snapshot.weeklyLimit.valid = true;
+            bool hasUsagePercent = config.contains("creditUsagePercent") ||
+                (config.contains("productUsage") && config.at("productUsage").is_array());
+            bool hasPeriod = currentPeriod != nullptr || config.contains("billingPeriodEnd");
+
+            snapshot.weeklyLimit.valid = hasUsagePercent || hasPeriod;
             snapshot.weeklyLimit.title = PeriodTitle(periodType);
             snapshot.weeklyLimit.subtitle = PeriodSubtitle(periodType);
             snapshot.weeklyLimit.usedPercent = static_cast<float>(Math::get_instance()->ClampPercentDouble(
@@ -249,7 +261,9 @@ namespace Grok
                 onDemandUsed = JsonUtils::get_instance()->Number(config.at("onDemandUsed"), "val", 0.0);
             }
 
-            snapshot.extraCredits.valid = true;
+            snapshot.extraCredits.valid =
+                (config.contains("prepaidBalance") && config.at("prepaidBalance").is_object()) ||
+                (config.contains("onDemandUsed") && config.at("onDemandUsed").is_object());
             snapshot.extraCredits.balanceText = FormatMoneyFromCents(prepaidBalance);
             snapshot.extraCredits.usedText = FormatMoneyFromCents(onDemandUsed);
             snapshot.extraCredits.usedPercent = 0.0f;

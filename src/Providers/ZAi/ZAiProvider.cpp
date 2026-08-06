@@ -117,8 +117,12 @@ void ZAiProvider::RefreshAsync()
                 self->HandleRateLimit(error);
             }
 
+            ZAi::Snapshot failedSnapshot;
+            failedSnapshot.statusText = error;
+            failedSnapshot.lastUpdated = "now";
+
             std::lock_guard<std::mutex> lock(*self->StateMutex());
-            self->Snapshot()->statusText = error;
+            *self->Snapshot() = failedSnapshot;
         }
 
         *self->Loading() = false;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <string>
 
@@ -21,6 +22,10 @@ public:
 
     AppSettings::ProviderNotifications* NotifySettings();
     AppSettings::CodexQuotaWarnings* QuotaWarnings();
+
+    void SetAccountSource(int source, const std::string& customAuthPath);
+    int AccountSource() const;
+    std::string CustomAuthPath() const;
 
     void SetRateLimitCallback(RateLimitCallback callback);
 
@@ -43,6 +48,11 @@ private:
 
     AppSettings::ProviderNotifications m_notifySettings;
     AppSettings::CodexQuotaWarnings m_quotaWarnings;
+
+    std::atomic_int m_accountSource = 0;
+    std::atomic<std::uint64_t> m_sourceGeneration = 0;
+    mutable std::mutex m_sourceMutex;
+    std::string m_customAuthPath;
 
     RateLimitCallback m_rateLimitCallback = nullptr;
 };

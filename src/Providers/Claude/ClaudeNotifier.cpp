@@ -159,7 +159,7 @@ namespace
         AddUsageWindow(points, snapshot.weeklySonnet, config.sonnet, "claude_weekly_sonnet", "weekly - Sonnet");
         AddUsageWindow(points, snapshot.weeklyFable, config.fable, "claude_weekly_fable", "weekly - Fable");
 
-        if (snapshot.credits.valid && snapshot.credits.enabled) {
+        if (snapshot.credits.valid && snapshot.credits.enabled && snapshot.credits.hasUsedPercent) {
             WatchPoint point;
             point.key = "claude_usage_credits";
             point.label = "Usage credits";

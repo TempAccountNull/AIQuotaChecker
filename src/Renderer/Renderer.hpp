@@ -40,6 +40,9 @@ namespace Renderer
         bool* showNotificationsInsideWindow = nullptr;
         bool* autoRefreshEnabled = nullptr;
         int* autoRefreshMinutes = nullptr;
+        int* claudeAccountSource = nullptr;
+        int* codexAccountSource = nullptr;
+        std::string* codexCustomAuthPath = nullptr;
 
         std::string* autoRefreshWarning = nullptr;
         std::mutex* autoRefreshWarningMutex = nullptr;

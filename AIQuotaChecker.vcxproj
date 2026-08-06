@@ -167,9 +167,12 @@
     <ClInclude Include="src\Win32\NotifyGUI.hpp" />
     <ClInclude Include="src\Window\Window.hpp" />
     <ClInclude Include="src\Providers\Codex\Codex.hpp" />
+    <ClInclude Include="src\Providers\Codex\CodexAppServer.hpp" />
     <ClInclude Include="src\Providers\Codex\CodexNotifier.hpp" />
     <ClInclude Include="src\Providers\Codex\CodexProvider.hpp" />
     <ClInclude Include="src\Providers\Claude\Claude.hpp" />
+    <ClInclude Include="src\Providers\Claude\ClaudeDesktopAuth.hpp" />
+    <ClInclude Include="src\Providers\Claude\ClaudeCookieStore.hpp" />
     <ClInclude Include="src\Providers\Claude\ClaudeNotifier.hpp" />
     <ClInclude Include="src\Providers\Claude\ClaudeProvider.hpp" />
     <ClInclude Include="src\Providers\ZAi\ZAi.hpp" />
@@ -197,9 +200,12 @@
     <ClCompile Include="src\Win32\NotifyGUI.cpp" />
     <ClCompile Include="src\Window\Window.cpp" />
     <ClCompile Include="src\Providers\Codex\Codex.cpp" />
+    <ClCompile Include="src\Providers\Codex\CodexAppServer.cpp" />
     <ClCompile Include="src\Providers\Codex\CodexNotifier.cpp" />
     <ClCompile Include="src\Providers\Codex\CodexProvider.cpp" />
     <ClCompile Include="src\Providers\Claude\Claude.cpp" />
+    <ClCompile Include="src\Providers\Claude\ClaudeDesktopAuth.cpp" />
+    <ClCompile Include="src\Providers\Claude\ClaudeCookieStore.cpp" />
     <ClCompile Include="src\Providers\Claude\ClaudeNotifier.cpp" />
     <ClCompile Include="src\Providers\Claude\ClaudeProvider.cpp" />
     <ClCompile Include="src\Providers\ZAi\ZAi.cpp" />

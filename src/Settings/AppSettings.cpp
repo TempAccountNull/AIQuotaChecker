@@ -29,6 +29,96 @@ namespace AppSettings
         return WritePrivateProfileStringW(section, key, text.c_str(), path.c_str()) != 0;
     }
 
+    static std::string WideToUtf8(const std::wstring& value)
+    {
+        if (value.empty()) {
+            return {};
+        }
+
+        int size = WideCharToMultiByte(
+            CP_UTF8,
+            0,
+            value.data(),
+            static_cast<int>(value.size()),
+            nullptr,
+            0,
+            nullptr,
+            nullptr
+        );
+
+        if (size <= 0) {
+            return {};
+        }
+
+        std::string result(static_cast<size_t>(size), '\0');
+        WideCharToMultiByte(
+            CP_UTF8,
+            0,
+            value.data(),
+            static_cast<int>(value.size()),
+            result.data(),
+            size,
+            nullptr,
+            nullptr
+        );
+        return result;
+    }
+
+    static std::wstring Utf8ToWide(const std::string& value)
+    {
+        if (value.empty()) {
+            return {};
+        }
+
+        int size = MultiByteToWideChar(
+            CP_UTF8,
+            MB_ERR_INVALID_CHARS,
+            value.data(),
+            static_cast<int>(value.size()),
+            nullptr,
+            0
+        );
+
+        if (size <= 0) {
+            return {};
+        }
+
+        std::wstring result(static_cast<size_t>(size), L'\0');
+        MultiByteToWideChar(
+            CP_UTF8,
+            MB_ERR_INVALID_CHARS,
+            value.data(),
+            static_cast<int>(value.size()),
+            result.data(),
+            size
+        );
+        return result;
+    }
+
+    static std::string ReadUtf8(const wchar_t* section, const wchar_t* key, const std::string& fallback, const std::wstring& path)
+    {
+        std::wstring fallbackWide = Utf8ToWide(fallback);
+        std::wstring buffer(32768, L'\0');
+
+        DWORD copied = GetPrivateProfileStringW(
+            section,
+            key,
+            fallbackWide.c_str(),
+            buffer.data(),
+            static_cast<DWORD>(buffer.size()),
+            path.c_str()
+        );
+
+        buffer.resize(static_cast<size_t>(copied));
+        return WideToUtf8(buffer);
+    }
+
+    static bool WriteUtf8(const wchar_t* section, const wchar_t* key, const std::string& value, const std::wstring& path)
+    {
+        std::wstring wide = Utf8ToWide(value);
+        return WritePrivateProfileStringW(section, key, wide.c_str(), path.c_str()) != 0;
+    }
+
     static void LoadProvider(const wchar_t* section, ProviderNotifications& p, const std::wstring& path, bool hasResetCredits)
     {
         p.enabled = ReadBool(section, L"Enabled", p.enabled, path);
@@ -179,6 +269,20 @@ namespace AppSettings
         return ResetTime::get_instance()->ClampMode(value);
     }
 
+    int ClampClaudeAccountSource(int value)
+    {
+        if (value < 0) return 0;
+        if (value > 3) return 3;
+        return value;
+    }
+
+    int ClampCodexAccountSource(int value)
+    {
+        if (value < 0) return 0;
+        if (value > 3) return 3;
+        return value;
+    }
+
     void Load(Settings& settings)
     {
         std::wstring path = GetSettingsIniPath();
@@ -190,6 +294,18 @@ namespace AppSettings
         settings.notificationPositionIndex = ClampNotificationPositionIndex(ReadInt(L"Notifications", L"PositionIndex", settings.notificationPositionIndex, path));
         settings.autoRefreshEnabled = ReadBool(L"AutoRefresh", L"Enabled", settings.autoRefreshEnabled, path);
         settings.autoRefreshMinutes = ClampAutoRefreshMinutes(ReadInt(L"AutoRefresh", L"Minutes", settings.autoRefreshMinutes, path));
+        settings.claudeAccountSource = ClampClaudeAccountSource(
+            ReadInt(L"Claude", L"AccountSource", settings.claudeAccountSource, path)
+        );
+        settings.codexAccountSource = ClampCodexAccountSource(
+            ReadInt(L"Codex", L"AccountSource", settings.codexAccountSource, path)
+        );
+        settings.codexCustomAuthPath = ReadUtf8(
+            L"Codex",
+            L"CustomAuthPath",
+            settings.codexCustomAuthPath,
+            path
+        );
 
         LoadProvider(L"CodexNotifications", settings.codex, path, true);
         LoadProvider(L"ClaudeNotifications", settings.claude, path, false);
@@ -199,6 +315,25 @@ namespace AppSettings
         LoadClaudeQuotaWarnings(settings.claudeQuotaWarnings, path);
         LoadZAiQuotaWarnings(settings.zaiQuotaWarnings, path);
         LoadGrokQuotaWarnings(settings.grokQuotaWarnings, path);
+    }
+
+    bool SaveClaudeAccountSource(int value)
+    {
+        return WriteInt(
+            L"Claude",
+            L"AccountSource",
+            ClampClaudeAccountSource(value),
+            GetSettingsIniPath()
+        );
+    }
+
+    bool SaveCodexAccountSource(int value, const std::string& customAuthPath)
+    {
+        std::wstring path = GetSettingsIniPath();
+        bool ok = true;
+        ok = WriteInt(L"Codex", L"AccountSource", ClampCodexAccountSource(value), path) && ok;
+        ok = WriteUtf8(L"Codex", L"CustomAuthPath", customAuthPath, path) && ok;
+        return ok;
     }
 
     bool Save(const Settings& settings)
@@ -213,6 +348,19 @@ namespace AppSettings
         ok = WriteInt(L"Notifications", L"PositionIndex", ClampNotificationPositionIndex(settings.notificationPositionIndex), path) && ok;
         ok = WriteBool(L"AutoRefresh", L"Enabled", settings.autoRefreshEnabled, path) && ok;
         ok = WriteInt(L"AutoRefresh", L"Minutes", ClampAutoRefreshMinutes(settings.autoRefreshMinutes), path) && ok;
+        ok = WriteInt(
+            L"Claude",
+            L"AccountSource",
+            ClampClaudeAccountSource(settings.claudeAccountSource),
+            path
+        ) && ok;
+        ok = WriteInt(
+            L"Codex",
+            L"AccountSource",
+            ClampCodexAccountSource(settings.codexAccountSource),
+            path
+        ) && ok;
+        ok = WriteUtf8(L"Codex", L"CustomAuthPath", settings.codexCustomAuthPath, path) && ok;
 
         ok = SaveProvider(L"CodexNotifications", settings.codex, path, true) && ok;
         ok = SaveProvider(L"ClaudeNotifications", settings.claude, path, false) && ok;

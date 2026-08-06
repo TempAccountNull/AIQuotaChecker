@@ -51,6 +51,67 @@ AppSettings::CodexQuotaWarnings* CodexProvider::QuotaWarnings()
     return &m_quotaWarnings;
 }
 
+void CodexProvider::SetAccountSource(int source, const std::string& customAuthPath)
+{
+    source = AppSettings::ClampCodexAccountSource(source);
+    bool changed = false;
+
+    {
+        std::lock_guard<std::mutex> lock(m_sourceMutex);
+        int previousSource = m_accountSource.load();
+        bool sourceChanged = previousSource != source;
+        bool relevantPathChanged =
+            (source == 3 || previousSource == 3) && m_customAuthPath != customAuthPath;
+
+        m_accountSource = source;
+        m_customAuthPath = customAuthPath;
+        changed = sourceChanged || relevantPathChanged;
+
+        if (changed) {
+            m_sourceGeneration.fetch_add(1);
+        }
+    }
+
+    if (!changed) {
+        return;
+    }
+
+    Codex::Snapshot switching;
+
+    switch (source) {
+    case 1:
+        switching.statusText = "Switching to the active Codex app-server account";
+        break;
+    case 2:
+        switching.statusText = "Switching to CODEX_HOME\\auth.json";
+        break;
+    case 3:
+        switching.statusText = customAuthPath.empty()
+            ? "Custom Codex auth.json selected, but no path is configured"
+            : "Switching to the selected custom Codex auth.json";
+        break;
+    default:
+        switching.statusText = "Selecting the active Codex account automatically";
+        break;
+    }
+
+    switching.lastUpdated = "now";
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_snapshot = switching;
+}
+
+int CodexProvider::AccountSource() const
+{
+    return AppSettings::ClampCodexAccountSource(m_accountSource.load());
+}
+
+std::string CodexProvider::CustomAuthPath() const
+{
+    std::lock_guard<std::mutex> lock(m_sourceMutex);
+    return m_customAuthPath;
+}
+
 void CodexProvider::SetRateLimitCallback(RateLimitCallback callback)
 {
     m_rateLimitCallback = callback;
@@ -103,31 +164,69 @@ void CodexProvider::RefreshAsync()
         return;
     }
 
-    std::thread([] {
+    int selectedSource = 0;
+    std::string customAuthPath;
+    std::uint64_t sourceGeneration = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(m_sourceMutex);
+        selectedSource = AppSettings::ClampCodexAccountSource(m_accountSource.load());
+        customAuthPath = m_customAuthPath;
+        sourceGeneration = m_sourceGeneration.load();
+    }
+
+    std::thread([selectedSource, customAuthPath, sourceGeneration] {
         CodexProvider* self = CodexProvider::get_instance();
+        bool sourceChanged = false;
 
         try {
-            Codex::Snapshot snapshot = Codex::FetchSnapshot();
+            Codex::AccountSource source = Codex::AccountSource::Auto;
 
-            if (Network::get_instance()->IsRateLimitText(snapshot.statusText)) {
-                self->HandleRateLimit(snapshot.statusText);
+            if (selectedSource == 1) {
+                source = Codex::AccountSource::ActiveAccount;
+            }
+            else if (selectedSource == 2) {
+                source = Codex::AccountSource::AuthFile;
+            }
+            else if (selectedSource == 3) {
+                source = Codex::AccountSource::CustomAuthFile;
             }
 
-            std::lock_guard<std::mutex> lock(*self->StateMutex());
-            *self->Snapshot() = snapshot;
+            Codex::Snapshot snapshot = Codex::FetchSnapshot(source, customAuthPath);
+            sourceChanged = self->m_sourceGeneration.load() != sourceGeneration;
+
+            if (!sourceChanged) {
+                if (Network::get_instance()->IsRateLimitText(snapshot.statusText)) {
+                    self->HandleRateLimit(snapshot.statusText);
+                }
+
+                std::lock_guard<std::mutex> lock(*self->StateMutex());
+                *self->Snapshot() = snapshot;
+            }
         }
         catch (const std::exception& e) {
             std::string error = std::string("Codex error: ") + e.what();
+            sourceChanged = self->m_sourceGeneration.load() != sourceGeneration;
 
-            if (Network::get_instance()->IsRateLimitText(error)) {
-                self->HandleRateLimit(error);
+            if (!sourceChanged) {
+                if (Network::get_instance()->IsRateLimitText(error)) {
+                    self->HandleRateLimit(error);
+                }
+
+                Codex::Snapshot failedSnapshot;
+                failedSnapshot.statusText = error;
+                failedSnapshot.lastUpdated = "now";
+
+                std::lock_guard<std::mutex> lock(*self->StateMutex());
+                *self->Snapshot() = failedSnapshot;
             }
-
-            std::lock_guard<std::mutex> lock(*self->StateMutex());
-            self->Snapshot()->statusText = error;
         }
 
         *self->Loading() = false;
+
+        if (sourceChanged) {
+            self->RefreshAsync();
+        }
     }).detach();
 }
 

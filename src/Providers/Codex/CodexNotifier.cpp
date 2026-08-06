@@ -171,6 +171,10 @@ namespace
         resetPoints.clear();
 
         for (const Codex::UsageBar& bar : snapshot.bars) {
+            if (!bar.valid || !bar.quotaNotificationEligible) {
+                continue;
+            }
+
             ResetPoint point;
             point.label = bar.label;
             FillCodexPointIdentity(bar.label, point);

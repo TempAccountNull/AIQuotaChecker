@@ -5,14 +5,18 @@
 #include "Math.hpp"
 #include "Format.hpp"
 #include "ResetTime.hpp"
+#include "Network.hpp"
 
 #include <windows.h>
+#include <commdlg.h>
 #include <d3d11.h>
 #include <wincodec.h>
 #include <filesystem>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cstring>
 #include <cmath>
 #include <ctime>
 #include <iomanip>
@@ -33,6 +37,7 @@
 #include "AppSettings.hpp"
 
 #pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "comdlg32.lib")
 
 namespace Renderer
 {
@@ -55,6 +60,83 @@ namespace Renderer
     static TabImage g_claudeTabImage;
     static TabImage g_zaiTabImage;
     static TabImage g_grokTabImage;
+
+    static std::array<char, 32768> g_codexCustomPathBuffer{};
+    static std::string g_codexCustomPathBufferSynced;
+    static bool g_codexCustomPathBufferDirty = false;
+
+    template <std::size_t N>
+    static void CopyStringToBuffer(std::array<char, N>& destination, const std::string& source)
+    {
+        static_assert(N > 0, "Destination buffer must not be empty");
+
+        destination.fill('\0');
+        const std::size_t count = (std::min)(source.size(), N - 1);
+
+        if (count > 0) {
+            std::memcpy(destination.data(), source.data(), count);
+        }
+    }
+
+    static std::string WideToUtf8(const std::wstring& value)
+    {
+        if (value.empty()) {
+            return {};
+        }
+
+        int size = WideCharToMultiByte(
+            CP_UTF8,
+            0,
+            value.data(),
+            static_cast<int>(value.size()),
+            nullptr,
+            0,
+            nullptr,
+            nullptr
+        );
+
+        if (size <= 0) {
+            return {};
+        }
+
+        std::string result(static_cast<size_t>(size), '\0');
+        WideCharToMultiByte(
+            CP_UTF8,
+            0,
+            value.data(),
+            static_cast<int>(value.size()),
+            result.data(),
+            size,
+            nullptr,
+            nullptr
+        );
+        return result;
+    }
+
+    static bool BrowseForCodexAuthJson(std::string& selectedPath)
+    {
+        std::array<wchar_t, 32768> fileBuffer{};
+
+        if (!selectedPath.empty()) {
+            std::wstring current = Network::get_instance()->Utf8ToWide(selectedPath);
+            wcsncpy_s(fileBuffer.data(), fileBuffer.size(), current.c_str(), _TRUNCATE);
+        }
+
+        OPENFILENAMEW dialog{};
+        dialog.lStructSize = sizeof(dialog);
+        dialog.lpstrFilter = L"JSON files (*.json)\0*.json\0All files (*.*)\0*.*\0\0";
+        dialog.lpstrFile = fileBuffer.data();
+        dialog.nMaxFile = static_cast<DWORD>(fileBuffer.size());
+        dialog.lpstrTitle = L"Select Codex auth.json";
+        dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+
+        if (!GetOpenFileNameW(&dialog)) {
+            return false;
+        }
+
+        selectedPath = WideToUtf8(fileBuffer.data());
+        return !selectedPath.empty();
+    }
 
     static std::filesystem::path ExeDirectory()
     {
@@ -246,6 +328,9 @@ namespace Renderer
 #define g_showNotificationsInsideWindow (*R().showNotificationsInsideWindow)
 #define g_autoRefreshEnabled (*R().autoRefreshEnabled)
 #define g_autoRefreshMinutes (*R().autoRefreshMinutes)
+#define g_claudeAccountSource (*R().claudeAccountSource)
+#define g_codexAccountSource (*R().codexAccountSource)
+#define g_codexCustomAuthPath (*R().codexCustomAuthPath)
 #define g_notifyPositionIndex (*R().notifyPositionIndex)
 #define g_notifyPosition (*R().notifyPosition)
 #define g_notifyPositionNames (R().notifyPositionNames)
@@ -1115,43 +1200,87 @@ static void DrawCodexResetCreditsCard(const Codex::Snapshot& snapshot, float car
 }
 
 static void DrawCodexExtraUsageCard(const Codex::Snapshot& snapshot, float cardWidth) {
-    ImGui::BeginChild("##codex_extra_usage_card", ImVec2(cardWidth, 74.0f), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    const bool showCredits = snapshot.creditBalance.valid;
+    const bool showSpendDetails = snapshot.extraUsage.valid && !snapshot.extraUsage.hasUsedPercent;
 
-    if (ImGui::BeginTable("##codex_extra_table", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
-        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.55f);
-        ImGui::TableSetupColumn("Credits", ImGuiTableColumnFlags_WidthStretch, 0.45f);
+    if (!showCredits && !showSpendDetails) {
+        return;
+    }
 
+    const int rows = (showCredits ? 1 : 0) + (showSpendDetails ? 1 : 0);
+    const float cardHeight = 24.0f + static_cast<float>(rows) * 50.0f;
+
+    ImGui::BeginChild("##codex_extra_usage_card", ImVec2(cardWidth, cardHeight), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+    if (ImGui::BeginTable("##codex_extra_table", 2, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoSavedSettings)) {
+        if (showCredits) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            DrawUsageDetailCell(snapshot.creditBalance.balanceText, "Credit balance");
+            ImGui::TableSetColumnIndex(1);
+            DrawUsageDetailCell(
+                snapshot.creditBalance.unlimited ? "Unlimited" : (snapshot.creditBalance.hasCredits ? "Available" : "Unavailable"),
+                "Extra usage credits"
+            );
+        }
+
+        if (showSpendDetails) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            DrawUsageDetailCell(
+                snapshot.extraUsage.spentText.empty() ? snapshot.extraUsage.limitText : snapshot.extraUsage.spentText,
+                snapshot.extraUsage.label
+            );
+            ImGui::TableSetColumnIndex(1);
+            DrawUsageDetailCell(
+                snapshot.extraUsage.remainingText.empty() ? snapshot.extraUsage.limitText : snapshot.extraUsage.remainingText,
+                "Remaining"
+            );
+        }
+
+        ImGui::EndTable();
+    }
+
+    ImGui::EndChild();
+}
+
+static void DrawClaudeExtraUsageCard(const Claude::Snapshot& snapshot, float cardWidth) {
+    const bool showDetails = snapshot.credits.valid &&
+        snapshot.credits.enabled &&
+        !snapshot.credits.hasUsedPercent;
+
+    if (!showDetails) {
+        return;
+    }
+
+    const float cardHeight = 74.0f;
+
+    ImGui::BeginChild(
+        "##claude_extra_usage_card",
+        ImVec2(cardWidth, cardHeight),
+        true,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse
+    );
+
+    if (ImGui::BeginTable(
+        "##claude_extra_usage_table",
+        2,
+        ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoSavedSettings
+    )) {
         ImGui::TableNextRow();
 
         ImGui::TableSetColumnIndex(0);
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f, 0.92f, 0.92f, 1.0f));
-        ImGui::TextUnformatted(snapshot.extraUsage.spentText.c_str());
-        ImGui::PopStyleColor();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.58f, 0.58f, 0.58f, 1.0f));
-        ImGui::TextUnformatted("Extra usage");
-        ImGui::PopStyleColor();
+        DrawUsageDetailCell(snapshot.credits.spentText, "Usage credits");
 
         ImGui::TableSetColumnIndex(1);
-        float rightWidth = ImGui::GetContentRegionAvail().x;
-        float rightTextWidth = ImGui::CalcTextSize(snapshot.extraUsage.balanceText.c_str()).x;
-        if (rightTextWidth < rightWidth) {
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + rightWidth - rightTextWidth);
-        }
-
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f, 0.92f, 0.92f, 1.0f));
-        ImGui::TextUnformatted(snapshot.extraUsage.balanceText.c_str());
-        ImGui::PopStyleColor();
-
-        const char* caption = "Credits";
-        float captionWidth = ImGui::CalcTextSize(caption).x;
-        rightWidth = ImGui::GetContentRegionAvail().x;
-        if (captionWidth < rightWidth) {
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + rightWidth - captionWidth);
-        }
-
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.58f, 0.58f, 0.58f, 1.0f));
-        ImGui::TextUnformatted(caption);
-        ImGui::PopStyleColor();
+        DrawUsageDetailCell(
+            snapshot.credits.monthlyLimitText.empty()
+                ? snapshot.credits.limitText
+                : snapshot.credits.monthlyLimitText,
+            snapshot.credits.resetText.empty()
+                ? "Monthly spend limit"
+                : snapshot.credits.resetText
+        );
 
         ImGui::EndTable();
     }
@@ -1163,28 +1292,42 @@ static std::vector<UiBar> BuildCodexBars(const Codex::Snapshot& snapshot) {
     std::vector<UiBar> bars;
 
     for (const Codex::UsageBar& b : snapshot.bars) {
+        if (!b.valid) {
+            continue;
+        }
+
         UiBar row;
         row.label = b.label;
+        row.sublabel = b.sublabel;
         row.rightText = BuildCodexRightText(b);
         row.resetAtUnixSeconds = b.resetAtUnixSeconds;
         row.usedPercent = DisplayPercentValue(b.usedPercent);
-        row.valid = true;
+        row.valid = b.valid;
         row.red = false;
         row.white = true;
         row.thin = false;
         bars.push_back(row);
     }
 
-    if (snapshot.extraUsage.valid) {
+    if (snapshot.extraUsage.valid && snapshot.extraUsage.hasUsedPercent) {
         UiBar row;
-        row.label = snapshot.extraUsage.spentText;
-        row.sublabel = "Extra usage";
-        row.rightText = snapshot.extraUsage.balanceText;
-        row.usedPercent = snapshot.extraUsage.usedPercent;
+        row.label = snapshot.extraUsage.label;
+        row.sublabel = snapshot.extraUsage.spentText;
+        row.rightText = BuildResetRightText(
+            snapshot.extraUsage.resetText,
+            snapshot.extraUsage.usedPercent,
+            snapshot.extraUsage.resetAtUnixSeconds
+        );
+        row.resetAtUnixSeconds = snapshot.extraUsage.resetAtUnixSeconds;
+        row.usedPercent = DisplayPercentValue(snapshot.extraUsage.usedPercent);
         row.valid = true;
         row.red = false;
         row.white = true;
         row.thin = false;
+        row.detailValue1 = snapshot.extraUsage.limitText;
+        row.detailLabel1 = snapshot.extraUsage.limitText.empty() ? "" : "Monthly limit";
+        row.detailValue2 = snapshot.extraUsage.remainingText;
+        row.detailLabel2 = snapshot.extraUsage.remainingText.empty() ? "" : "Remaining";
         bars.push_back(row);
     }
 
@@ -1250,7 +1393,25 @@ static std::vector<UiBar> BuildClaudeBars(const Claude::Snapshot& snapshot) {
         bars.push_back(row);
     }
 
-    if (snapshot.credits.valid && snapshot.credits.enabled) {
+    for (const Claude::UsageWindow& limit : snapshot.additionalLimits) {
+        if (!limit.valid) {
+            continue;
+        }
+
+        UiBar row;
+        row.label = limit.title;
+        row.sublabel = limit.subtitle;
+        row.rightText = BuildResetRightText(limit.resetText, limit.usedPercent, limit.resetAtUnixSeconds);
+        row.resetAtUnixSeconds = limit.resetAtUnixSeconds;
+        row.usedPercent = DisplayPercentValue(limit.usedPercent);
+        row.valid = true;
+        row.red = false;
+        row.white = false;
+        row.thin = true;
+        bars.push_back(row);
+    }
+
+    if (snapshot.credits.valid && snapshot.credits.enabled && snapshot.credits.hasUsedPercent) {
         UiBar row;
         row.label = snapshot.credits.spentText;
         row.sublabel = snapshot.credits.limitText;
@@ -1387,11 +1548,22 @@ static void DrawCodexTab() {
         ImGui::PopStyleColor();
     }
 
+    if (!snapshot.usageNotice.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.62f, 0.24f, 1.0f));
+        ImGui::TextWrapped("%s", snapshot.usageNotice.c_str());
+        ImGui::PopStyleColor();
+    }
+
     ImGui::Spacing();
 
     std::string title = snapshot.plan.empty() ? "Codex" : snapshot.plan;
 
     DrawUnifiedUsageCard(title.c_str(), BuildCodexBars(snapshot), cardWidth);
+
+    if (snapshot.creditBalance.valid || (snapshot.extraUsage.valid && !snapshot.extraUsage.hasUsedPercent)) {
+        ImGui::Spacing();
+        DrawCodexExtraUsageCard(snapshot, cardWidth);
+    }
 
     ImGui::Spacing();
 
@@ -1409,7 +1581,7 @@ static void DrawClaudeTab() {
     float contentWidth = ImGui::GetContentRegionAvail().x;
     float cardWidth = contentWidth;
 
-    ImGui::TextUnformatted("Claude Desktop usage");
+    ImGui::TextUnformatted(snapshot.usageHeading.empty() ? "Claude usage" : snapshot.usageHeading.c_str());
     ImGui::SameLine();
 
     if (g_claudeLoading) {
@@ -1428,8 +1600,16 @@ static void DrawClaudeTab() {
     ImGui::Spacing();
 
     std::string title = snapshot.plan.empty() ? "Claude" : snapshot.plan;
+    std::vector<UiBar> bars = BuildClaudeBars(snapshot);
 
-    DrawUnifiedUsageCard(title.c_str(), BuildClaudeBars(snapshot), cardWidth);
+    if (!bars.empty()) {
+        DrawUnifiedUsageCard(title.c_str(), bars, cardWidth);
+    }
+
+    if (snapshot.credits.valid && snapshot.credits.enabled && !snapshot.credits.hasUsedPercent) {
+        ImGui::Spacing();
+        DrawClaudeExtraUsageCard(snapshot, cardWidth);
+    }
 }
 
 static void DrawZAiTab() {
@@ -1631,16 +1811,75 @@ static void DrawClaudeNotificationCard()
     DrawProviderNotificationSettings("Claude notifications", g_claudeNotifySettings, false);
 }
 
+static Codex::Snapshot CopyCodexSnapshotForSettings()
+{
+    std::lock_guard<std::mutex> lock(g_codexMutex);
+    return g_codexState;
+}
+
+static Claude::Snapshot CopyClaudeSnapshotForSettings()
+{
+    std::lock_guard<std::mutex> lock(g_claudeMutex);
+    return g_claudeState;
+}
+
+static ZAi::Snapshot CopyZAiSnapshotForSettings()
+{
+    std::lock_guard<std::mutex> lock(g_zaiMutex);
+    return g_zaiState;
+}
+
+static Grok::Snapshot CopyGrokSnapshotForSettings()
+{
+    std::lock_guard<std::mutex> lock(g_grokMutex);
+    return g_grokState;
+}
+
+static bool HasCodexWindow(const Codex::Snapshot& snapshot, const char* label)
+{
+    for (const Codex::UsageBar& bar : snapshot.bars) {
+        if (bar.valid && bar.label == label) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool HasZAiModelWindow(const ZAi::Snapshot& snapshot, const char* compactModel)
+{
+    for (const ZAi::UsageBar& bar : snapshot.bars) {
+        if (bar.valid && Text::get_instance()->CompactLower(bar.label) == compactModel) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static void DrawCodexQuotaCard()
 {
     DrawSettingsHeader("Codex quota warnings");
+    Codex::Snapshot snapshot = CopyCodexSnapshotForSettings();
+    bool hasSession = HasCodexWindow(snapshot, "Session");
+    bool hasWeekly = HasCodexWindow(snapshot, "Weekly");
+
+    if (!hasSession && !hasWeekly) {
+        ImGui::TextDisabled("No quota windows are currently available.");
+        return;
+    }
 
     if (ImGui::BeginTable("##codex_quota_table", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
         ImGui::TableSetupColumn("Quota", ImGuiTableColumnFlags_WidthStretch, 0.47f);
         ImGui::TableSetupColumn("Threshold", ImGuiTableColumnFlags_WidthStretch, 0.53f);
 
-        DrawQuotaRuleSettings("5-hour limit", g_codexQuotaWarnings.fiveHour);
-        DrawQuotaRuleSettings("Weekly - all models", g_codexQuotaWarnings.weekly);
+        if (hasSession) {
+            DrawQuotaRuleSettings("5-hour limit", g_codexQuotaWarnings.fiveHour);
+        }
+
+        if (hasWeekly) {
+            DrawQuotaRuleSettings("Weekly - all models", g_codexQuotaWarnings.weekly);
+        }
 
         ImGui::EndTable();
     }
@@ -1649,16 +1888,24 @@ static void DrawCodexQuotaCard()
 static void DrawClaudeQuotaCard()
 {
     DrawSettingsHeader("Claude quota warnings");
+    Claude::Snapshot snapshot = CopyClaudeSnapshotForSettings();
+    bool any = snapshot.currentSession.valid || snapshot.weeklyAllModels.valid || snapshot.weeklySonnet.valid ||
+        snapshot.weeklyFable.valid || (snapshot.credits.valid && snapshot.credits.enabled && snapshot.credits.hasUsedPercent);
+
+    if (!any) {
+        ImGui::TextDisabled("No quota windows are currently available.");
+        return;
+    }
 
     if (ImGui::BeginTable("##claude_quota_table", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
         ImGui::TableSetupColumn("Quota", ImGuiTableColumnFlags_WidthStretch, 0.47f);
         ImGui::TableSetupColumn("Threshold", ImGuiTableColumnFlags_WidthStretch, 0.53f);
 
-        DrawQuotaRuleSettings("Current session", g_claudeQuotaWarnings.currentSession);
-        DrawQuotaRuleSettings("All models", g_claudeQuotaWarnings.allModels);
-        DrawQuotaRuleSettings("Sonnet", g_claudeQuotaWarnings.sonnet);
-        DrawQuotaRuleSettings("Fable", g_claudeQuotaWarnings.fable);
-        DrawQuotaRuleSettings("Usage credits", g_claudeQuotaWarnings.credits);
+        if (snapshot.currentSession.valid) DrawQuotaRuleSettings("Current session", g_claudeQuotaWarnings.currentSession);
+        if (snapshot.weeklyAllModels.valid) DrawQuotaRuleSettings("All models", g_claudeQuotaWarnings.allModels);
+        if (snapshot.weeklySonnet.valid) DrawQuotaRuleSettings("Sonnet", g_claudeQuotaWarnings.sonnet);
+        if (snapshot.weeklyFable.valid) DrawQuotaRuleSettings("Fable", g_claudeQuotaWarnings.fable);
+        if (snapshot.credits.valid && snapshot.credits.enabled && snapshot.credits.hasUsedPercent) DrawQuotaRuleSettings("Usage credits", g_claudeQuotaWarnings.credits);
 
         ImGui::EndTable();
     }
@@ -1868,13 +2115,16 @@ static void DrawModernQuotaSettings()
         ImGui::TableSetupColumn("Threshold", ImGuiTableColumnFlags_WidthStretch, 0.50f);
         ImGui::TableHeadersRow();
 
-        DrawModernQuotaRow("Codex", "5-hour limit", g_codexQuotaWarnings.fiveHour);
-        DrawModernQuotaRow("Codex", "Weekly - all models", g_codexQuotaWarnings.weekly);
-        DrawModernQuotaRow("Claude", "Current session", g_claudeQuotaWarnings.currentSession);
-        DrawModernQuotaRow("Claude", "All models", g_claudeQuotaWarnings.allModels);
-        DrawModernQuotaRow("Claude", "Sonnet", g_claudeQuotaWarnings.sonnet);
-        DrawModernQuotaRow("Claude", "Fable", g_claudeQuotaWarnings.fable);
-        DrawModernQuotaRow("Claude", "Usage credits", g_claudeQuotaWarnings.credits);
+        Codex::Snapshot codexSnapshot = CopyCodexSnapshotForSettings();
+        Claude::Snapshot claudeSnapshot = CopyClaudeSnapshotForSettings();
+
+        if (HasCodexWindow(codexSnapshot, "Session")) DrawModernQuotaRow("Codex", "5-hour limit", g_codexQuotaWarnings.fiveHour);
+        if (HasCodexWindow(codexSnapshot, "Weekly")) DrawModernQuotaRow("Codex", "Weekly - all models", g_codexQuotaWarnings.weekly);
+        if (claudeSnapshot.currentSession.valid) DrawModernQuotaRow("Claude", "Current session", g_claudeQuotaWarnings.currentSession);
+        if (claudeSnapshot.weeklyAllModels.valid) DrawModernQuotaRow("Claude", "All models", g_claudeQuotaWarnings.allModels);
+        if (claudeSnapshot.weeklySonnet.valid) DrawModernQuotaRow("Claude", "Sonnet", g_claudeQuotaWarnings.sonnet);
+        if (claudeSnapshot.weeklyFable.valid) DrawModernQuotaRow("Claude", "Fable", g_claudeQuotaWarnings.fable);
+        if (claudeSnapshot.credits.valid && claudeSnapshot.credits.enabled && claudeSnapshot.credits.hasUsedPercent) DrawModernQuotaRow("Claude", "Usage credits", g_claudeQuotaWarnings.credits);
 
         ImGui::EndTable();
     }
@@ -1904,6 +2154,13 @@ static void DrawSettingsMutedText(const char* text)
 {
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.58f, 0.58f, 0.58f, 1.0f));
     ImGui::TextUnformatted(text);
+    ImGui::PopStyleColor();
+}
+
+static void DrawSettingsMutedWrappedText(const char* text)
+{
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.58f, 0.58f, 0.58f, 1.0f));
+    ImGui::TextWrapped("%s", text);
     ImGui::PopStyleColor();
 }
 
@@ -1965,20 +2222,46 @@ static void DrawCleanProviderNotifications(AppSettings::ProviderNotifications& s
 
 static void DrawCleanQuotaWarnings(bool codex)
 {
+    bool codexSession = false;
+    bool codexWeekly = false;
+    Claude::Snapshot claudeSnapshot;
+
+    if (codex) {
+        Codex::Snapshot snapshot = CopyCodexSnapshotForSettings();
+        codexSession = HasCodexWindow(snapshot, "Session");
+        codexWeekly = HasCodexWindow(snapshot, "Weekly");
+
+        if (!codexSession && !codexWeekly) {
+            DrawSettingsMutedText("No quota windows are currently available.");
+            return;
+        }
+    }
+    else {
+        claudeSnapshot = CopyClaudeSnapshotForSettings();
+        bool any = claudeSnapshot.currentSession.valid || claudeSnapshot.weeklyAllModels.valid ||
+            claudeSnapshot.weeklySonnet.valid || claudeSnapshot.weeklyFable.valid ||
+            (claudeSnapshot.credits.valid && claudeSnapshot.credits.enabled && claudeSnapshot.credits.hasUsedPercent);
+
+        if (!any) {
+            DrawSettingsMutedText("No quota windows are currently available.");
+            return;
+        }
+    }
+
     if (ImGui::BeginTable("##provider_quota_table", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
         ImGui::TableSetupColumn("Quota", ImGuiTableColumnFlags_WidthStretch, 0.48f);
         ImGui::TableSetupColumn("Threshold", ImGuiTableColumnFlags_WidthStretch, 0.52f);
 
         if (codex) {
-            DrawQuotaRuleSettings("5-hour limit", g_codexQuotaWarnings.fiveHour);
-            DrawQuotaRuleSettings("Weekly - all models", g_codexQuotaWarnings.weekly);
+            if (codexSession) DrawQuotaRuleSettings("5-hour limit", g_codexQuotaWarnings.fiveHour);
+            if (codexWeekly) DrawQuotaRuleSettings("Weekly - all models", g_codexQuotaWarnings.weekly);
         }
         else {
-            DrawQuotaRuleSettings("Current session", g_claudeQuotaWarnings.currentSession);
-            DrawQuotaRuleSettings("All models", g_claudeQuotaWarnings.allModels);
-            DrawQuotaRuleSettings("Sonnet", g_claudeQuotaWarnings.sonnet);
-            DrawQuotaRuleSettings("Fable", g_claudeQuotaWarnings.fable);
-            DrawQuotaRuleSettings("Usage credits", g_claudeQuotaWarnings.credits);
+            if (claudeSnapshot.currentSession.valid) DrawQuotaRuleSettings("Current session", g_claudeQuotaWarnings.currentSession);
+            if (claudeSnapshot.weeklyAllModels.valid) DrawQuotaRuleSettings("All models", g_claudeQuotaWarnings.allModels);
+            if (claudeSnapshot.weeklySonnet.valid) DrawQuotaRuleSettings("Sonnet", g_claudeQuotaWarnings.sonnet);
+            if (claudeSnapshot.weeklyFable.valid) DrawQuotaRuleSettings("Fable", g_claudeQuotaWarnings.fable);
+            if (claudeSnapshot.credits.valid && claudeSnapshot.credits.enabled && claudeSnapshot.credits.hasUsedPercent) DrawQuotaRuleSettings("Usage credits", g_claudeQuotaWarnings.credits);
         }
 
         ImGui::EndTable();
@@ -2002,12 +2285,21 @@ static void DrawCleanZAiNotifications()
 
 static void DrawCleanZAiQuotaWarnings()
 {
+    ZAi::Snapshot snapshot = CopyZAiSnapshotForSettings();
+    bool hasGlm52 = HasZAiModelWindow(snapshot, "glm5.2");
+    bool hasTurbo = HasZAiModelWindow(snapshot, "glm5turbo");
+
+    if (!hasGlm52 && !hasTurbo) {
+        DrawSettingsMutedText("No quota windows are currently available.");
+        return;
+    }
+
     if (ImGui::BeginTable("##zai_quota_table", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
         ImGui::TableSetupColumn("Quota", ImGuiTableColumnFlags_WidthStretch, 0.48f);
         ImGui::TableSetupColumn("Threshold", ImGuiTableColumnFlags_WidthStretch, 0.52f);
 
-        DrawQuotaRuleSettings("GLM-5.2", g_zaiQuotaWarnings.glm52);
-        DrawQuotaRuleSettings("GLM-5-Turbo", g_zaiQuotaWarnings.turbo);
+        if (hasGlm52) DrawQuotaRuleSettings("GLM-5.2", g_zaiQuotaWarnings.glm52);
+        if (hasTurbo) DrawQuotaRuleSettings("GLM-5-Turbo", g_zaiQuotaWarnings.turbo);
 
         ImGui::EndTable();
     }
@@ -2030,6 +2322,13 @@ static void DrawCleanGrokNotifications()
 
 static void DrawCleanGrokQuotaWarnings()
 {
+    Grok::Snapshot snapshot = CopyGrokSnapshotForSettings();
+
+    if (!snapshot.weeklyLimit.valid) {
+        DrawSettingsMutedText("No quota windows are currently available.");
+        return;
+    }
+
     if (ImGui::BeginTable("##grok_quota_table", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
         ImGui::TableSetupColumn("Quota", ImGuiTableColumnFlags_WidthStretch, 0.48f);
         ImGui::TableSetupColumn("Threshold", ImGuiTableColumnFlags_WidthStretch, 0.52f);
@@ -2208,6 +2507,204 @@ static void DrawProviderSettingsCard(const char* id, const char* title, AppSetti
     ImGui::PopID();
 }
 
+static void SyncCodexCustomPathBuffer()
+{
+    if (g_codexCustomPathBufferDirty || g_codexCustomPathBufferSynced == g_codexCustomAuthPath) {
+        return;
+    }
+
+    CopyStringToBuffer(g_codexCustomPathBuffer, g_codexCustomAuthPath);
+    g_codexCustomPathBufferSynced = g_codexCustomAuthPath;
+}
+
+static bool SaveAndApplyCodexAccountSource(bool commitPathBuffer)
+{
+    if (commitPathBuffer) {
+        g_codexCustomAuthPath = g_codexCustomPathBuffer.data();
+        g_codexCustomPathBufferSynced = g_codexCustomAuthPath;
+        g_codexCustomPathBufferDirty = false;
+    }
+
+    bool saved = AppSettings::SaveCodexAccountSource(
+        g_codexAccountSource,
+        g_codexCustomAuthPath
+    );
+
+    if (!saved) {
+        NotifyGUI::Add(
+            "Failed to save the Codex account source",
+            g_notifyPosition,
+            5.0f,
+            NOTIFY_COL32(255, 90, 90, 255)
+        );
+    }
+
+    ApplySettingsToRuntime();
+    RefreshCodexAsync();
+    return saved;
+}
+
+static const char* CodexAccountSourceDescription(int source)
+{
+    switch (AppSettings::ClampCodexAccountSource(source)) {
+    case 1:
+        return "Uses only the account Codex currently exposes through app-server. It never reads auth.json.";
+    case 2:
+        return "Directly parses CODEX_HOME\\auth.json, or %USERPROFILE%\\.codex\\auth.json when CODEX_HOME is unset. It never starts app-server.";
+    case 3:
+        return "Directly parses only the selected auth.json file. No app-server or default-file fallback is used.";
+    default:
+        return "Uses the active Codex app-server account first. The default auth.json is used only when app-server is unavailable, never after an app-server error.";
+    }
+}
+
+static void DrawCodexSettingsCard(float width, float height)
+{
+    ImGui::PushID("##codex_settings_card");
+    BeginCleanSettingsCard("##codex_settings_card", "Codex", ImVec2(width, height));
+
+    DrawSettingsSubHeader("Account source");
+    ImGui::SetNextItemWidth(-1.0f);
+
+    static const char* sourceNames[] = {
+        "Auto - active account, then auth.json",
+        "Active Codex account only",
+        "Codex auth.json only",
+        "Custom Codex auth.json"
+    };
+
+    SyncCodexCustomPathBuffer();
+
+    int selectedSource = AppSettings::ClampCodexAccountSource(g_codexAccountSource);
+
+    if (ImGui::Combo("##codex_account_source", &selectedSource, sourceNames, 4)) {
+        g_codexAccountSource = AppSettings::ClampCodexAccountSource(selectedSource);
+        SaveAndApplyCodexAccountSource(g_codexCustomPathBufferDirty);
+    }
+
+    DrawSettingsMutedWrappedText(CodexAccountSourceDescription(g_codexAccountSource));
+
+    if (g_codexAccountSource == 2) {
+        DrawSettingsMutedText("Default file: %CODEX_HOME%\\auth.json or %USERPROFILE%\\.codex\\auth.json");
+        DrawSettingsMutedWrappedText("This explicit mode honors the file even when config.toml uses auto, keyring, or ephemeral; the main Codex page warns that the file may be stale.");
+    }
+    else if (g_codexAccountSource == 3) {
+        ImGui::Spacing();
+        DrawSettingsMutedText("Custom auth.json path");
+        ImGui::SetNextItemWidth(-1.0f);
+
+        if (ImGui::InputText(
+            "##codex_custom_auth_path",
+            g_codexCustomPathBuffer.data(),
+            g_codexCustomPathBuffer.size()
+        )) {
+            g_codexCustomPathBufferDirty = true;
+        }
+
+        if (ImGui::Button("Browse...", ImVec2(96.0f, 26.0f))) {
+            std::string selectedPath = g_codexCustomPathBuffer.data();
+
+            if (BrowseForCodexAuthJson(selectedPath)) {
+                CopyStringToBuffer(g_codexCustomPathBuffer, selectedPath);
+                g_codexCustomPathBufferDirty = true;
+            }
+        }
+
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!g_codexCustomPathBufferDirty);
+
+        if (ImGui::Button("Apply path", ImVec2(104.0f, 26.0f))) {
+            SaveAndApplyCodexAccountSource(true);
+        }
+
+        ImGui::EndDisabled();
+        DrawSettingsMutedText("Environment variables such as %USERPROFILE% are expanded. Relative paths are resolved to an absolute path.");
+    }
+
+    DrawSettingsMutedText("The source selection is saved automatically.");
+
+    ImGui::Spacing();
+    DrawSettingsSubHeader("Notifications");
+    DrawCleanProviderNotifications(g_codexNotifySettings, true);
+
+    ImGui::Spacing();
+    DrawSettingsSubHeader("Quota warnings");
+    DrawCleanQuotaWarnings(true);
+
+    EndCleanSettingsCard();
+    ImGui::PopID();
+}
+
+static const char* ClaudeAccountSourceDescription(int source)
+{
+    switch (AppSettings::ClampClaudeAccountSource(source)) {
+    case 1:
+        return "Uses only the account signed in to Claude Desktop. It reads the live Desktop cookie/OAuth session; Claude Code files and environment tokens are never read.";
+    case 2:
+        return "Uses only Claude Code .credentials.json. This is a separate Claude Code login: signing in or switching accounts in Claude Desktop does not update this file.";
+    case 3:
+        return "Uses only CLAUDE_CODE_OAUTH_TOKEN from this process environment. Claude Desktop and .credentials.json are ignored.";
+    default:
+        return "Uses Claude Desktop first. If Desktop has no session, it uses .credentials.json; the environment token is used only when that file is absent. Read or decryption errors never silently switch accounts.";
+    }
+}
+
+static void DrawClaudeSettingsCard(float width, float height)
+{
+    ImGui::PushID("##claude_settings_card");
+    BeginCleanSettingsCard("##claude_settings_card", "Claude", ImVec2(width, height));
+
+    DrawSettingsSubHeader("Account source");
+    ImGui::SetNextItemWidth(-1.0f);
+
+    static const char* sourceNames[] = {
+        "Auto - Desktop, credentials file, then environment",
+        "Claude Desktop only",
+        "Claude Code .credentials.json only",
+        "Claude Code environment token only"
+    };
+
+    int selectedSource = AppSettings::ClampClaudeAccountSource(g_claudeAccountSource);
+
+    if (ImGui::Combo("##claude_account_source", &selectedSource, sourceNames, 4)) {
+        g_claudeAccountSource = AppSettings::ClampClaudeAccountSource(selectedSource);
+
+        if (!AppSettings::SaveClaudeAccountSource(g_claudeAccountSource)) {
+            NotifyGUI::Add(
+                "Failed to save the Claude account source",
+                g_notifyPosition,
+                5.0f,
+                NOTIFY_COL32(255, 90, 90, 255)
+            );
+        }
+
+        ApplySettingsToRuntime();
+        RefreshClaudeAsync();
+    }
+
+    DrawSettingsMutedWrappedText(ClaudeAccountSourceDescription(g_claudeAccountSource));
+
+    if (g_claudeAccountSource == 2) {
+        DrawSettingsMutedText("File: %CLAUDE_CONFIG_DIR%\\.credentials.json or %USERPROFILE%\\.claude\\.credentials.json");
+    }
+    else if (g_claudeAccountSource == 3) {
+        DrawSettingsMutedText("Environment variable: CLAUDE_CODE_OAUTH_TOKEN");
+    }
+
+    DrawSettingsMutedText("This selection is saved automatically.");
+
+    ImGui::Spacing();
+    DrawSettingsSubHeader("Notifications");
+    DrawCleanProviderNotifications(g_claudeNotifySettings, false);
+
+    ImGui::Spacing();
+    DrawSettingsSubHeader("Quota warnings");
+    DrawCleanQuotaWarnings(false);
+
+    EndCleanSettingsCard();
+    ImGui::PopID();
+}
+
 static void DrawZAiSettingsCard(float width, float height)
 {
     ImGui::PushID("##zai_settings_card");
@@ -2278,10 +2775,10 @@ static void DrawSelectedSettingsPage(float width, float height)
         DrawCleanGeneralSettings(width, height);
         break;
     case ActiveSettingsTab::Codex:
-        DrawProviderSettingsCard("##codex_settings_card", "Codex", g_codexNotifySettings, true, width, height);
+        DrawCodexSettingsCard(width, height);
         break;
     case ActiveSettingsTab::Claude:
-        DrawProviderSettingsCard("##claude_settings_card", "Claude", g_claudeNotifySettings, false, width, height);
+        DrawClaudeSettingsCard(width, height);
         break;
     case ActiveSettingsTab::Grok:
         DrawGrokSettingsCard(width, height);

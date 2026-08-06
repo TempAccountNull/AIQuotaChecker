@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <string>
 
@@ -22,6 +23,9 @@ public:
     AppSettings::ProviderNotifications* NotifySettings();
     AppSettings::ClaudeQuotaWarnings* QuotaWarnings();
 
+    void SetAccountSource(int source);
+    int AccountSource() const;
+
     void SetRateLimitCallback(RateLimitCallback callback);
 
     void LoadSettings(const AppSettings::Settings& settings);
@@ -39,10 +43,15 @@ private:
 
     std::mutex m_mutex;
     Claude::Snapshot m_snapshot;
+    std::string m_lastSuccessfulAccountKey;
     std::atomic_bool m_loading = false;
 
     AppSettings::ProviderNotifications m_notifySettings;
     AppSettings::ClaudeQuotaWarnings m_quotaWarnings;
+
+    std::atomic_int m_accountSource = 0;
+    std::atomic<std::uint64_t> m_sourceGeneration = 0;
+    mutable std::mutex m_sourceMutex;
 
     RateLimitCallback m_rateLimitCallback = nullptr;
 };
