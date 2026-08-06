@@ -254,6 +254,7 @@
   <ItemGroup>
     <None Include="src\Tools\check-codex-resets.cmd" />
     <None Include="src\Tools\check-codex-resets.ps1" />
+    <None Include="tools\prepare_dependencies.ps1" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="src\Resources\images\Claude.ico">
@@ -276,10 +277,20 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
-  <Target Name="VerifyAIQuotaDependencies" BeforeTargets="PrepareForBuild">
-    <Error Condition="!Exists('$(AIQuotaImGuiDir)\imgui.h')" Text="Dear ImGui is missing. Run tools\prepare_dependencies.ps1 before building." />
-    <Error Condition="!Exists('$(AIQuotaImGuiDir)\backends\imgui_impl_dx11.cpp')" Text="The Dear ImGui DirectX 11 backend is missing." />
-    <Error Condition="!Exists('$(AIQuotaImGuiDir)\backends\imgui_impl_win32.cpp')" Text="The Dear ImGui Win32 backend is missing." />
-    <Error Condition="!Exists('$(AIQuotaJsonDir)\single_include\nlohmann\json.hpp')" Text="nlohmann/json is missing. Run tools\prepare_dependencies.ps1 before building." />
+  <Target
+    Name="PrepareAIQuotaDependencies"
+    Condition="'$(DesignTimeBuild)' != 'true' and (!Exists('$(AIQuotaImGuiDir)\imgui.h') or !Exists('$(AIQuotaImGuiDir)\backends\imgui_impl_dx11.cpp') or !Exists('$(AIQuotaImGuiDir)\backends\imgui_impl_win32.cpp') or !Exists('$(AIQuotaJsonDir)\single_include\nlohmann\json.hpp'))">
+    <Message Importance="high" Text="Preparing pinned Dear ImGui and nlohmann/json dependencies for AIQuotaChecker..." />
+    <Exec Command="&quot;$(SystemRoot)\System32\WindowsPowerShell\v1.0\powershell.exe&quot; -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$(ProjectDir)tools\prepare_dependencies.ps1&quot; -ProjectRoot &quot;$(MSBuildProjectDirectory)&quot;" />
+  </Target>
+  <Target
+    Name="VerifyAIQuotaDependencies"
+    BeforeTargets="PrepareForBuild"
+    DependsOnTargets="PrepareAIQuotaDependencies"
+    Condition="'$(DesignTimeBuild)' != 'true'">
+    <Error Condition="!Exists('$(AIQuotaImGuiDir)\imgui.h')" Text="Dear ImGui could not be prepared. Check the dependency download error above, then run tools\prepare_dependencies.ps1 manually." />
+    <Error Condition="!Exists('$(AIQuotaImGuiDir)\backends\imgui_impl_dx11.cpp')" Text="The Dear ImGui DirectX 11 backend could not be prepared." />
+    <Error Condition="!Exists('$(AIQuotaImGuiDir)\backends\imgui_impl_win32.cpp')" Text="The Dear ImGui Win32 backend could not be prepared." />
+    <Error Condition="!Exists('$(AIQuotaJsonDir)\single_include\nlohmann\json.hpp')" Text="nlohmann/json could not be prepared. Check the dependency download error above, then run tools\prepare_dependencies.ps1 manually." />
   </Target>
 </Project>
