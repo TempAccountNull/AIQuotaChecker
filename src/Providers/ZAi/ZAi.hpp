@@ -3,6 +3,8 @@
 #include <string>
 #include <vector>
 
+#include "../UsageTelemetry.hpp"
+
 namespace ZAi
 {
     struct UsageBar
@@ -17,6 +19,7 @@ namespace ZAi
         bool white = false;
         bool green = false;
         bool thin = false;
+        bool spendBalance = false;
     };
 
     struct DetailRow
@@ -34,6 +37,8 @@ namespace ZAi
         std::string lastUpdated = "never";
         std::vector<UsageBar> bars;
         std::vector<DetailRow> details;
+        UsageTelemetry::AccessStatus access;
+        UsageTelemetry::ContextUsage context;
     };
 
     Snapshot FetchSnapshot();

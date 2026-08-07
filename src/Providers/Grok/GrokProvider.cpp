@@ -123,6 +123,7 @@ void GrokProvider::RefreshAsync()
             Grok::Snapshot failedSnapshot;
             failedSnapshot.statusText = error;
             failedSnapshot.lastUpdated = "now";
+            failedSnapshot.access = UsageTelemetry::FromText(error);
 
             std::lock_guard<std::mutex> lock(*self->StateMutex());
             *self->Snapshot() = failedSnapshot;

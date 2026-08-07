@@ -39,9 +39,7 @@ namespace Network
         return lower.find("rate limited") != std::string::npos ||
             lower.find("rate limit") != std::string::npos ||
             lower.find("http 429") != std::string::npos ||
-            lower.find("too many requests") != std::string::npos ||
-            lower.find("insufficient balance") != std::string::npos ||
-            lower.find("no resource package") != std::string::npos;
+            lower.find("too many requests") != std::string::npos;
     }
 
     std::string Client::GetEnvText(const char* name) const

@@ -1168,6 +1168,7 @@ Result AcquireCurrentSession() {
         result.cookieHeader = std::move(cookieHeader);
 
         if (oauth) {
+            result.accessToken = oauth->accessToken;
             result.subscriptionType = oauth->subscriptionType;
             result.rateLimitTier = oauth->rateLimitTier;
         }

@@ -160,6 +160,22 @@ namespace Grok
             return Network::get_instance()->Utf8ToWide(headers);
         }
 
+        static bool HasProductUsagePercent(const Json& config)
+        {
+            if (!config.is_object() || !config.contains("productUsage") ||
+                !config.at("productUsage").is_array()) {
+                return false;
+            }
+
+            for (const Json& item : config.at("productUsage")) {
+                if (item.is_object() && JsonUtils::get_instance()->NumberOpt(item, "usagePercent")) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         static float ProductUsageFallback(const Json& config)
         {
             if (!config.is_object() || !config.contains("productUsage") || !config.at("productUsage").is_array()) {
@@ -226,8 +242,9 @@ namespace Grok
 
             std::string periodType = currentPeriod ? JsonUtils::get_instance()->String(*currentPeriod, "type") : std::string();
 
-            bool hasUsagePercent = config.contains("creditUsagePercent") ||
-                (config.contains("productUsage") && config.at("productUsage").is_array());
+            bool hasUsagePercent =
+                JsonUtils::get_instance()->NumberOpt(config, "creditUsagePercent").has_value() ||
+                HasProductUsagePercent(config);
             bool hasPeriod = currentPeriod != nullptr || config.contains("billingPeriodEnd");
 
             snapshot.weeklyLimit.valid = hasUsagePercent || hasPeriod;
@@ -270,6 +287,19 @@ namespace Grok
 
             AddProductUsage(snapshot, config);
 
+            if (!snapshot.weeklyLimit.valid && !snapshot.extraCredits.valid &&
+                snapshot.products.empty()) {
+                throw std::runtime_error("Grok billing response contained no usable usage data");
+            }
+
+            UsageTelemetry::SetAvailable(snapshot.access);
+
+            if (snapshot.weeklyLimit.valid &&
+                UsageTelemetry::IsExhausted(snapshot.weeklyLimit.usedPercent)) {
+                snapshot.access.state = UsageTelemetry::AccessState::OutOfUsage;
+                snapshot.access.detail = snapshot.weeklyLimit.title + " usage exhausted";
+            }
+
             return snapshot;
         }
     }
@@ -302,6 +332,7 @@ namespace Grok
         }
         catch (const std::exception& e) {
             snapshot.statusText = std::string("Grok error: ") + e.what();
+            snapshot.access = UsageTelemetry::FromText(snapshot.statusText);
             snapshot.weeklyLimit.valid = false;
             snapshot.extraCredits.valid = false;
             return snapshot;

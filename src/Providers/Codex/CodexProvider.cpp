@@ -216,6 +216,7 @@ void CodexProvider::RefreshAsync()
                 Codex::Snapshot failedSnapshot;
                 failedSnapshot.statusText = error;
                 failedSnapshot.lastUpdated = "now";
+                failedSnapshot.access = UsageTelemetry::FromText(error);
 
                 std::lock_guard<std::mutex> lock(*self->StateMutex());
                 *self->Snapshot() = failedSnapshot;
@@ -227,6 +228,38 @@ void CodexProvider::RefreshAsync()
         if (sourceChanged) {
             self->RefreshAsync();
         }
+    }).detach();
+}
+
+void CodexProvider::RefreshContextAsync()
+{
+    if (m_contextLoading.exchange(true)) {
+        return;
+    }
+
+    std::thread([] {
+        CodexProvider* self = CodexProvider::get_instance();
+
+        try {
+            UsageTelemetry::ContextUsage context = Codex::ReadLocalContextUsage();
+            std::lock_guard<std::mutex> lock(*self->StateMutex());
+
+            if (context.valid) {
+                self->Snapshot()->context = std::move(context);
+            }
+            else if (context.compacting) {
+                self->Snapshot()->context.compacting = true;
+            }
+            else {
+                self->Snapshot()->context.compacting = false;
+            }
+        }
+        catch (...) {
+            std::lock_guard<std::mutex> lock(*self->StateMutex());
+            self->Snapshot()->context.compacting = false;
+        }
+
+        self->m_contextLoading = false;
     }).detach();
 }
 

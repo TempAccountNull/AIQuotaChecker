@@ -34,6 +34,7 @@ public:
 
     void ApplyRuntime(NotifyPosition position, int quotaRepeatSeconds);
     void RefreshAsync();
+    void RefreshContextAsync();
     void PollNotifications();
 
 private:
@@ -45,6 +46,7 @@ private:
     std::mutex m_mutex;
     Codex::Snapshot m_snapshot;
     std::atomic_bool m_loading = false;
+    std::atomic_bool m_contextLoading = false;
 
     AppSettings::ProviderNotifications m_notifySettings;
     AppSettings::CodexQuotaWarnings m_quotaWarnings;

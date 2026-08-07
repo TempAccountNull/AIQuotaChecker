@@ -294,6 +294,10 @@ namespace AppSettings
         settings.notificationPositionIndex = ClampNotificationPositionIndex(ReadInt(L"Notifications", L"PositionIndex", settings.notificationPositionIndex, path));
         settings.autoRefreshEnabled = ReadBool(L"AutoRefresh", L"Enabled", settings.autoRefreshEnabled, path);
         settings.autoRefreshMinutes = ClampAutoRefreshMinutes(ReadInt(L"AutoRefresh", L"Minutes", settings.autoRefreshMinutes, path));
+        settings.codexAutoRefreshEnabled = ReadBool(L"AutoRefresh", L"CodexEnabled", settings.codexAutoRefreshEnabled, path);
+        settings.claudeAutoRefreshEnabled = ReadBool(L"AutoRefresh", L"ClaudeEnabled", settings.claudeAutoRefreshEnabled, path);
+        settings.zaiAutoRefreshEnabled = ReadBool(L"AutoRefresh", L"ZAiEnabled", settings.zaiAutoRefreshEnabled, path);
+        settings.grokAutoRefreshEnabled = ReadBool(L"AutoRefresh", L"GrokEnabled", settings.grokAutoRefreshEnabled, path);
         settings.claudeAccountSource = ClampClaudeAccountSource(
             ReadInt(L"Claude", L"AccountSource", settings.claudeAccountSource, path)
         );
@@ -348,6 +352,10 @@ namespace AppSettings
         ok = WriteInt(L"Notifications", L"PositionIndex", ClampNotificationPositionIndex(settings.notificationPositionIndex), path) && ok;
         ok = WriteBool(L"AutoRefresh", L"Enabled", settings.autoRefreshEnabled, path) && ok;
         ok = WriteInt(L"AutoRefresh", L"Minutes", ClampAutoRefreshMinutes(settings.autoRefreshMinutes), path) && ok;
+        ok = WriteBool(L"AutoRefresh", L"CodexEnabled", settings.codexAutoRefreshEnabled, path) && ok;
+        ok = WriteBool(L"AutoRefresh", L"ClaudeEnabled", settings.claudeAutoRefreshEnabled, path) && ok;
+        ok = WriteBool(L"AutoRefresh", L"ZAiEnabled", settings.zaiAutoRefreshEnabled, path) && ok;
+        ok = WriteBool(L"AutoRefresh", L"GrokEnabled", settings.grokAutoRefreshEnabled, path) && ok;
         ok = WriteInt(
             L"Claude",
             L"AccountSource",

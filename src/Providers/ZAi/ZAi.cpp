@@ -493,6 +493,7 @@ namespace ZAi
         }
 
         UsageBar bar;
+        bar.spendBalance = true;
         bar.label = PickUsageLabel(balance, "Usage credits");
 
         if (total && *total > 0.0 && used) {
@@ -712,12 +713,32 @@ namespace ZAi
         }
     }
 
-    static void ApplyCurrentResponse(Snapshot& snapshot, const json& root)
+    static bool EnvelopeSucceeded(const json& root)
+    {
+        if (!root.is_object()) {
+            return false;
+        }
+
+        if (root.contains("success") && root.at("success").is_boolean() &&
+            !root.at("success").get<bool>()) {
+            return false;
+        }
+
+        if (root.contains("code") && root.at("code").is_number()) {
+            const int code = root.at("code").get<int>();
+            return code == 0 || code == 200;
+        }
+
+        return true;
+    }
+
+    static bool ApplyCurrentResponse(Snapshot& snapshot, const json& root)
     {
         const json* data = JsonUtils::get_instance()->UnwrapData(root);
 
-        if (!data || !data->is_object() || !data->contains("plans") || !data->at("plans").is_array()) {
-            return;
+        if (!EnvelopeSucceeded(root) || !data || !data->is_object() ||
+            !data->contains("plans") || !data->at("plans").is_array()) {
+            return false;
         }
 
         const json& plans = data->at("plans");
@@ -734,12 +755,10 @@ namespace ZAi
             }
         }
 
-        if (!selected && !plans.empty()) {
-            selected = &plans.front();
-        }
-
+        // Match ZCode itself: only an active Start Plan is authoritative.
+        // Never select the first arbitrary/inactive plan as a fallback.
         if (!selected) {
-            return;
+            return false;
         }
 
         std::string name = Text::get_instance()->FirstNonEmpty({ JsonUtils::get_instance()->String(*selected, "name"), JsonUtils::get_instance()->String(*selected, "plan_id") });
@@ -749,10 +768,15 @@ namespace ZAi
         }
 
         AddDetail(snapshot, Text::get_instance()->FirstNonEmpty({ JsonUtils::get_instance()->String(*selected, "status"), "unknown" }), "Plan status", Text::get_instance()->FirstNonEmpty({ JsonUtils::get_instance()->String(*selected, "plan_id"), JsonUtils::get_instance()->String(*selected, "user_plan_id") }), "Plan ID");
+        return true;
     }
 
-    static void ApplyBalanceResponse(Snapshot& snapshot, const json& root)
+    static bool ApplyBalanceResponse(Snapshot& snapshot, const json& root)
     {
+        if (!EnvelopeSucceeded(root)) {
+            return false;
+        }
+
         const json* data = JsonUtils::get_instance()->UnwrapData(root);
         size_t before = snapshot.bars.size();
 
@@ -770,14 +794,20 @@ namespace ZAi
             size_t added = 0;
             ScanUsageJson(snapshot, data ? *data : root, 6, added);
         }
+
+        return snapshot.bars.size() > before;
     }
 
-    static void ApplyQuotaResponse(Snapshot& snapshot, const json& root)
+    static bool ApplyQuotaResponse(Snapshot& snapshot, const json& root)
     {
+        if (!EnvelopeSucceeded(root)) {
+            return false;
+        }
+
         const json* data = JsonUtils::get_instance()->UnwrapData(root);
 
         if (!data || !data->is_object()) {
-            return;
+            return false;
         }
 
         std::string level = JsonUtils::get_instance()->String(*data, "level");
@@ -802,6 +832,8 @@ namespace ZAi
             size_t added = 0;
             ScanUsageJson(snapshot, *data, 6, added);
         }
+
+        return snapshot.bars.size() > before;
     }
 
     static void ApplySubscriptionList(Snapshot& snapshot, const json& root)
@@ -828,6 +860,63 @@ namespace ZAi
         return response.statusCode >= 200 && response.statusCode < 300 && !response.body.empty();
     }
 
+    static void FinalizeZAiAccess(Snapshot& snapshot)
+    {
+        if (snapshot.bars.empty()) {
+            snapshot.access.state = UsageTelemetry::AccessState::Unavailable;
+            snapshot.access.detail = "No usable Z.Ai usage data was returned";
+            return;
+        }
+
+        UsageTelemetry::SetAvailable(snapshot.access);
+
+        std::vector<std::string> exhaustedBalances;
+        std::vector<std::string> exhaustedRateLimits;
+        size_t rateLimitCount = 0;
+
+        for (const UsageBar& bar : snapshot.bars) {
+            if (!bar.valid) {
+                continue;
+            }
+
+            if (!bar.spendBalance) {
+                ++rateLimitCount;
+            }
+
+            if (!UsageTelemetry::IsExhausted(bar.usedPercent)) {
+                continue;
+            }
+
+            std::vector<std::string>& target = bar.spendBalance
+                ? exhaustedBalances
+                : exhaustedRateLimits;
+            target.push_back(bar.label.empty() ? "Usage" : bar.label);
+        }
+
+        auto join = [](const std::vector<std::string>& values) {
+            std::string text;
+
+            for (size_t i = 0; i < values.size(); ++i) {
+                if (i != 0) text += ", ";
+                text += values[i];
+            }
+
+            return text;
+        };
+
+        if (!exhaustedBalances.empty()) {
+            snapshot.access.state = UsageTelemetry::AccessState::OutOfUsage;
+            snapshot.access.detail = "Usage balance exhausted: " + join(exhaustedBalances);
+        }
+        else if (rateLimitCount > 0 && exhaustedRateLimits.size() == rateLimitCount) {
+            snapshot.access.state = UsageTelemetry::AccessState::OutOfUsage;
+            snapshot.access.detail = "All returned usage allocations are exhausted";
+        }
+        else if (!exhaustedRateLimits.empty()) {
+            snapshot.access.detail = "Some usage allocations are exhausted: " + join(exhaustedRateLimits);
+        }
+    }
+
     Snapshot FetchSnapshot()
     {
         Snapshot snapshot;
@@ -837,6 +926,7 @@ namespace ZAi
 
         if (tokens.empty()) {
             snapshot.statusText = "Z.Ai credentials not found. Sign in to ZCode or set ZCODE_JWT_TOKEN.";
+            snapshot.access = UsageTelemetry::FromText(snapshot.statusText);
             return snapshot;
         }
 
@@ -868,9 +958,15 @@ namespace ZAi
         addUrl("https://api.z.ai/api/biz/subscription/list", "subscription");
 
         std::string lastError;
+        std::string bestUnavailableReason;
+        UsageTelemetry::AccessStatus strongestFailure;
 
         for (const std::string& token : tokens) {
-            bool anyOk = false;
+            Snapshot candidate;
+            candidate.lastUpdated = "now";
+            bool activeStartPlan = false;
+            bool usableUsageData = false;
+            bool receivedSuccessfulResponse = false;
 
             for (const auto& item : urls) {
                 try {
@@ -884,6 +980,25 @@ namespace ZAi
                         std::ostringstream ss;
                         ss << item.second << " HTTP " << response.statusCode;
                         lastError = ss.str();
+
+                        UsageTelemetry::AccessStatus failure = UsageTelemetry::FromHttpFailure(
+                            response.statusCode,
+                            response.body,
+                            lastError
+                        );
+
+                        auto rank = [](UsageTelemetry::AccessState state) {
+                            switch (state) {
+                            case UsageTelemetry::AccessState::OutOfUsage: return 4;
+                            case UsageTelemetry::AccessState::RateLimited: return 3;
+                            case UsageTelemetry::AccessState::Unavailable: return 2;
+                            default: return 1;
+                            }
+                        };
+
+                        if (rank(failure.state) > rank(strongestFailure.state)) {
+                            strongestFailure = std::move(failure);
+                        }
                         continue;
                     }
 
@@ -894,43 +1009,76 @@ namespace ZAi
                         continue;
                     }
 
-                    anyOk = true;
+                    if (!EnvelopeSucceeded(root)) {
+                        lastError = std::string(item.second) + " returned an unsuccessful envelope";
+                        continue;
+                    }
 
+                    receivedSuccessfulResponse = true;
                     std::string kind = item.second;
 
                     if (kind == "current") {
-                        ApplyCurrentResponse(snapshot, root);
+                        activeStartPlan = ApplyCurrentResponse(candidate, root) || activeStartPlan;
                     }
                     else if (kind == "balance") {
-                        ApplyBalanceResponse(snapshot, root);
+                        // The current ZCode balance envelope can include both
+                        // plans and balances, so inspect both sections.
+                        activeStartPlan = ApplyCurrentResponse(candidate, root) || activeStartPlan;
+                        usableUsageData = ApplyBalanceResponse(candidate, root) || usableUsageData;
                     }
                     else if (kind == "quota") {
-                        ApplyQuotaResponse(snapshot, root);
+                        usableUsageData = ApplyQuotaResponse(candidate, root) || usableUsageData;
                     }
                     else if (kind == "subscription") {
-                        ApplySubscriptionList(snapshot, root);
+                        ApplySubscriptionList(candidate, root);
                     }
                 }
                 catch (const std::exception& e) {
                     lastError = e.what();
+                    UsageTelemetry::AccessStatus failure = UsageTelemetry::FromText(lastError);
+
+                    if (strongestFailure.state == UsageTelemetry::AccessState::Unknown) {
+                        strongestFailure = std::move(failure);
+                    }
                 }
             }
 
-            if (anyOk) {
-                FinalizeZaiBars(snapshot);
-                snapshot.statusText = snapshot.bars.empty()
-                    ? "Z.Ai connected, but no usage bars were returned by the ZCode billing endpoints."
-                    : "";
-                return snapshot;
+            if (receivedSuccessfulResponse) {
+                FinalizeZaiBars(candidate);
+                usableUsageData = usableUsageData || !candidate.bars.empty();
+
+                if (!usableUsageData || candidate.bars.empty()) {
+                    bestUnavailableReason = activeStartPlan
+                        ? "Z.Ai usage unavailable: the active plan returned no usage balances"
+                        : "Z.Ai usage unavailable: no active ZCode Start Plan or usable quota was returned";
+                    continue;
+                }
+
+                candidate.statusText = activeStartPlan
+                    ? "Source: active ZCode Start Plan"
+                    : "Source: Z.Ai quota endpoint";
+                FinalizeZAiAccess(candidate);
+                return candidate;
             }
         }
 
-        snapshot.statusText = "Z.Ai usage unavailable";
+        snapshot.statusText = bestUnavailableReason.empty()
+            ? "Z.Ai usage unavailable"
+            : bestUnavailableReason;
 
-        if (!lastError.empty()) {
+        if (bestUnavailableReason.empty() && !lastError.empty()) {
             snapshot.statusText += ": " + lastError;
         }
 
+        if (!bestUnavailableReason.empty()) {
+            snapshot.access.state = UsageTelemetry::AccessState::Unavailable;
+            snapshot.access.detail = snapshot.statusText;
+        }
+        else {
+            snapshot.access = strongestFailure.state == UsageTelemetry::AccessState::Unknown
+                ? UsageTelemetry::FromText(snapshot.statusText)
+                : strongestFailure;
+        }
         return snapshot;
     }
 }

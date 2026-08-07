@@ -3,6 +3,8 @@
 #include <string>
 #include <vector>
 
+#include "../UsageTelemetry.hpp"
+
 namespace Claude {
 
     enum class AccountSource {
@@ -22,8 +24,12 @@ namespace Claude {
     };
 
     struct UsageCredits {
+        bool reported = false;
         bool valid = false;
+        std::string label = "Usage credits";
         bool enabled = false;
+        bool hasSpentAmount = false;
+        bool hasMonthlyLimit = false;
         std::string spentText;
         std::string resetText;
         std::string limitText;
@@ -50,8 +56,11 @@ namespace Claude {
         std::vector<UsageWindow> additionalLimits;
 
         UsageCredits credits;
+        UsageTelemetry::AccessStatus access;
+        UsageTelemetry::ContextUsage context;
     };
 
     Snapshot FetchSnapshot(AccountSource source);
+    UsageTelemetry::ContextUsage ReadLocalContextUsage();
 
 }

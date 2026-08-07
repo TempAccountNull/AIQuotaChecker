@@ -54,6 +54,10 @@ namespace AppSettings
         int notificationPositionIndex = 3;
         bool autoRefreshEnabled = true;
         int autoRefreshMinutes = 1;
+        bool codexAutoRefreshEnabled = true;
+        bool claudeAutoRefreshEnabled = true;
+        bool zaiAutoRefreshEnabled = true;
+        bool grokAutoRefreshEnabled = true;
 
         // 0 = Auto (Desktop, credentials file, then environment token)
         // 1 = Claude Desktop only

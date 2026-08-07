@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <mutex>
 #include <string>
 
@@ -56,11 +57,23 @@ namespace
     static bool g_showNotificationsInsideWindow = false;
     static bool g_autoRefreshEnabled = true;
     static int g_autoRefreshMinutes = 1;
+    static bool g_codexAutoRefreshEnabled = true;
+    static bool g_claudeAutoRefreshEnabled = true;
+    static bool g_zaiAutoRefreshEnabled = true;
+    static bool g_grokAutoRefreshEnabled = true;
     static int g_claudeAccountSource = 0;
     static int g_codexAccountSource = 0;
     static std::string g_codexCustomAuthPath;
 
-    static std::atomic_bool g_autoRefreshDisableRequested = false;
+    enum AutoRefreshProviderMask : unsigned int
+    {
+        AutoRefreshProviderCodex = 1u << 0,
+        AutoRefreshProviderClaude = 1u << 1,
+        AutoRefreshProviderZAi = 1u << 2,
+        AutoRefreshProviderGrok = 1u << 3
+    };
+
+    static std::atomic_uint g_autoRefreshDisableMask = 0;
     static std::mutex g_autoRefreshWarningMutex;
     static std::string g_autoRefreshWarning;
 
@@ -85,22 +98,41 @@ namespace
         NotifyPosition::CENTER
     };
 
+    static unsigned int ProviderAutoRefreshMask(const char* provider)
+    {
+        if (!provider) return 0;
+        if (_stricmp(provider, "Codex") == 0) return AutoRefreshProviderCodex;
+        if (_stricmp(provider, "Claude") == 0) return AutoRefreshProviderClaude;
+        if (_stricmp(provider, "Z.Ai") == 0 || _stricmp(provider, "ZAi") == 0) return AutoRefreshProviderZAi;
+        if (_stricmp(provider, "Grok") == 0) return AutoRefreshProviderGrok;
+        return 0;
+    }
+
     static void RequestAutoRefreshDisableForRateLimit(const char* provider, const std::string& detail)
     {
-        std::lock_guard<std::mutex> lock(g_autoRefreshWarningMutex);
+        const unsigned int mask = ProviderAutoRefreshMask(provider);
 
-        g_autoRefreshWarning = "Warning: Auto refresh disabled for ";
-        g_autoRefreshWarning += provider;
-        g_autoRefreshWarning += " because that provider was rate limited";
-
-        if (!detail.empty()) {
-            g_autoRefreshWarning += " (";
-            g_autoRefreshWarning += detail;
-            g_autoRefreshWarning += ")";
+        if (mask == 0) {
+            return;
         }
 
-        g_autoRefreshWarning += ". Increase the refresh interval before enabling it again.";
-        g_autoRefreshDisableRequested = true;
+        {
+            std::lock_guard<std::mutex> lock(g_autoRefreshWarningMutex);
+
+            g_autoRefreshWarning = "Warning: Auto refresh disabled for ";
+            g_autoRefreshWarning += provider;
+            g_autoRefreshWarning += " because that provider was rate limited";
+
+            if (!detail.empty()) {
+                g_autoRefreshWarning += " (";
+                g_autoRefreshWarning += detail;
+                g_autoRefreshWarning += ")";
+            }
+
+            g_autoRefreshWarning += ". Other providers remain enabled.";
+        }
+
+        g_autoRefreshDisableMask.fetch_or(mask);
     }
 
     static std::string GetAutoRefreshWarning()
@@ -111,16 +143,21 @@ namespace
 
     static void ApplyPendingAutoRefreshDisable()
     {
-        if (!g_autoRefreshDisableRequested.exchange(false)) {
+        const unsigned int mask = g_autoRefreshDisableMask.exchange(0);
+
+        if (mask == 0) {
             return;
         }
 
-        g_autoRefreshEnabled = false;
+        if ((mask & AutoRefreshProviderCodex) != 0) g_codexAutoRefreshEnabled = false;
+        if ((mask & AutoRefreshProviderClaude) != 0) g_claudeAutoRefreshEnabled = false;
+        if ((mask & AutoRefreshProviderZAi) != 0) g_zaiAutoRefreshEnabled = false;
+        if ((mask & AutoRefreshProviderGrok) != 0) g_grokAutoRefreshEnabled = false;
 
         std::string warning = GetAutoRefreshWarning();
 
         if (warning.empty()) {
-            warning = "Warning: Auto refresh disabled after a provider rate limit response.";
+            warning = "Warning: Auto refresh disabled for the rate-limited provider.";
         }
 
         NotifyGUI::Add(warning.c_str(), g_notifyPosition, 10.0f, NOTIFY_COL32(255, 200, 64, 255));
@@ -159,6 +196,10 @@ namespace
         g_notifyPositionIndex = settings.notificationPositionIndex;
         g_autoRefreshEnabled = settings.autoRefreshEnabled;
         g_autoRefreshMinutes = AppSettings::ClampAutoRefreshMinutes(settings.autoRefreshMinutes);
+        g_codexAutoRefreshEnabled = settings.codexAutoRefreshEnabled;
+        g_claudeAutoRefreshEnabled = settings.claudeAutoRefreshEnabled;
+        g_zaiAutoRefreshEnabled = settings.zaiAutoRefreshEnabled;
+        g_grokAutoRefreshEnabled = settings.grokAutoRefreshEnabled;
         g_claudeAccountSource = AppSettings::ClampClaudeAccountSource(settings.claudeAccountSource);
         g_codexAccountSource = AppSettings::ClampCodexAccountSource(settings.codexAccountSource);
         g_codexCustomAuthPath = settings.codexCustomAuthPath;
@@ -181,6 +222,10 @@ namespace
         settings.notificationPositionIndex = g_notifyPositionIndex;
         settings.autoRefreshEnabled = g_autoRefreshEnabled;
         settings.autoRefreshMinutes = AppSettings::ClampAutoRefreshMinutes(g_autoRefreshMinutes);
+        settings.codexAutoRefreshEnabled = g_codexAutoRefreshEnabled;
+        settings.claudeAutoRefreshEnabled = g_claudeAutoRefreshEnabled;
+        settings.zaiAutoRefreshEnabled = g_zaiAutoRefreshEnabled;
+        settings.grokAutoRefreshEnabled = g_grokAutoRefreshEnabled;
         settings.claudeAccountSource = AppSettings::ClampClaudeAccountSource(g_claudeAccountSource);
         settings.codexAccountSource = AppSettings::ClampCodexAccountSource(g_codexAccountSource);
         settings.codexCustomAuthPath = g_codexCustomAuthPath;
@@ -382,6 +427,11 @@ namespace
             return;
         }
 
+        if (!g_codexAutoRefreshEnabled) nextCodexRefresh = 0;
+        if (!g_claudeAutoRefreshEnabled) nextClaudeRefresh = 0;
+        if (!g_zaiAutoRefreshEnabled) nextZAiRefresh = 0;
+        if (!g_grokAutoRefreshEnabled) nextGrokRefresh = 0;
+
         LONGLONG now = KSharedClock::SystemUnixSeconds();
 
         if (now <= 0) {
@@ -390,19 +440,19 @@ namespace
 
         LONGLONG intervalSeconds = static_cast<LONGLONG>(AutoRefreshIntervalSeconds());
 
-        if (nextCodexRefresh == 0 || nextCodexRefresh - now > intervalSeconds) {
+        if (g_codexAutoRefreshEnabled && (nextCodexRefresh == 0 || nextCodexRefresh - now > intervalSeconds)) {
             nextCodexRefresh = now + intervalSeconds;
         }
 
-        if (nextClaudeRefresh == 0 || nextClaudeRefresh - now > intervalSeconds) {
+        if (g_claudeAutoRefreshEnabled && (nextClaudeRefresh == 0 || nextClaudeRefresh - now > intervalSeconds)) {
             nextClaudeRefresh = now + intervalSeconds;
         }
 
-        if (nextZAiRefresh == 0 || nextZAiRefresh - now > intervalSeconds) {
+        if (g_zaiAutoRefreshEnabled && (nextZAiRefresh == 0 || nextZAiRefresh - now > intervalSeconds)) {
             nextZAiRefresh = now + intervalSeconds;
         }
 
-        if (nextGrokRefresh == 0 || nextGrokRefresh - now > intervalSeconds) {
+        if (g_grokAutoRefreshEnabled && (nextGrokRefresh == 0 || nextGrokRefresh - now > intervalSeconds)) {
             nextGrokRefresh = now + intervalSeconds;
         }
 
@@ -411,7 +461,7 @@ namespace
         ZAiProvider* zai = ZAiProvider::get_instance();
         GrokProvider* grok = GrokProvider::get_instance();
 
-        if (now >= nextCodexRefresh) {
+        if (g_codexAutoRefreshEnabled && nextCodexRefresh > 0 && now >= nextCodexRefresh) {
             if (!codex->Loading()->load()) {
                 codex->RefreshAsync();
                 nextCodexRefresh = now + intervalSeconds;
@@ -421,7 +471,7 @@ namespace
             }
         }
 
-        if (now >= nextClaudeRefresh) {
+        if (g_claudeAutoRefreshEnabled && nextClaudeRefresh > 0 && now >= nextClaudeRefresh) {
             if (!claude->Loading()->load()) {
                 claude->RefreshAsync();
                 nextClaudeRefresh = now + intervalSeconds;
@@ -431,7 +481,7 @@ namespace
             }
         }
 
-        if (now >= nextZAiRefresh) {
+        if (g_zaiAutoRefreshEnabled && nextZAiRefresh > 0 && now >= nextZAiRefresh) {
             if (!zai->Loading()->load()) {
                 zai->RefreshAsync();
                 nextZAiRefresh = now + intervalSeconds;
@@ -441,7 +491,7 @@ namespace
             }
         }
 
-        if (now >= nextGrokRefresh) {
+        if (g_grokAutoRefreshEnabled && nextGrokRefresh > 0 && now >= nextGrokRefresh) {
             if (!grok->Loading()->load()) {
                 grok->RefreshAsync();
                 nextGrokRefresh = now + intervalSeconds;
@@ -452,10 +502,25 @@ namespace
         }
     }
 
+    static void PollLocalContextTelemetry()
+    {
+        static LONGLONG nextContextRefresh = 0;
+        const LONGLONG now = KSharedClock::SystemUnixSeconds();
+
+        if (now <= 0 || (nextContextRefresh > 0 && now < nextContextRefresh)) {
+            return;
+        }
+
+        nextContextRefresh = now + 2;
+        CodexProvider::get_instance()->RefreshContextAsync();
+        ClaudeProvider::get_instance()->RefreshContextAsync();
+    }
+
     static void PollAppNotifications()
     {
         ApplyPendingAutoRefreshDisable();
         PollAutoRefresh();
+        PollLocalContextTelemetry();
 
         CodexProvider::get_instance()->PollNotifications();
         ClaudeProvider::get_instance()->PollNotifications();
@@ -511,6 +576,10 @@ namespace
         g_rendererState.showNotificationsInsideWindow = &g_showNotificationsInsideWindow;
         g_rendererState.autoRefreshEnabled = &g_autoRefreshEnabled;
         g_rendererState.autoRefreshMinutes = &g_autoRefreshMinutes;
+        g_rendererState.codexAutoRefreshEnabled = &g_codexAutoRefreshEnabled;
+        g_rendererState.claudeAutoRefreshEnabled = &g_claudeAutoRefreshEnabled;
+        g_rendererState.zaiAutoRefreshEnabled = &g_zaiAutoRefreshEnabled;
+        g_rendererState.grokAutoRefreshEnabled = &g_grokAutoRefreshEnabled;
         g_rendererState.claudeAccountSource = &g_claudeAccountSource;
         g_rendererState.codexAccountSource = &g_codexAccountSource;
         g_rendererState.codexCustomAuthPath = &g_codexCustomAuthPath;
@@ -591,10 +660,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 
     LoadAppSettings();
 
-    CodexProvider::get_instance()->RefreshAsync();
-    ClaudeProvider::get_instance()->RefreshAsync();
-    ZAiProvider::get_instance()->RefreshAsync();
-    GrokProvider::get_instance()->RefreshAsync();
+    if (g_autoRefreshEnabled && g_codexAutoRefreshEnabled) CodexProvider::get_instance()->RefreshAsync();
+    if (g_autoRefreshEnabled && g_claudeAutoRefreshEnabled) ClaudeProvider::get_instance()->RefreshAsync();
+    if (g_autoRefreshEnabled && g_zaiAutoRefreshEnabled) ZAiProvider::get_instance()->RefreshAsync();
+    if (g_autoRefreshEnabled && g_grokAutoRefreshEnabled) GrokProvider::get_instance()->RefreshAsync();
 
     bool done = false;
 

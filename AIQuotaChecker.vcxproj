@@ -186,6 +186,7 @@
     <ClInclude Include="src\Providers\Grok\Grok.hpp" />
     <ClInclude Include="src\Providers\Grok\GrokNotifier.hpp" />
     <ClInclude Include="src\Providers\Grok\GrokProvider.hpp" />
+    <ClInclude Include="src\Providers\UsageTelemetry.hpp" />
     <ClInclude Include="src\Global\Global.hpp" />
   </ItemGroup>
   <ItemGroup>

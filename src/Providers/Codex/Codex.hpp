@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include "../UsageTelemetry.hpp"
+
 
 namespace Codex {
 
@@ -23,6 +25,7 @@ namespace Codex {
         long long resetAtUnixSeconds = 0;
         bool valid = false;
         bool quotaNotificationEligible = true;
+        bool blocksProvider = true;
     };
 
     struct ResetCredit {
@@ -64,8 +67,11 @@ namespace Codex {
         std::vector<ResetCredit> resetCreditLedger;
         ExtraUsage extraUsage;
         CreditBalance creditBalance;
+        UsageTelemetry::AccessStatus access;
+        UsageTelemetry::ContextUsage context;
     };
 
     Snapshot FetchSnapshot(AccountSource source, const std::string& customAuthPath);
+    UsageTelemetry::ContextUsage ReadLocalContextUsage();
 
 }

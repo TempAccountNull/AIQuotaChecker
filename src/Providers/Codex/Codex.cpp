@@ -643,10 +643,10 @@ namespace Codex {
             });
 
             if (lower != "none" && lower != "null" && lower != "rate_limit_reached") {
-                AppendUsageNotice(snapshot, "Rate limit reached: " + HumanizeIdentifier(reachedType));
+                AppendUsageNotice(snapshot, "Usage exhausted: " + HumanizeIdentifier(reachedType));
             }
             else if (lower == "rate_limit_reached") {
-                AppendUsageNotice(snapshot, "Rate limit reached");
+                AppendUsageNotice(snapshot, "Usage exhausted");
             }
         }
 
@@ -656,7 +656,7 @@ namespace Codex {
             (allowed.has_value() && !*allowed);
 
         if (explicitRateLimitReached && reachedType.empty()) {
-            AppendUsageNotice(snapshot, "Rate limit reached");
+            AppendUsageNotice(snapshot, "Usage exhausted");
         }
 
         bool spendReached = ReadBoolFlexible(
@@ -894,6 +894,7 @@ namespace Codex {
         bar.label = label;
         bar.sublabel = sublabel;
         bar.quotaNotificationEligible = quotaNotificationEligible;
+        bar.blocksProvider = quotaNotificationEligible;
 
         if (!window.is_object()) {
             return bar;
@@ -1650,7 +1651,7 @@ namespace Codex {
         const json& result
     ) {
         Snapshot snapshot;
-        snapshot.statusText = "Codex app-server account active";
+        snapshot.statusText = "Source: Codex app-server active account";
         snapshot.lastUpdated = "just now";
         snapshot.bars.clear();
 
@@ -2031,7 +2032,7 @@ namespace Codex {
             ParseCodexMonthlyUsage(monthlyUsageJson, snapshot);
         }
 
-        snapshot.statusText = sourceLabel + ": " + authPath.string();
+        snapshot.statusText = "Source: " + sourceLabel + ": " + authPath.string();
 
         std::string store = ConfiguredCredentialStore();
 
@@ -2044,13 +2045,457 @@ namespace Codex {
         return snapshot;
     }
 
+    static std::string ReadTailSharedReadOnly(
+        const std::filesystem::path& path,
+        unsigned long long maximumBytes
+    ) {
+        const std::wstring widePath = path.wstring();
+        HANDLE file = CreateFileW(
+            widePath.c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+            nullptr
+        );
+
+        if (file == INVALID_HANDLE_VALUE) {
+            return {};
+        }
+
+        LARGE_INTEGER size{};
+
+        if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0) {
+            CloseHandle(file);
+            return {};
+        }
+
+        const unsigned long long fileSize = static_cast<unsigned long long>(size.QuadPart);
+        const unsigned long long readSize = std::min(fileSize, maximumBytes);
+        const unsigned long long start = fileSize - readSize;
+
+        LARGE_INTEGER offset{};
+        offset.QuadPart = static_cast<LONGLONG>(start);
+
+        if (!SetFilePointerEx(file, offset, nullptr, FILE_BEGIN)) {
+            CloseHandle(file);
+            return {};
+        }
+
+        std::string text(static_cast<size_t>(readSize), '\0');
+        size_t totalRead = 0;
+
+        while (totalRead < text.size()) {
+            const DWORD chunkSize = static_cast<DWORD>(std::min<size_t>(
+                text.size() - totalRead,
+                1024 * 1024
+            ));
+            DWORD read = 0;
+
+            if (!ReadFile(file, text.data() + totalRead, chunkSize, &read, nullptr) || read == 0) {
+                break;
+            }
+
+            totalRead += read;
+        }
+
+        CloseHandle(file);
+        text.resize(totalRead);
+
+        // A tail read can start in the middle of one JSONL record. Drop only
+        // that partial first record; the source file is never modified/copied.
+        if (start > 0) {
+            const size_t firstNewline = text.find('\n');
+
+            if (firstNewline == std::string::npos) {
+                return {};
+            }
+
+            text.erase(0, firstNewline + 1);
+        }
+
+        return text;
+    }
+
+    static std::filesystem::path LatestCodexSessionFile() {
+        const std::filesystem::path sessions = CodexHomePath() / "sessions";
+        std::error_code ec;
+
+        if (!std::filesystem::exists(sessions, ec) || ec) {
+            return {};
+        }
+
+        std::filesystem::path latest;
+        std::filesystem::file_time_type latestTime{};
+        bool haveLatest = false;
+
+        std::filesystem::recursive_directory_iterator it(
+            sessions,
+            std::filesystem::directory_options::skip_permission_denied,
+            ec
+        );
+        const std::filesystem::recursive_directory_iterator end;
+
+        for (; it != end; it.increment(ec)) {
+            if (ec) {
+                ec.clear();
+                continue;
+            }
+
+            const std::filesystem::directory_entry& entry = *it;
+
+            if (!entry.is_regular_file(ec) || ec || entry.path().extension() != ".jsonl") {
+                ec.clear();
+                continue;
+            }
+
+            const std::filesystem::file_time_type writeTime = entry.last_write_time(ec);
+
+            if (ec) {
+                ec.clear();
+                continue;
+            }
+
+            if (!haveLatest || writeTime > latestTime) {
+                latest = entry.path();
+                latestTime = writeTime;
+                haveLatest = true;
+            }
+        }
+
+        return latest;
+    }
+
+    static const json* FindCodexCompactionObjectRecursive(
+        const json& value,
+        int depth = 0
+    ) {
+        if (depth > 8) {
+            return nullptr;
+        }
+
+        if (value.is_object()) {
+            for (const char* key : { "type", "subtype", "event", "kind" }) {
+                if (!value.contains(key) || !value.at(key).is_string()) {
+                    continue;
+                }
+
+                if (UsageTelemetry::LowerCopy(value.at(key).get<std::string>()).find("compact") !=
+                    std::string::npos) {
+                    return &value;
+                }
+            }
+
+            for (auto it = value.begin(); it != value.end(); ++it) {
+                if (!it.value().is_object() && !it.value().is_array()) {
+                    continue;
+                }
+
+                if (const json* nested = FindCodexCompactionObjectRecursive(it.value(), depth + 1)) {
+                    return nested;
+                }
+            }
+        }
+        else if (value.is_array()) {
+            for (const json& item : value) {
+                if (const json* nested = FindCodexCompactionObjectRecursive(item, depth + 1)) {
+                    return nested;
+                }
+            }
+        }
+
+        return nullptr;
+    }
+
+    static bool CodexCompactionStateFromRecord(
+        const json& record,
+        bool& state
+    ) {
+        const json* compactObject = FindCodexCompactionObjectRecursive(record);
+
+        if (!compactObject) {
+            return false;
+        }
+
+        const json& source = *compactObject;
+        const std::string type = UsageTelemetry::LowerCopy(
+            ReadStringFlexible(source, { "type", "event", "kind", "subtype" })
+        );
+        const std::string status = UsageTelemetry::LowerCopy(
+            ReadStringFlexible(source, { "status", "phase" })
+        );
+        const std::string combined = type + " " + status;
+
+        if (combined.find("compact") == std::string::npos) {
+            return false;
+        }
+
+        const std::optional<bool> completed = ReadBoolFlexible(
+            source,
+            { "completed", "isCompleted", "is_completed" }
+        );
+
+        const bool completionEvent =
+            combined.find("context_compacted") != std::string::npos ||
+            combined.find("compaction_completed") != std::string::npos ||
+            combined.find("compact_completed") != std::string::npos ||
+            status == "completed" || status == "complete" || status == "done" ||
+            (completed.has_value() && *completed);
+
+        if (completionEvent) {
+            state = false;
+            return true;
+        }
+
+        const bool runningEvent =
+            combined.find("compaction_started") != std::string::npos ||
+            combined.find("compact_started") != std::string::npos ||
+            combined.find("context_compaction") != std::string::npos ||
+            combined.find("compacting") != std::string::npos ||
+            status == "running" || status == "started" || status == "in_progress" ||
+            (completed.has_value() && !*completed);
+
+        if (runningEvent) {
+            state = true;
+            return true;
+        }
+
+        return false;
+    }
+
+    static UsageTelemetry::ContextUsage ReadLatestCodexContextUsage() {
+        UsageTelemetry::ContextUsage context;
+        const std::filesystem::path session = LatestCodexSessionFile();
+
+        if (session.empty()) {
+            return context;
+        }
+
+        // Read only the most recent portion. Token-count records are emitted
+        // throughout a session, so the latest record should be in this tail.
+        const std::string text = ReadTailSharedReadOnly(session, 8ULL * 1024ULL * 1024ULL);
+
+        if (text.empty()) {
+            return context;
+        }
+
+        std::vector<std::string> lines;
+        std::istringstream stream(text);
+        std::string line;
+
+        while (std::getline(stream, line)) {
+            if (!line.empty()) {
+                lines.push_back(std::move(line));
+            }
+        }
+
+        bool foundUsage = false;
+        bool compacting = false;
+
+        for (const std::string& candidate : lines) {
+            const bool mayContainState =
+                candidate.find("compact") != std::string::npos ||
+                candidate.find("token_count") != std::string::npos;
+
+            if (!mayContainState) {
+                continue;
+            }
+
+            json record = json::parse(candidate, nullptr, false);
+
+            if (record.is_discarded() || !record.is_object()) {
+                continue;
+            }
+
+            const bool stateChanged = CodexCompactionStateFromRecord(record, compacting);
+            const json* payload = FindObjectField(record, { "payload" });
+
+            if (!stateChanged && compacting && payload &&
+                ReadStringFlexible(*payload, { "type" }) == "token_count") {
+                // A fresh token-count record after the start marker means the
+                // new compacted context is active even if this Codex version
+                // omitted a dedicated completion event.
+                compacting = false;
+            }
+        }
+
+        context.compacting = compacting;
+
+        for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
+            // Do not parse transcript/message records. Only the two metadata
+            // event types needed for the token card are decoded.
+            const bool mayContainUsage =
+                it->find("token_count") != std::string::npos ||
+                it->find("turn_context") != std::string::npos;
+
+            if (!mayContainUsage) {
+                continue;
+            }
+
+            json record = json::parse(*it, nullptr, false);
+
+            if (record.is_discarded() || !record.is_object()) {
+                continue;
+            }
+
+            const json* payload = FindObjectField(record, { "payload" });
+
+            if (!payload) {
+                continue;
+            }
+
+            const std::string type = ReadStringFlexible(*payload, { "type" });
+
+            if (context.model.empty() && type == "turn_context") {
+                context.model = ReadStringFlexible(*payload, { "model" });
+            }
+
+            if (!foundUsage && type == "token_count") {
+                const json* info = FindObjectField(*payload, { "info" });
+
+                if (!info) {
+                    continue;
+                }
+
+                const json* last = FindObjectField(
+                    *info,
+                    { "last_token_usage", "lastTokenUsage" }
+                );
+
+                if (!last) {
+                    continue;
+                }
+
+                const long long rawTotalTokens = static_cast<long long>(std::max(
+                    0.0,
+                    ReadNumberFlexible(*last, { "total_tokens", "totalTokens" }).value_or(0.0)
+                ));
+                context.inputTokens = static_cast<long long>(std::max(
+                    0.0,
+                    ReadNumberFlexible(*last, { "input_tokens", "inputTokens" }).value_or(0.0)
+                ));
+                context.cachedInputTokens = static_cast<long long>(std::max(
+                    0.0,
+                    ReadNumberFlexible(*last, { "cached_input_tokens", "cachedInputTokens" }).value_or(0.0)
+                ));
+                context.outputTokens = static_cast<long long>(std::max(
+                    0.0,
+                    ReadNumberFlexible(*last, { "output_tokens", "outputTokens" }).value_or(0.0)
+                ));
+                context.reasoningOutputTokens = static_cast<long long>(std::max(
+                    0.0,
+                    ReadNumberFlexible(*last, { "reasoning_output_tokens", "reasoningOutputTokens" }).value_or(0.0)
+                ));
+
+                // Codex's own context accounting excludes reasoning output from
+                // the tokens retained in the active model context. Keep the raw
+                // output/reasoning breakdown visible, but use the retained count
+                // for the context-window progress bar.
+                context.usedTokens = std::max(
+                    0LL,
+                    rawTotalTokens - context.reasoningOutputTokens
+                );
+                context.contextWindowTokens = static_cast<long long>(std::max(
+                    0.0,
+                    ReadNumberFlexible(
+                        *info,
+                        { "model_context_window", "modelContextWindow" }
+                    ).value_or(0.0)
+                ));
+
+                if (context.usedTokens <= 0 && rawTotalTokens <= 0) {
+                    context.usedTokens = std::max(
+                        0LL,
+                        context.inputTokens + context.outputTokens - context.reasoningOutputTokens
+                    );
+                }
+
+                context.valid = context.usedTokens > 0 && context.contextWindowTokens > 0;
+                context.sourceLabel = "Newest local Codex thread · direct read-only metadata";
+                foundUsage = context.valid;
+            }
+
+            if (foundUsage && !context.model.empty()) {
+                break;
+            }
+        }
+
+        return context;
+    }
+
+    UsageTelemetry::ContextUsage ReadLocalContextUsage() {
+        return ReadLatestCodexContextUsage();
+    }
+
+    static void FinalizeCodexAccess(Snapshot& snapshot) {
+        UsageTelemetry::SetAvailable(snapshot.access);
+
+        const bool monthlySpendReached =
+            snapshot.usageNotice.find("Monthly usage limit reached") != std::string::npos ||
+            (snapshot.extraUsage.valid && snapshot.extraUsage.hasUsedPercent &&
+                UsageTelemetry::IsExhausted(snapshot.extraUsage.usedPercent));
+
+        if (monthlySpendReached) {
+            snapshot.access.state = UsageTelemetry::AccessState::OutOfUsage;
+            snapshot.access.detail = "Monthly usage/credits exhausted";
+        }
+        else {
+            std::vector<std::string> exhaustedRateLimits;
+
+            for (const UsageBar& bar : snapshot.bars) {
+                if (bar.valid && bar.blocksProvider && UsageTelemetry::IsExhausted(bar.usedPercent)) {
+                    exhaustedRateLimits.push_back(bar.label.empty() ? "Usage" : bar.label);
+                }
+            }
+
+            const bool explicitlyExhausted =
+                snapshot.usageNotice.find("Usage exhausted") != std::string::npos;
+
+            if (explicitlyExhausted || !exhaustedRateLimits.empty()) {
+                std::string detail = explicitlyExhausted
+                    ? snapshot.usageNotice
+                    : "Usage exhausted";
+
+                if (!exhaustedRateLimits.empty()) {
+                    if (explicitlyExhausted) {
+                        detail += " · ";
+                    }
+                    else {
+                        detail += ": ";
+                    }
+
+                    for (size_t i = 0; i < exhaustedRateLimits.size(); ++i) {
+                        if (i != 0) detail += ", ";
+                        detail += exhaustedRateLimits[i];
+                    }
+                }
+
+                snapshot.access.state = UsageTelemetry::AccessState::OutOfUsage;
+                snapshot.access.detail = std::move(detail);
+            }
+            else if (snapshot.creditBalance.valid &&
+                !snapshot.creditBalance.unlimited &&
+                !snapshot.creditBalance.hasCredits) {
+                snapshot.access.state = UsageTelemetry::AccessState::OutOfUsage;
+                snapshot.access.detail = "No Codex credits remain";
+            }
+        }
+
+        snapshot.context = ReadLatestCodexContextUsage();
+    }
+
     Snapshot FetchSnapshot(AccountSource source, const std::string& customAuthPath) {
+        Snapshot snapshot;
+
         if (source == AccountSource::AuthFile) {
-            return FetchSnapshotFromAuthFile(
+            snapshot = FetchSnapshotFromAuthFile(
                 DefaultAuthPath(),
                 false,
                 "Codex auth.json selected"
             );
+            FinalizeCodexAccess(snapshot);
+            return snapshot;
         }
 
         if (source == AccountSource::CustomAuthFile) {
@@ -2058,17 +2503,21 @@ namespace Codex {
                 throw std::runtime_error("Custom Codex auth.json is selected, but no path was configured");
             }
 
-            return FetchSnapshotFromAuthFile(
+            snapshot = FetchSnapshotFromAuthFile(
                 ExpandCustomAuthPath(customAuthPath),
                 false,
                 "Custom Codex auth.json selected"
             );
+            FinalizeCodexAccess(snapshot);
+            return snapshot;
         }
 
         CodexAppServer::Result current = CodexAppServer::ReadCurrentAccountRateLimits();
 
         if (current.kind == CodexAppServer::ResultKind::Success) {
-            return ParseAppServerSnapshot(current.accountResult, current.rateLimitsResult);
+            snapshot = ParseAppServerSnapshot(current.accountResult, current.rateLimitsResult);
+            FinalizeCodexAccess(snapshot);
+            return snapshot;
         }
 
         if (current.kind == CodexAppServer::ResultKind::Error) {
@@ -2084,11 +2533,13 @@ namespace Codex {
 
         // Auto mode uses auth.json only when app-server is genuinely unavailable.
         // Ambiguous keyring/auto/ephemeral configurations are still refused here.
-        return FetchSnapshotFromAuthFile(
+        snapshot = FetchSnapshotFromAuthFile(
             DefaultAuthPath(),
             true,
             "Codex auto fallback auth.json"
         );
+        FinalizeCodexAccess(snapshot);
+        return snapshot;
     }
 
 }

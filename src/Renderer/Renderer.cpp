@@ -328,6 +328,10 @@ namespace Renderer
 #define g_showNotificationsInsideWindow (*R().showNotificationsInsideWindow)
 #define g_autoRefreshEnabled (*R().autoRefreshEnabled)
 #define g_autoRefreshMinutes (*R().autoRefreshMinutes)
+#define g_codexAutoRefreshEnabled (*R().codexAutoRefreshEnabled)
+#define g_claudeAutoRefreshEnabled (*R().claudeAutoRefreshEnabled)
+#define g_zaiAutoRefreshEnabled (*R().zaiAutoRefreshEnabled)
+#define g_grokAutoRefreshEnabled (*R().grokAutoRefreshEnabled)
 #define g_claudeAccountSource (*R().claudeAccountSource)
 #define g_codexAccountSource (*R().codexAccountSource)
 #define g_codexCustomAuthPath (*R().codexCustomAuthPath)
@@ -380,6 +384,60 @@ struct UiBar {
 };
 
 
+
+static const char* AccessStateLabel(UsageTelemetry::AccessState state)
+{
+    switch (state) {
+    case UsageTelemetry::AccessState::Available: return "AVAILABLE";
+    case UsageTelemetry::AccessState::RateLimited: return "RATE LIMITED";
+    case UsageTelemetry::AccessState::OutOfUsage: return "OUT OF USAGE";
+    case UsageTelemetry::AccessState::Unavailable: return "UNAVAILABLE";
+    default: return "";
+    }
+}
+
+static ImVec4 AccessStateColor(UsageTelemetry::AccessState state)
+{
+    switch (state) {
+    case UsageTelemetry::AccessState::Available: return ImVec4(0.27f, 0.84f, 0.50f, 1.0f);
+    case UsageTelemetry::AccessState::RateLimited: return ImVec4(1.00f, 0.69f, 0.24f, 1.0f);
+    case UsageTelemetry::AccessState::OutOfUsage: return ImVec4(0.96f, 0.30f, 0.30f, 1.0f);
+    case UsageTelemetry::AccessState::Unavailable: return ImVec4(0.62f, 0.62f, 0.62f, 1.0f);
+    default: return ImVec4(0.62f, 0.62f, 0.62f, 1.0f);
+    }
+}
+
+static void DrawProviderAccessStatus(const UsageTelemetry::AccessStatus& access)
+{
+    const char* label = AccessStateLabel(access.state);
+
+    if (!label || !*label) {
+        return;
+    }
+
+    ImGui::PushStyleColor(ImGuiCol_Text, AccessStateColor(access.state));
+    ImGui::Text("Status: %s", label);
+    ImGui::PopStyleColor();
+
+    if (!access.detail.empty()) {
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
+        ImGui::TextWrapped("%s", access.detail.c_str());
+        ImGui::PopStyleColor();
+    }
+}
+
+static std::string FormatTokenCount(long long value)
+{
+    value = std::max<long long>(0, value);
+    std::string digits = std::to_string(value);
+
+    for (std::ptrdiff_t i = static_cast<std::ptrdiff_t>(digits.size()) - 3; i > 0; i -= 3) {
+        digits.insert(static_cast<size_t>(i), 1, ',');
+    }
+
+    return digits;
+}
 
 static ImU32 Color(int r, int g, int b, int a = 255) {
     return IM_COL32(r, g, b, a);
@@ -1245,11 +1303,10 @@ static void DrawCodexExtraUsageCard(const Codex::Snapshot& snapshot, float cardW
 }
 
 static void DrawClaudeExtraUsageCard(const Claude::Snapshot& snapshot, float cardWidth) {
-    const bool showDetails = snapshot.credits.valid &&
-        snapshot.credits.enabled &&
-        !snapshot.credits.hasUsedPercent;
-
-    if (!showDetails) {
+    // The Usage credits section remains visible even when Claude omits spend
+    // data. This keeps the section independent from Session/Weekly exhaustion
+    // without inventing a balance or utilization value.
+    if (snapshot.credits.valid && snapshot.credits.enabled && snapshot.credits.hasUsedPercent) {
         return;
     }
 
@@ -1270,15 +1327,19 @@ static void DrawClaudeExtraUsageCard(const Claude::Snapshot& snapshot, float car
         ImGui::TableNextRow();
 
         ImGui::TableSetColumnIndex(0);
-        DrawUsageDetailCell(snapshot.credits.spentText, "Usage credits");
+        DrawUsageDetailCell(
+            snapshot.credits.spentText.empty() ? "Unavailable" : snapshot.credits.spentText,
+            snapshot.credits.label.empty() ? "Usage credits" : snapshot.credits.label.c_str()
+        );
 
         ImGui::TableSetColumnIndex(1);
+        const std::string creditLimit = !snapshot.credits.monthlyLimitText.empty()
+            ? snapshot.credits.monthlyLimitText
+            : (!snapshot.credits.limitText.empty() ? snapshot.credits.limitText : "Unavailable");
         DrawUsageDetailCell(
-            snapshot.credits.monthlyLimitText.empty()
-                ? snapshot.credits.limitText
-                : snapshot.credits.monthlyLimitText,
+            creditLimit,
             snapshot.credits.resetText.empty()
-                ? "Monthly spend limit"
+                ? (snapshot.credits.reported ? "Monthly spend limit" : "Not returned by provider")
                 : snapshot.credits.resetText
         );
 
@@ -1413,8 +1474,8 @@ static std::vector<UiBar> BuildClaudeBars(const Claude::Snapshot& snapshot) {
 
     if (snapshot.credits.valid && snapshot.credits.enabled && snapshot.credits.hasUsedPercent) {
         UiBar row;
-        row.label = snapshot.credits.spentText;
-        row.sublabel = snapshot.credits.limitText;
+        row.label = snapshot.credits.label.empty() ? "Usage credits" : snapshot.credits.label;
+        row.sublabel = snapshot.credits.spentText;
         row.rightText = BuildResetRightText(snapshot.credits.resetText, snapshot.credits.usedPercent, snapshot.credits.resetAtUnixSeconds);
         row.resetAtUnixSeconds = snapshot.credits.resetAtUnixSeconds;
         row.usedPercent = DisplayPercentValue(snapshot.credits.usedPercent);
@@ -1521,6 +1582,151 @@ static void DrawZAiDetailsCard(const ZAi::Snapshot& snapshot, float cardWidth) {
     ImGui::EndChild();
 }
 
+static std::string FormatCompactTokenCount(long long value)
+{
+    value = std::max<long long>(0, value);
+
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(1);
+
+    if (value >= 1000000) {
+        out << (static_cast<double>(value) / 1000000.0) << "M";
+    }
+    else if (value >= 1000) {
+        out << (static_cast<double>(value) / 1000.0) << "k";
+    }
+    else {
+        return std::to_string(value);
+    }
+
+    return out.str();
+}
+
+enum class ContextMeterStyle
+{
+    ClaudeBlueThin,
+    CodexWhiteStandard
+};
+
+static void DrawContextUsageCard(
+    const UsageTelemetry::ContextUsage& context,
+    float cardWidth,
+    bool showWhenUnavailable = false,
+    ContextMeterStyle style = ContextMeterStyle::ClaudeBlueThin
+) {
+    const bool available = context.valid &&
+        context.usedTokens >= 0 &&
+        context.contextWindowTokens > 0;
+
+    if (!available && !showWhenUnavailable) {
+        return;
+    }
+
+    const float cardHeight = available ? 70.0f : 48.0f;
+    ImGui::BeginChild(
+        "##context_usage_card",
+        ImVec2(cardWidth, cardHeight),
+        true,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse
+    );
+
+    ImGui::TextUnformatted(
+        context.compacting ? "Compacting conversation ..." : "Context window"
+    );
+
+    std::string usageText = context.compacting && !available ? "" : "Unavailable";
+    float displayPercent = 0.0f;
+
+    if (available) {
+        const long long clampedUsed = std::clamp<long long>(
+            context.usedTokens,
+            0,
+            context.contextWindowTokens
+        );
+        const long long remainingTokens = context.contextWindowTokens - clampedUsed;
+        const float usedPercent = Math::get_instance()->ClampPercentFloat(
+            static_cast<float>(
+                (static_cast<double>(clampedUsed) /
+                    static_cast<double>(context.contextWindowTokens)) * 100.0
+            )
+        );
+
+        displayPercent = g_showRemaining ? 100.0f - usedPercent : usedPercent;
+        const long long displayTokens = g_showRemaining ? remainingTokens : clampedUsed;
+
+        usageText = FormatCompactTokenCount(displayTokens) + " / " +
+            FormatCompactTokenCount(context.contextWindowTokens) + " (" +
+            Format::get_instance()->Percent(displayPercent) +
+            (g_showRemaining ? " remaining)" : " used)");
+    }
+
+    if (!usageText.empty()) {
+        ImGui::SameLine();
+        const float availableWidth = ImGui::GetContentRegionAvail().x;
+        const float textWidth = ImGui::CalcTextSize(usageText.c_str()).x;
+
+        if (textWidth < availableWidth) {
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + availableWidth - textWidth);
+        }
+
+        if (!available) {
+            ImGui::TextDisabled("%s", usageText.c_str());
+            ImGui::EndChild();
+            return;
+        }
+
+        ImGui::TextUnformatted(usageText.c_str());
+    }
+    else if (!available) {
+        ImGui::EndChild();
+        return;
+    }
+
+    const bool codexStyle = style == ContextMeterStyle::CodexWhiteStandard;
+    const ImU32 fillColor = codexStyle ? Color(235, 235, 235) : Color(38, 132, 255);
+    const float barHeight = codexStyle ? 7.0f : 3.0f;
+    DrawThinBar(displayPercent, ImGui::GetContentRegionAvail().x, fillColor, barHeight);
+
+    ImGui::EndChild();
+}
+
+static bool ProviderAutoRefreshActive(bool providerEnabled)
+{
+    return g_autoRefreshEnabled && providerEnabled;
+}
+
+static void DrawProviderRefreshHeader(
+    const char* label,
+    bool providerEnabled,
+    bool loading,
+    void (*refresh)(),
+    const char* buttonId
+) {
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine();
+
+    if (loading) {
+        ImGui::TextDisabled("Loading");
+    }
+    else {
+        ImGui::TextDisabled(ProviderAutoRefreshActive(providerEnabled) ? "Auto refresh on" : "Auto refresh off");
+    }
+
+    const float buttonWidth = 72.0f;
+    const float right = ImGui::GetWindowContentRegionMax().x;
+    ImGui::SameLine();
+    ImGui::SetCursorPosX((std::max)(ImGui::GetCursorPosX(), right - buttonWidth));
+    ImGui::BeginDisabled(loading || refresh == nullptr);
+
+    ImGui::PushID(buttonId);
+    if (ImGui::Button("Refresh", ImVec2(buttonWidth, 0.0f)) && refresh) {
+        refresh();
+    }
+    ImGui::PopID();
+
+    ImGui::EndDisabled();
+}
+
 static void DrawCodexTab() {
     Codex::Snapshot snapshot;
 
@@ -1532,32 +1738,34 @@ static void DrawCodexTab() {
     float contentWidth = ImGui::GetContentRegionAvail().x;
     float cardWidth = contentWidth;
 
-    ImGui::TextUnformatted("Codex usage");
-    ImGui::SameLine();
+    DrawProviderRefreshHeader(
+        "Codex usage",
+        g_codexAutoRefreshEnabled,
+        g_codexLoading,
+        RefreshCodexAsync,
+        "codex_manual_refresh"
+    );
 
-    if (g_codexLoading) {
-        ImGui::TextDisabled("Loading");
-    }
-    else {
-        ImGui::TextDisabled(g_autoRefreshEnabled ? "Auto refresh on" : "Auto refresh off");
-    }
-
-    if (!snapshot.statusText.empty() && snapshot.statusText.rfind("Plan:", 0) != 0) {
+    if (!snapshot.statusText.empty() &&
+        snapshot.statusText.rfind("Plan:", 0) != 0 &&
+        snapshot.statusText != snapshot.access.detail) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
         ImGui::TextWrapped("%s", snapshot.statusText.c_str());
         ImGui::PopStyleColor();
     }
 
-    if (!snapshot.usageNotice.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.62f, 0.24f, 1.0f));
-        ImGui::TextWrapped("%s", snapshot.usageNotice.c_str());
-        ImGui::PopStyleColor();
-    }
+    DrawProviderAccessStatus(snapshot.access);
+    ImGui::Spacing();
 
+    DrawContextUsageCard(
+        snapshot.context,
+        cardWidth,
+        true,
+        ContextMeterStyle::CodexWhiteStandard
+    );
     ImGui::Spacing();
 
     std::string title = snapshot.plan.empty() ? "Codex" : snapshot.plan;
-
     DrawUnifiedUsageCard(title.c_str(), BuildCodexBars(snapshot), cardWidth);
 
     if (snapshot.creditBalance.valid || (snapshot.extraUsage.valid && !snapshot.extraUsage.hasUsedPercent)) {
@@ -1581,22 +1789,29 @@ static void DrawClaudeTab() {
     float contentWidth = ImGui::GetContentRegionAvail().x;
     float cardWidth = contentWidth;
 
-    ImGui::TextUnformatted(snapshot.usageHeading.empty() ? "Claude usage" : snapshot.usageHeading.c_str());
-    ImGui::SameLine();
+    DrawProviderRefreshHeader(
+        snapshot.usageHeading.empty() ? "Claude usage" : snapshot.usageHeading.c_str(),
+        g_claudeAutoRefreshEnabled,
+        g_claudeLoading,
+        RefreshClaudeAsync,
+        "claude_manual_refresh"
+    );
 
-    if (g_claudeLoading) {
-        ImGui::TextDisabled("Loading");
-    }
-    else {
-        ImGui::TextDisabled(g_autoRefreshEnabled ? "Auto refresh on" : "Auto refresh off");
-    }
-
-    if (!snapshot.statusText.empty() && snapshot.statusText.rfind("Plan:", 0) != 0) {
+    if (!snapshot.statusText.empty() && snapshot.statusText.rfind("Plan:", 0) != 0 && snapshot.statusText != snapshot.access.detail) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
         ImGui::TextWrapped("%s", snapshot.statusText.c_str());
         ImGui::PopStyleColor();
     }
 
+    DrawProviderAccessStatus(snapshot.access);
+    ImGui::Spacing();
+
+    DrawContextUsageCard(
+        snapshot.context,
+        cardWidth,
+        true,
+        ContextMeterStyle::ClaudeBlueThin
+    );
     ImGui::Spacing();
 
     std::string title = snapshot.plan.empty() ? "Claude" : snapshot.plan;
@@ -1606,10 +1821,8 @@ static void DrawClaudeTab() {
         DrawUnifiedUsageCard(title.c_str(), bars, cardWidth);
     }
 
-    if (snapshot.credits.valid && snapshot.credits.enabled && !snapshot.credits.hasUsedPercent) {
-        ImGui::Spacing();
-        DrawClaudeExtraUsageCard(snapshot, cardWidth);
-    }
+    ImGui::Spacing();
+    DrawClaudeExtraUsageCard(snapshot, cardWidth);
 }
 
 static void DrawZAiTab() {
@@ -1623,22 +1836,21 @@ static void DrawZAiTab() {
     float contentWidth = ImGui::GetContentRegionAvail().x;
     float cardWidth = contentWidth;
 
-    ImGui::TextUnformatted("Z.Ai usage");
-    ImGui::SameLine();
+    DrawProviderRefreshHeader(
+        "Z.Ai usage",
+        g_zaiAutoRefreshEnabled,
+        g_zaiLoading,
+        RefreshZAiAsync,
+        "zai_manual_refresh"
+    );
 
-    if (g_zaiLoading) {
-        ImGui::TextDisabled("Loading");
-    }
-    else {
-        ImGui::TextDisabled(g_autoRefreshEnabled ? "Auto refresh on" : "Auto refresh off");
-    }
-
-    if (!snapshot.statusText.empty()) {
+    if (!snapshot.statusText.empty() && snapshot.statusText != snapshot.access.detail) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
         ImGui::TextWrapped("%s", snapshot.statusText.c_str());
         ImGui::PopStyleColor();
     }
 
+    DrawProviderAccessStatus(snapshot.access);
     ImGui::Spacing();
 
     std::string title = snapshot.plan.empty() ? "Z.Ai" : snapshot.plan;
@@ -1650,6 +1862,11 @@ static void DrawZAiTab() {
     }
 
     DrawZAiDetailsCard(snapshot, cardWidth);
+
+    if (snapshot.context.valid) {
+        ImGui::Spacing();
+        DrawContextUsageCard(snapshot.context, cardWidth);
+    }
 }
 
 static void DrawGrokTab() {
@@ -1663,22 +1880,21 @@ static void DrawGrokTab() {
     float contentWidth = ImGui::GetContentRegionAvail().x;
     float cardWidth = contentWidth;
 
-    ImGui::TextUnformatted("Grok / xAI usage");
-    ImGui::SameLine();
+    DrawProviderRefreshHeader(
+        "Grok / xAI usage",
+        g_grokAutoRefreshEnabled,
+        g_grokLoading,
+        RefreshGrokAsync,
+        "grok_manual_refresh"
+    );
 
-    if (g_grokLoading) {
-        ImGui::TextDisabled("Loading");
-    }
-    else {
-        ImGui::TextDisabled(g_autoRefreshEnabled ? "Auto refresh on" : "Auto refresh off");
-    }
-
-    if (!snapshot.statusText.empty() && snapshot.statusText != "Updated") {
+    if (!snapshot.statusText.empty() && snapshot.statusText != "Updated" && snapshot.statusText != snapshot.access.detail) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
         ImGui::TextWrapped("%s", snapshot.statusText.c_str());
         ImGui::PopStyleColor();
     }
 
+    DrawProviderAccessStatus(snapshot.access);
     ImGui::Spacing();
 
     std::string title = snapshot.plan.empty() ? "Grok" : snapshot.plan;
@@ -1686,6 +1902,11 @@ static void DrawGrokTab() {
 
     if (!bars.empty()) {
         DrawUnifiedUsageCard(title.c_str(), bars, cardWidth);
+    }
+
+    if (snapshot.context.valid) {
+        ImGui::Spacing();
+        DrawContextUsageCard(snapshot.context, cardWidth);
     }
 }
 
@@ -2558,6 +2779,33 @@ static const char* CodexAccountSourceDescription(int source)
     }
 }
 
+static void DrawProviderAutoRefreshSetting(
+    const char* checkboxId,
+    bool& enabled
+) {
+    const bool previous = enabled;
+    ImGui::Checkbox(checkboxId, &enabled);
+
+    if (enabled != previous) {
+        ClearAutoRefreshWarning();
+
+        if (!SaveAppSettings()) {
+            NotifyGUI::Add(
+                "Failed to save provider auto-refresh setting",
+                g_notifyPosition,
+                5.0f,
+                NOTIFY_COL32(255, 90, 90, 255)
+            );
+        }
+    }
+
+    DrawSettingsMutedWrappedText(
+        g_autoRefreshEnabled
+            ? (enabled ? "This provider refreshes automatically at the global interval." : "Automatic requests for this provider are disabled. Use Refresh on its tab when needed.")
+            : "Global auto refresh is off. This provider setting will apply when the global switch is enabled."
+    );
+}
+
 static void DrawCodexSettingsCard(float width, float height)
 {
     ImGui::PushID("##codex_settings_card");
@@ -2622,6 +2870,10 @@ static void DrawCodexSettingsCard(float width, float height)
     }
 
     DrawSettingsMutedText("The source selection is saved automatically.");
+
+    ImGui::Spacing();
+    DrawSettingsSubHeader("Auto refresh");
+    DrawProviderAutoRefreshSetting("Refresh Codex automatically", g_codexAutoRefreshEnabled);
 
     ImGui::Spacing();
     DrawSettingsSubHeader("Notifications");
@@ -2694,6 +2946,10 @@ static void DrawClaudeSettingsCard(float width, float height)
     DrawSettingsMutedText("This selection is saved automatically.");
 
     ImGui::Spacing();
+    DrawSettingsSubHeader("Auto refresh");
+    DrawProviderAutoRefreshSetting("Refresh Claude automatically", g_claudeAutoRefreshEnabled);
+
+    ImGui::Spacing();
     DrawSettingsSubHeader("Notifications");
     DrawCleanProviderNotifications(g_claudeNotifySettings, false);
 
@@ -2710,6 +2966,10 @@ static void DrawZAiSettingsCard(float width, float height)
     ImGui::PushID("##zai_settings_card");
     BeginCleanSettingsCard("##zai_settings_card", "Z.Ai", ImVec2(width, height));
 
+    DrawSettingsSubHeader("Auto refresh");
+    DrawProviderAutoRefreshSetting("Refresh Z.Ai automatically", g_zaiAutoRefreshEnabled);
+
+    ImGui::Spacing();
     DrawSettingsSubHeader("Notifications");
     DrawCleanZAiNotifications();
 
@@ -2726,6 +2986,10 @@ static void DrawGrokSettingsCard(float width, float height)
     ImGui::PushID("##grok_settings_card");
     BeginCleanSettingsCard("##grok_settings_card", "Grok", ImVec2(width, height));
 
+    DrawSettingsSubHeader("Auto refresh");
+    DrawProviderAutoRefreshSetting("Refresh Grok automatically", g_grokAutoRefreshEnabled);
+
+    ImGui::Spacing();
     DrawSettingsSubHeader("Notifications");
     DrawCleanGrokNotifications();
 

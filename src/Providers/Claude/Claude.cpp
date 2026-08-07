@@ -248,6 +248,8 @@ namespace Claude {
             L"\r\n"
             L"Accept: application/json\r\n"
             L"Content-Type: application/json\r\n"
+            L"Cache-Control: no-cache\r\n"
+            L"Pragma: no-cache\r\n"
             L"anthropic-beta: oauth-2025-04-20\r\n"
             L"User-Agent: claude-code/2.1.69\r\n";
 
@@ -408,6 +410,151 @@ namespace Claude {
         }
 
         return nullptr;
+    }
+
+    static const json* FindClaudeObjectRecursive(
+        const json& value,
+        std::initializer_list<const char*> keys,
+        int depth = 0
+    ) {
+        if (depth > 5) {
+            return nullptr;
+        }
+
+        if (value.is_object()) {
+            if (const json* direct = FindClaudeObject(value, keys)) {
+                return direct;
+            }
+
+            // Current Claude Desktop returns extra_usage at the top level.
+            // These wrappers are accepted for compatible web/API variants,
+            // without scanning or persisting any unrelated local data.
+            for (const char* wrapper : { "data", "usage", "plan_usage", "planUsage", "result" }) {
+                if (value.contains(wrapper)) {
+                    if (const json* nested = FindClaudeObjectRecursive(value.at(wrapper), keys, depth + 1)) {
+                        return nested;
+                    }
+                }
+            }
+
+            for (auto it = value.begin(); it != value.end(); ++it) {
+                if (!it.value().is_object() && !it.value().is_array()) {
+                    continue;
+                }
+
+                if (const json* nested = FindClaudeObjectRecursive(it.value(), keys, depth + 1)) {
+                    return nested;
+                }
+            }
+        }
+        else if (value.is_array()) {
+            for (const json& item : value) {
+                if (const json* nested = FindClaudeObjectRecursive(item, keys, depth + 1)) {
+                    return nested;
+                }
+            }
+        }
+
+        return nullptr;
+    }
+
+    static bool HasClaudeExtraUsageField(const json& object) {
+        if (!object.is_object()) {
+            return false;
+        }
+
+        for (const char* key : {
+            "is_enabled", "isEnabled", "enabled",
+            "monthly_limit", "monthlyLimit", "spend_limit", "spendLimit",
+            "used_credits", "usedCredits", "spent_credits", "spentCredits",
+            "utilization", "percent", "used_percent", "usedPercent"
+        }) {
+            if (object.contains(key)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    static int ClaudeExtraUsageInformationScore(const json& object) {
+        if (!HasClaudeExtraUsageField(object)) {
+            return -1;
+        }
+
+        int score = 1;
+
+        auto hasNonNull = [&](std::initializer_list<const char*> keys) {
+            for (const char* key : keys) {
+                if (object.contains(key) && !object.at(key).is_null()) {
+                    return true;
+                }
+            }
+
+            return false;
+        };
+
+        if (hasNonNull({ "is_enabled", "isEnabled", "enabled" })) {
+            score += 5;
+
+            if (JsonUtils::get_instance()->Bool(object, "is_enabled",
+                    JsonUtils::get_instance()->Bool(object, "isEnabled",
+                        JsonUtils::get_instance()->Bool(object, "enabled", false)))) {
+                score += 30;
+            }
+        }
+
+        if (hasNonNull({ "used_credits", "usedCredits", "spent_credits", "spentCredits" })) {
+            score += 45;
+        }
+
+        if (hasNonNull({ "monthly_limit", "monthlyLimit", "spend_limit", "spendLimit" })) {
+            score += 35;
+        }
+
+        if (hasNonNull({ "utilization", "percent", "used_percent", "usedPercent" })) {
+            score += 20;
+        }
+
+        return score;
+    }
+
+    static const json* FindClaudeExtraUsageObject(const json& root) {
+        const json* best = nullptr;
+        int bestScore = -1;
+
+        // Claude Desktop's authoritative plan-usage schema places
+        // extra_usage at the response root. A small set of API wrappers is
+        // accepted for compatibility, but unrelated nested objects are never
+        // searched because they can contain stale feature/configuration flags.
+        std::function<void(const json&, int)> visit = [&](const json& value, int depth) {
+            if (!value.is_object() || depth > 3) {
+                return;
+            }
+
+            for (const char* key : { "extra_usage", "extraUsage" }) {
+                if (!value.contains(key) || !value.at(key).is_object()) {
+                    continue;
+                }
+
+                const json& candidate = value.at(key);
+                int score = ClaudeExtraUsageInformationScore(candidate);
+
+                if (score > bestScore) {
+                    best = &candidate;
+                    bestScore = score;
+                }
+            }
+
+            for (const char* wrapper : { "data", "usage", "plan_usage", "planUsage", "result" }) {
+                if (value.contains(wrapper)) {
+                    visit(value.at(wrapper), depth + 1);
+                }
+            }
+        };
+
+        visit(root, 0);
+        return best;
     }
 
     static std::string ClaudeStringAny(
@@ -857,49 +1004,96 @@ namespace Claude {
 
         UsageCredits credits;
 
-        const json* extraUsage = FindClaudeObject(root, { "extra_usage", "extraUsage" });
+        const json* extraUsage = FindClaudeExtraUsageObject(root);
 
         if (!extraUsage) {
             return credits;
         }
 
+        credits.reported = true;
+        credits.valid = true;
+        credits.label = "Usage credits";
+
         const json& object = *extraUsage;
+        std::optional<bool> enabled;
 
-        // Claude Desktop only exposes the spend row when extra usage is
-        // enabled and the server supplied an actual used-credit amount.
-        // is_enabled by itself is not usage data and must not create a 0% row.
-        credits.enabled = ClaudeBoolAny(object, { "is_enabled", "isEnabled" }, false);
-        const std::optional<double> usedCents = ClaudeNumberAny(
-            object,
-            { "used_credits", "usedCredits" }
-        );
-
-        if (!credits.enabled || !usedCents) {
-            return credits;
+        for (const char* key : { "is_enabled", "isEnabled", "enabled" }) {
+            if (object.contains(key) && !object.at(key).is_null()) {
+                enabled = ClaudeBoolAny(object, { key }, false);
+                break;
+            }
         }
 
-        credits.valid = true;
-
+        const std::optional<double> usedCents = ClaudeNumberAny(
+            object,
+            { "used_credits", "usedCredits", "spent_credits", "spentCredits" }
+        );
         const std::optional<double> limitCents = ClaudeNumberAny(
             object,
-            { "monthly_limit", "monthlyLimit" }
+            { "monthly_limit", "monthlyLimit", "spend_limit", "spendLimit" }
         );
         const std::optional<double> utilization = ClaudeNumberAny(
             object,
             { "utilization", "percent", "used_percent", "usedPercent" }
         );
+        const std::optional<double> balanceCents = ClaudeNumberAny(
+            object,
+            {
+                "current_balance", "currentBalance",
+                "credit_balance", "creditBalance", "balance"
+            }
+        );
 
-        const double usedDollars = std::max(0.0, *usedCents) / 100.0;
+        credits.hasSpentAmount = usedCents.has_value();
+        credits.hasMonthlyLimit = limitCents.has_value();
+
+        // Spend data is authoritative evidence that usage credits are active.
+        // Do not render Off when a stale/contradictory flag is returned next
+        // to non-null used_credits, monthly_limit, or utilization values.
+        const bool hasSpendData = usedCents.has_value() || limitCents.has_value();
+        const bool inferredEnabled = hasSpendData || utilization.has_value();
+        credits.enabled = enabled.has_value()
+            ? (*enabled || hasSpendData)
+            : inferredEnabled;
+
+        if (!credits.enabled) {
+            credits.spentText = "Off";
+            credits.limitText = "Off";
+            credits.monthlyLimitText = "Off";
+            credits.currentBalanceText = "Unavailable";
+            credits.hasUsedPercent = false;
+            return credits;
+        }
+
+        if (!usedCents) {
+            // The provider reported that usage credits are enabled but withheld
+            // spend data. Keep the section visible without fabricating a value.
+            credits.spentText = "Spend unavailable";
+            credits.limitText = limitCents ? FormatDollars(std::max(0.0, *limitCents) / 100.0) : "Unavailable";
+            credits.monthlyLimitText = credits.limitText;
+            credits.currentBalanceText = balanceCents
+                ? FormatDollars(std::max(0.0, *balanceCents) / 100.0)
+                : FormatDollars(0.0);
+            credits.hasUsedPercent = false;
+            return credits;
+        }
+
+        const double safeUsedCents = std::max(0.0, *usedCents);
+        const double usedDollars = safeUsedCents / 100.0;
         credits.spentText = FormatDollars(usedDollars) + " spent";
 
         if (limitCents) {
             const double safeLimitCents = std::max(0.0, *limitCents);
             const double limitDollars = safeLimitCents / 100.0;
-            const double balanceDollars = std::max(0.0, limitDollars - usedDollars);
-
             credits.limitText = FormatDollars(limitDollars) + " monthly limit";
             credits.monthlyLimitText = FormatDollars(limitDollars);
-            credits.currentBalanceText = FormatDollars(balanceDollars);
+            // The monthly limit is a spending cap, not a wallet balance.
+            // Claude Desktop renders an omitted prepaid-credit balance as
+            // $0.00, so mirror that exact UI behavior instead of showing an
+            // ambiguous "Not reported" value.
+            credits.currentBalanceText = balanceCents
+                ? FormatDollars(std::max(0.0, *balanceCents) / 100.0)
+                : FormatDollars(0.0);
             credits.hasUsedPercent = true;
 
             if (utilization) {
@@ -913,24 +1107,22 @@ namespace Claude {
             else {
                 credits.usedPercent = static_cast<float>(
                     Math::get_instance()->ClampPercentDouble(
-                        (std::max(0.0, *usedCents) / safeLimitCents) * 100.0
+                        (safeUsedCents / safeLimitCents) * 100.0
                     )
                 );
             }
         }
         else {
-            // No monthly cap means Claude treats the spend as unlimited. Keep
-            // the real spend details, but do not invent a 0% quota bar.
             credits.limitText = "Unlimited";
             credits.monthlyLimitText = "Unlimited";
-            credits.currentBalanceText = "Unlimited";
+            credits.currentBalanceText = balanceCents
+                ? FormatDollars(std::max(0.0, *balanceCents) / 100.0)
+                : FormatDollars(0.0);
             credits.hasUsedPercent = false;
         }
 
         std::chrono::system_clock::time_point resetAt = ParseClaudeResetAt(object);
 
-        // Claude Desktop derives the spend reset from the first day of the
-        // next month when the response does not include an explicit timestamp.
         if (resetAt.time_since_epoch().count() == 0) {
             resetAt = FirstDayOfNextMonth();
         }
@@ -944,6 +1136,694 @@ namespace Claude {
         }
 
         return credits;
+    }
+
+    static int CreditsInformationScore(const UsageCredits& credits) {
+        if (!credits.reported) {
+            return 0;
+        }
+
+        int score = 10;
+        score += credits.valid ? 5 : 0;
+        score += credits.enabled ? 25 : 0;
+        score += credits.hasSpentAmount ? 45 : 0;
+        score += credits.hasMonthlyLimit ? 35 : 0;
+        score += credits.hasUsedPercent ? 20 : 0;
+        score += !credits.currentBalanceText.empty() &&
+            credits.currentBalanceText != "Unavailable" &&
+            credits.currentBalanceText != "Not reported" ? 5 : 0;
+        return score;
+    }
+
+    static bool CreditsNeedSupplement(const UsageCredits& credits) {
+        if (!credits.reported) {
+            return true;
+        }
+
+        // A full-spend response always supplies used_credits when the feature
+        // is enabled. A reported disabled object with no spend fields can be a
+        // lightweight/stale response, so verify it through the remaining
+        // official authentication/host paths before displaying Off.
+        if (!credits.enabled && !credits.hasSpentAmount && !credits.hasMonthlyLimit) {
+            return true;
+        }
+
+        return credits.enabled && !credits.hasSpentAmount;
+    }
+
+    static std::filesystem::path ClaudeProjectsPath() {
+        std::string configDir = Network::get_instance()->GetEnvText("CLAUDE_CONFIG_DIR");
+
+        if (!configDir.empty()) {
+            return std::filesystem::path(configDir) / "projects";
+        }
+
+        return Network::get_instance()->UserProfilePath() / ".claude" / "projects";
+    }
+
+    static std::string ReadClaudeTailSharedReadOnly(
+        const std::filesystem::path& path,
+        unsigned long long maximumBytes
+    ) {
+        HANDLE file = CreateFileW(
+            path.wstring().c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+            nullptr
+        );
+
+        if (file == INVALID_HANDLE_VALUE) {
+            return {};
+        }
+
+        LARGE_INTEGER size{};
+
+        if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0) {
+            CloseHandle(file);
+            return {};
+        }
+
+        const unsigned long long fileSize = static_cast<unsigned long long>(size.QuadPart);
+        const unsigned long long readSize = std::min(fileSize, maximumBytes);
+        const unsigned long long start = fileSize - readSize;
+        LARGE_INTEGER offset{};
+        offset.QuadPart = static_cast<LONGLONG>(start);
+
+        if (!SetFilePointerEx(file, offset, nullptr, FILE_BEGIN)) {
+            CloseHandle(file);
+            return {};
+        }
+
+        std::string text(static_cast<size_t>(readSize), '\0');
+        size_t totalRead = 0;
+
+        while (totalRead < text.size()) {
+            const DWORD chunk = static_cast<DWORD>(std::min<size_t>(
+                text.size() - totalRead,
+                1024 * 1024
+            ));
+            DWORD read = 0;
+
+            if (!ReadFile(file, text.data() + totalRead, chunk, &read, nullptr) || read == 0) {
+                break;
+            }
+
+            totalRead += read;
+        }
+
+        CloseHandle(file);
+        text.resize(totalRead);
+
+        if (start > 0) {
+            const size_t newline = text.find('\n');
+
+            if (newline == std::string::npos) {
+                return {};
+            }
+
+            text.erase(0, newline + 1);
+        }
+
+        return text;
+    }
+
+    struct ClaudeSessionCandidate {
+        std::filesystem::path path;
+        std::filesystem::file_time_type writeTime{};
+    };
+
+    static std::vector<ClaudeSessionCandidate> LatestClaudeSessionFiles() {
+        const std::filesystem::path projects = ClaudeProjectsPath();
+        std::error_code ec;
+
+        if (!std::filesystem::exists(projects, ec) || ec) {
+            return {};
+        }
+
+        std::vector<ClaudeSessionCandidate> candidates;
+        std::filesystem::recursive_directory_iterator it(
+            projects,
+            std::filesystem::directory_options::skip_permission_denied,
+            ec
+        );
+        const std::filesystem::recursive_directory_iterator end;
+
+        for (; it != end; it.increment(ec)) {
+            if (ec) {
+                ec.clear();
+                continue;
+            }
+
+            const std::filesystem::directory_entry& entry = *it;
+
+            if (!entry.is_regular_file(ec) || ec || entry.path().extension() != ".jsonl") {
+                ec.clear();
+                continue;
+            }
+
+            const auto writeTime = entry.last_write_time(ec);
+
+            if (ec) {
+                ec.clear();
+                continue;
+            }
+
+            candidates.push_back({ entry.path(), writeTime });
+        }
+
+        std::sort(
+            candidates.begin(),
+            candidates.end(),
+            [](const ClaudeSessionCandidate& left, const ClaudeSessionCandidate& right) {
+                return left.writeTime > right.writeTime;
+            }
+        );
+
+        if (candidates.size() > 64) {
+            candidates.resize(64);
+        }
+
+        return candidates;
+    }
+
+    static std::optional<double> FindClaudeNumberRecursive(
+        const json& value,
+        std::initializer_list<const char*> keys,
+        int depth = 0
+    ) {
+        if (depth > 10) {
+            return std::nullopt;
+        }
+
+        if (value.is_object()) {
+            for (const char* key : keys) {
+                if (!value.contains(key) || value.at(key).is_null()) {
+                    continue;
+                }
+
+                const json& candidate = value.at(key);
+
+                if (candidate.is_number()) {
+                    return candidate.get<double>();
+                }
+            }
+
+            for (auto it = value.begin(); it != value.end(); ++it) {
+                if (it.value().is_object() || it.value().is_array()) {
+                    if (auto result = FindClaudeNumberRecursive(it.value(), keys, depth + 1)) {
+                        return result;
+                    }
+                }
+            }
+        }
+        else if (value.is_array()) {
+            for (const json& item : value) {
+                if (auto result = FindClaudeNumberRecursive(item, keys, depth + 1)) {
+                    return result;
+                }
+            }
+        }
+
+        return std::nullopt;
+    }
+
+    static std::optional<json> ExtractClaudeMetadataObject(
+        const std::string& line,
+        const std::string& key
+    ) {
+        const std::string needle = "\"" + key + "\"";
+        size_t searchAt = 0;
+
+        while (true) {
+            const size_t keyAt = line.find(needle, searchAt);
+
+            if (keyAt == std::string::npos) {
+                return std::nullopt;
+            }
+
+            const size_t colon = line.find(':', keyAt + needle.size());
+
+            if (colon == std::string::npos) {
+                return std::nullopt;
+            }
+
+            size_t begin = colon + 1;
+
+            while (begin < line.size() && std::isspace(
+                static_cast<unsigned char>(line[begin])
+            )) {
+                ++begin;
+            }
+
+            if (begin >= line.size() || line[begin] != '{') {
+                searchAt = keyAt + needle.size();
+                continue;
+            }
+
+            int depth = 0;
+            bool inString = false;
+            bool escaped = false;
+
+            for (size_t i = begin; i < line.size(); ++i) {
+                const char c = line[i];
+
+                if (inString) {
+                    if (escaped) {
+                        escaped = false;
+                    }
+                    else if (c == '\\') {
+                        escaped = true;
+                    }
+                    else if (c == '"') {
+                        inString = false;
+                    }
+                    continue;
+                }
+
+                if (c == '"') {
+                    inString = true;
+                }
+                else if (c == '{') {
+                    ++depth;
+                }
+                else if (c == '}') {
+                    --depth;
+
+                    if (depth == 0) {
+                        json object = json::parse(
+                            line.substr(begin, i - begin + 1),
+                            nullptr,
+                            false
+                        );
+
+                        if (!object.is_discarded() && object.is_object()) {
+                            return object;
+                        }
+
+                        return std::nullopt;
+                    }
+                }
+            }
+
+            return std::nullopt;
+        }
+    }
+
+    static long long ClaudeInputTokensFromUsage(const json& usage) {
+        if (!usage.is_object()) {
+            return 0;
+        }
+
+        const long long input = static_cast<long long>(std::max(
+            0.0,
+            ClaudeNumberAny(usage, { "input_tokens", "inputTokens" }).value_or(0.0)
+        ));
+        const long long cacheCreate = static_cast<long long>(std::max(
+            0.0,
+            ClaudeNumberAny(usage, {
+                "cache_creation_input_tokens", "cacheCreationInputTokens"
+            }).value_or(0.0)
+        ));
+        const long long cacheRead = static_cast<long long>(std::max(
+            0.0,
+            ClaudeNumberAny(usage, {
+                "cache_read_input_tokens", "cacheReadInputTokens"
+            }).value_or(0.0)
+        ));
+
+        return input + cacheCreate + cacheRead;
+    }
+
+    static bool LooksLikeClaudeAssistantRecord(const std::string& line) {
+        return line.find("\"type\":\"assistant\"") != std::string::npos ||
+            line.find("\"type\": \"assistant\"") != std::string::npos;
+    }
+
+    static std::string ExtractClaudeMetadataString(
+        const std::string& line,
+        const std::string& key
+    ) {
+        const std::string needle = "\"" + key + "\"";
+        size_t searchAt = 0;
+
+        while (true) {
+            const size_t keyAt = line.find(needle, searchAt);
+
+            if (keyAt == std::string::npos) {
+                return {};
+            }
+
+            const size_t colon = line.find(':', keyAt + needle.size());
+
+            if (colon == std::string::npos) {
+                return {};
+            }
+
+            size_t begin = colon + 1;
+            while (begin < line.size() && std::isspace(static_cast<unsigned char>(line[begin]))) ++begin;
+
+            if (begin >= line.size() || line[begin] != '"') {
+                searchAt = keyAt + needle.size();
+                continue;
+            }
+
+            std::string value;
+            bool escaped = false;
+
+            for (size_t i = begin + 1; i < line.size(); ++i) {
+                const char c = line[i];
+
+                if (escaped) {
+                    value.push_back(c);
+                    escaped = false;
+                }
+                else if (c == '\\') {
+                    escaped = true;
+                }
+                else if (c == '"') {
+                    return value;
+                }
+                else {
+                    value.push_back(c);
+                }
+            }
+
+            return {};
+        }
+    }
+
+    static long long KnownClaudeContextWindowForModel(const std::string& model) {
+        const std::string lower = ToLowerAscii(model);
+
+        if (lower.empty()) {
+            return 0;
+        }
+
+        if (lower.find("[1m]") != std::string::npos ||
+            lower.find("context-1m") != std::string::npos ||
+            lower.find("context_1m") != std::string::npos) {
+            return 1000000;
+        }
+
+        // Claude Code's current Claude 3.x and Claude 4.x model IDs use a
+        // 200k standard context window. Restrict the fallback to recognized
+        // Claude model IDs so an unknown future model is never guessed.
+        if (lower.rfind("claude-3", 0) == 0 || lower.rfind("claude-4", 0) == 0 ||
+            lower.find("claude-sonnet-4") != std::string::npos ||
+            lower.find("claude-opus-4") != std::string::npos ||
+            lower.find("claude-haiku-4") != std::string::npos ||
+            lower == "sonnet" || lower == "opus" || lower == "haiku" ||
+            lower == "default") {
+            return 200000;
+        }
+
+        return 0;
+    }
+
+    static bool ClaudeCompactionStateFromLine(
+        const std::string& line,
+        bool& state
+    ) {
+        if (ToLowerAscii(line).find("compact") == std::string::npos) {
+            return false;
+        }
+
+        const std::string type = ToLowerAscii(ExtractClaudeMetadataString(line, "type"));
+        const std::string subtype = ToLowerAscii(ExtractClaudeMetadataString(line, "subtype"));
+        const std::string status = ToLowerAscii(ExtractClaudeMetadataString(line, "status"));
+        const std::string phase = ToLowerAscii(ExtractClaudeMetadataString(line, "phase"));
+        const std::string combined = type + " " + subtype + " " + status + " " + phase;
+
+        const bool completed =
+            combined.find("compact_boundary") != std::string::npos ||
+            combined.find("compaction_completed") != std::string::npos ||
+            combined.find("compact_completed") != std::string::npos ||
+            combined.find("context_compacted") != std::string::npos ||
+            ((combined.find("compact") != std::string::npos) &&
+                (status == "completed" || status == "complete" || status == "done" ||
+                    phase == "completed" || phase == "complete" || phase == "done")) ||
+            (line.find("\"completed\":true") != std::string::npos) ||
+            (line.find("\"completed\": true") != std::string::npos);
+
+        if (completed) {
+            state = false;
+            return true;
+        }
+
+        const bool running =
+            combined.find("compaction_started") != std::string::npos ||
+            combined.find("compact_started") != std::string::npos ||
+            combined.find("context_compaction") != std::string::npos ||
+            combined.find("auto_compact") != std::string::npos ||
+            combined.find("autocompact") != std::string::npos ||
+            combined.find("compacting") != std::string::npos ||
+            ((combined.find("compact") != std::string::npos) &&
+                (status == "running" || status == "started" || status == "in_progress" ||
+                    phase == "running" || phase == "started" || phase == "in_progress")) ||
+            (line.find("\"completed\":false") != std::string::npos) ||
+            (line.find("\"completed\": false") != std::string::npos);
+
+        if (running) {
+            state = true;
+            return true;
+        }
+
+        return false;
+    }
+
+    static UsageTelemetry::ContextUsage ReadClaudeContextFromSession(
+        const std::filesystem::path& session
+    ) {
+        UsageTelemetry::ContextUsage context;
+        const std::string text = ReadClaudeTailSharedReadOnly(
+            session,
+            8ULL * 1024ULL * 1024ULL
+        );
+
+        if (text.empty()) {
+            return context;
+        }
+
+        std::vector<std::string> lines;
+        std::istringstream stream(text);
+        std::string line;
+
+        while (std::getline(stream, line)) {
+            if (!line.empty()) {
+                lines.push_back(std::move(line));
+            }
+        }
+
+        long long usedTokens = 0;
+        long long contextWindowTokens = 0;
+        std::string model;
+        bool modelWindowFallback = false;
+        bool compacting = false;
+
+        // Session metadata is processed in file order so a completed boundary
+        // or a newer assistant usage record switches the transient state back.
+        for (const std::string& candidate : lines) {
+            bool stateChanged = ClaudeCompactionStateFromLine(candidate, compacting);
+
+            if (!stateChanged && compacting && LooksLikeClaudeAssistantRecord(candidate) &&
+                candidate.find("\"usage\"") != std::string::npos) {
+                compacting = false;
+            }
+        }
+
+        context.compacting = compacting;
+
+        for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
+            const bool relevant =
+                it->find("\"usage\"") != std::string::npos ||
+                it->find("context_window") != std::string::npos ||
+                it->find("contextWindow") != std::string::npos ||
+                it->find("modelUsage") != std::string::npos ||
+                it->find("\"model\"") != std::string::npos;
+
+            if (!relevant) {
+                continue;
+            }
+
+            std::optional<json> contextWindow = ExtractClaudeMetadataObject(
+                *it,
+                "context_window"
+            );
+
+            if (!contextWindow) {
+                contextWindow = ExtractClaudeMetadataObject(*it, "contextWindow");
+            }
+
+            if (contextWindow) {
+                if (contextWindowTokens <= 0) {
+                    const auto maximum = ClaudeNumberAny(
+                        *contextWindow,
+                        { "context_window_size", "contextWindowSize" }
+                    );
+
+                    if (maximum && *maximum > 0.0) {
+                        contextWindowTokens = static_cast<long long>(*maximum);
+                    }
+                }
+
+                if (usedTokens <= 0) {
+                    const json* current = FindClaudeObjectRecursive(
+                        *contextWindow,
+                        { "current_usage", "currentUsage" }
+                    );
+
+                    if (current) {
+                        usedTokens = ClaudeInputTokensFromUsage(*current);
+                    }
+
+                    if (usedTokens <= 0) {
+                        const auto total = ClaudeNumberAny(
+                            *contextWindow,
+                            { "total_input_tokens", "totalInputTokens" }
+                        );
+
+                        if (total && *total > 0.0) {
+                            usedTokens = static_cast<long long>(*total);
+                        }
+                    }
+                }
+            }
+
+            if (usedTokens <= 0 && LooksLikeClaudeAssistantRecord(*it)) {
+                if (auto usage = ExtractClaudeMetadataObject(*it, "usage")) {
+                    usedTokens = ClaudeInputTokensFromUsage(*usage);
+                }
+            }
+
+            if (model.empty()) {
+                model = ExtractClaudeMetadataString(*it, "model");
+            }
+
+            if (contextWindowTokens <= 0) {
+                if (auto modelUsage = ExtractClaudeMetadataObject(*it, "modelUsage")) {
+                    const auto maximum = FindClaudeNumberRecursive(
+                        *modelUsage,
+                        {
+                            "context_window_size", "contextWindowSize",
+                            "model_context_window", "modelContextWindow",
+                            "contextWindow"
+                        }
+                    );
+
+                    if (maximum && *maximum > 0.0) {
+                        contextWindowTokens = static_cast<long long>(*maximum);
+                    }
+                }
+            }
+
+            if (usedTokens > 0 && contextWindowTokens > 0) {
+                break;
+            }
+        }
+
+        if (contextWindowTokens <= 0) {
+            contextWindowTokens = KnownClaudeContextWindowForModel(model);
+            modelWindowFallback = contextWindowTokens > 0;
+        }
+
+        if (usedTokens <= 0 || contextWindowTokens <= 0) {
+            return context;
+        }
+
+        context.valid = true;
+        context.usedTokens = usedTokens;
+        context.contextWindowTokens = contextWindowTokens;
+        context.model = model;
+        context.sourceLabel = modelWindowFallback
+            ? "Claude Code session usage + recognized model context limit"
+            : "Claude Code session context metadata · direct read-only";
+        return context;
+    }
+
+    static UsageTelemetry::ContextUsage ReadLatestClaudeContextUsage() {
+        UsageTelemetry::ContextUsage newestTransient;
+
+        for (const ClaudeSessionCandidate& candidate : LatestClaudeSessionFiles()) {
+            UsageTelemetry::ContextUsage context = ReadClaudeContextFromSession(candidate.path);
+
+            if (context.valid) {
+                return context;
+            }
+
+            if (context.compacting) {
+                newestTransient = context;
+                break;
+            }
+        }
+
+        return newestTransient;
+    }
+
+    UsageTelemetry::ContextUsage ReadLocalContextUsage() {
+        return ReadLatestClaudeContextUsage();
+    }
+
+    static void FinalizeClaudeAccess(Snapshot& snapshot) {
+        std::vector<std::string> blockingRateLimits;
+        std::vector<std::string> partialRateLimits;
+
+        auto collect = [&](const UsageWindow& window, bool blocksAllUsage) {
+            if (!window.valid || !UsageTelemetry::IsExhausted(window.usedPercent)) {
+                return;
+            }
+
+            (blocksAllUsage ? blockingRateLimits : partialRateLimits).push_back(
+                window.title.empty() ? "Usage" : window.title
+            );
+        };
+
+        collect(snapshot.currentSession, true);
+        collect(snapshot.weeklyAllModels, true);
+        collect(snapshot.weeklySonnet, false);
+        collect(snapshot.weeklyFable, false);
+
+        for (const UsageWindow& limit : snapshot.additionalLimits) {
+            collect(limit, false);
+        }
+
+        auto join = [](const std::vector<std::string>& values) {
+            std::string text;
+
+            for (size_t i = 0; i < values.size(); ++i) {
+                if (i != 0) text += ", ";
+                text += values[i];
+            }
+
+            return text;
+        };
+
+        // A depleted plan window or credit allocation means the account cannot
+        // continue until reset/top-up, so it is OUT OF USAGE. RATE LIMITED is
+        // reserved for transient request throttling such as HTTP 429.
+        if (snapshot.credits.valid && snapshot.credits.enabled &&
+            snapshot.credits.hasUsedPercent &&
+            UsageTelemetry::IsExhausted(snapshot.credits.usedPercent)) {
+            snapshot.access.state = UsageTelemetry::AccessState::OutOfUsage;
+            snapshot.access.detail = snapshot.credits.label.empty()
+                ? "Usage credits exhausted"
+                : snapshot.credits.label + " exhausted";
+            return;
+        }
+
+        if (!blockingRateLimits.empty()) {
+            snapshot.access.state = UsageTelemetry::AccessState::OutOfUsage;
+            snapshot.access.detail = "Usage exhausted: " + join(blockingRateLimits);
+            return;
+        }
+
+        UsageTelemetry::SetAvailable(snapshot.access);
+
+        if (!partialRateLimits.empty()) {
+            snapshot.access.detail = "Some limits are exhausted: " + join(partialRateLimits);
+        }
     }
 
     static Snapshot ParseSnapshot(const json& root, const ClaudeOAuth& oauth, const std::string& usageHeading) {
@@ -1010,32 +1890,159 @@ namespace Claude {
         }
 
         snapshot.credits = ParseCredits(root, oauth);
+        FinalizeClaudeAccess(snapshot);
         return snapshot;
     }
 
-    static Network::HttpResponse FetchDesktopUsage(const ClaudeDesktopAuth::Result& desktop) {
-        std::string cookie = Network::get_instance()->StripHeaderValue(desktop.cookieHeader);
-        std::string baseUrl = desktop.baseUrl.empty() ? "https://claude.ai" : desktop.baseUrl;
+    static Network::HttpResponse FetchDesktopOrganizationUsage(
+        const ClaudeDesktopAuth::Result& desktop,
+        const std::string& baseUrl,
+        bool explicitSpend
+    ) {
+        const std::string cookie = Network::get_instance()->StripHeaderValue(desktop.cookieHeader);
+
+        if (cookie.empty()) {
+            return {};
+        }
 
         std::string headers;
         headers += "Accept: application/json\r\n";
+        headers += "Cache-Control: no-cache, no-store, max-age=0\r\n";
+        headers += "Pragma: no-cache\r\n";
         headers += "Cookie: " + cookie + "\r\n";
         headers += "Referer: " + baseUrl + "/settings/usage\r\n";
         headers += "Origin: " + baseUrl + "\r\n";
         headers += "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Claude/1.25927.0\r\n";
 
+        std::string url = baseUrl + "/api/organizations/" + desktop.organizationId + "/usage";
+
+        // Claude Desktop normally omits the query for a full-spend refresh.
+        // The explicit false form is retained as a compatibility retry for
+        // deployments that distinguish it from an omitted query parameter.
+        if (explicitSpend) {
+            url += "?skip_spend=0";
+        }
+
         return Network::get_instance()->RequestUrl(
-            baseUrl + "/api/organizations/" + desktop.organizationId + "/usage",
+            url,
             "GET",
             Network::get_instance()->Utf8ToWide(headers)
         );
     }
 
-    static Snapshot FailedSnapshot(const std::string& heading, const std::string& status) {
+    static Network::HttpResponse FetchDesktopUsage(const ClaudeDesktopAuth::Result& desktop) {
+        const std::string baseUrl = desktop.baseUrl.empty() ? "https://claude.ai" : desktop.baseUrl;
+        return FetchDesktopOrganizationUsage(desktop, baseUrl, false);
+    }
+
+    static bool MergeCreditsFromBody(
+        Snapshot& snapshot,
+        const std::string& body,
+        const ClaudeOAuth& oauth
+    ) {
+        if (body.empty()) {
+            return false;
+        }
+
+        json parsed = JsonUtils::get_instance()->ParseOrNull(body);
+
+        if (!parsed.is_object() && !parsed.is_array()) {
+            return false;
+        }
+
+        UsageCredits credits = ParseCredits(parsed, oauth);
+
+        if (credits.reported &&
+            CreditsInformationScore(credits) > CreditsInformationScore(snapshot.credits)) {
+            snapshot.credits = std::move(credits);
+            return true;
+        }
+
+        return false;
+    }
+
+    static Network::HttpResponse FetchDesktopUsageFromBase(
+        const ClaudeDesktopAuth::Result& desktop,
+        const std::string& baseUrl,
+        bool explicitSpend = false
+    ) {
+        return FetchDesktopOrganizationUsage(
+            desktop,
+            baseUrl,
+            explicitSpend
+        );
+    }
+
+    static void FetchDesktopCreditsSupplement(
+        Snapshot& snapshot,
+        const ClaudeDesktopAuth::Result& desktop,
+        const ClaudeOAuth& desktopPlan
+    ) {
+        if (!CreditsNeedSupplement(snapshot.credits)) {
+            return;
+        }
+
+        const std::string primaryBase = desktop.baseUrl.empty()
+            ? "https://claude.ai"
+            : desktop.baseUrl;
+
+        auto mergeSuccessful = [&](const Network::HttpResponse& response) {
+            if (response.statusCode >= 200 && response.statusCode < 300) {
+                MergeCreditsFromBody(snapshot, response.body, desktopPlan);
+            }
+        };
+
+        if (desktop.source == ClaudeDesktopAuth::AuthSource::BrowserCookies) {
+            // A full-spend refresh normally has no query. Retry with an
+            // explicit skip_spend=0 only when the successful primary response
+            // omitted extra_usage.
+            mergeSuccessful(FetchDesktopUsageFromBase(
+                desktop,
+                primaryBase,
+                true
+            ));
+        }
+
+        // The matching Desktop OAuth cache belongs to the same active
+        // organization. The token remains in memory only.
+        if (CreditsNeedSupplement(snapshot.credits) &&
+            desktop.source == ClaudeDesktopAuth::AuthSource::BrowserCookies &&
+            !desktop.accessToken.empty()) {
+            mergeSuccessful(FetchUsage(desktop.accessToken));
+        }
+
+        if (!CreditsNeedSupplement(snapshot.credits) ||
+            desktop.source != ClaudeDesktopAuth::AuthSource::BrowserCookies) {
+            return;
+        }
+
+        // Claude has migrated between claude.ai and claude.com. Query the
+        // alternate official host with the same in-memory authentication and
+        // merge only extra_usage; no credentials are persisted or copied.
+        const std::string alternate = primaryBase.find("claude.com") != std::string::npos
+            ? "https://claude.ai"
+            : "https://claude.com";
+
+        mergeSuccessful(FetchDesktopUsageFromBase(
+            desktop,
+            alternate,
+            false
+        ));
+    }
+
+    static Snapshot FailedSnapshot(
+        const std::string& heading,
+        const std::string& status,
+        int statusCode = 0,
+        const std::string& responseBody = {}
+    ) {
         Snapshot snapshot;
         snapshot.usageHeading = heading;
         snapshot.statusText = status;
         snapshot.lastUpdated = "now";
+        snapshot.access = statusCode > 0
+            ? UsageTelemetry::FromHttpFailure(statusCode, responseBody, status)
+            : UsageTelemetry::FromText(status);
         return snapshot;
     }
 
@@ -1075,13 +2082,20 @@ namespace Claude {
         }
 
         if (response.statusCode == 429) {
-            return FailedSnapshot("Claude Desktop usage", "Claude Desktop usage request is rate limited");
+            return FailedSnapshot(
+                "Claude Desktop usage",
+                "Claude Desktop usage request is rate limited",
+                response.statusCode,
+                response.body
+            );
         }
 
         if (response.statusCode < 200 || response.statusCode >= 300) {
             return FailedSnapshot(
                 "Claude Desktop usage",
-                "Claude Desktop usage failed: HTTP " + std::to_string(response.statusCode)
+                "Claude Desktop usage failed: HTTP " + std::to_string(response.statusCode),
+                response.statusCode,
+                response.body
             );
         }
 
@@ -1095,6 +2109,10 @@ namespace Claude {
         // The organization ID is already required for the usage request and is
         // retained only in memory.
         snapshot.accountKey = "desktop:" + desktop.organizationId;
+        FetchDesktopCreditsSupplement(snapshot, desktop, desktopPlan);
+        // Supplemental spend data can change availability independently from
+        // Session/Weekly limits, so classify access again after the merge.
+        FinalizeClaudeAccess(snapshot);
         snapshot.statusText += desktop.source == ClaudeDesktopAuth::AuthSource::OAuthCache
             ? " | Source: Desktop OAuth cache"
             : " | Source: Desktop live session";
@@ -1122,13 +2140,20 @@ namespace Claude {
         }
 
         if (response.statusCode == 429) {
-            return FailedSnapshot(usageHeading, sourceName + " usage request is rate limited");
+            return FailedSnapshot(
+                usageHeading,
+                sourceName + " usage request is rate limited",
+                response.statusCode,
+                response.body
+            );
         }
 
         if (response.statusCode < 200 || response.statusCode >= 300) {
             return FailedSnapshot(
                 usageHeading,
-                sourceName + " usage failed: HTTP " + std::to_string(response.statusCode)
+                sourceName + " usage failed: HTTP " + std::to_string(response.statusCode),
+                response.statusCode,
+                response.body
             );
         }
 
@@ -1203,7 +2228,7 @@ namespace Claude {
         return FetchCodeSnapshot(*credentials, heading, "Claude Code environment token");
     }
 
-    Snapshot FetchSnapshot(AccountSource source) {
+    static Snapshot FetchSnapshotForSource(AccountSource source) {
         if (source == AccountSource::Desktop || source == AccountSource::Auto) {
             ClaudeDesktopAuth::Result desktop = ClaudeDesktopAuth::AcquireCurrentSession();
 
@@ -1247,5 +2272,12 @@ namespace Claude {
 
         return FetchEnvironmentSnapshot(false);
     }
+
+    Snapshot FetchSnapshot(AccountSource source) {
+        Snapshot snapshot = FetchSnapshotForSource(source);
+        snapshot.context = ReadLatestClaudeContextUsage();
+        return snapshot;
+    }
+
 
 }

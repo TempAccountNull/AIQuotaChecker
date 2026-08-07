@@ -3,6 +3,8 @@
 #include <string>
 #include <vector>
 
+#include "../UsageTelemetry.hpp"
+
 namespace Grok
 {
     struct UsageWindow
@@ -38,6 +40,8 @@ namespace Grok
         UsageWindow weeklyLimit;
         ExtraCredits extraCredits;
         std::vector<ProductUsage> products;
+        UsageTelemetry::AccessStatus access;
+        UsageTelemetry::ContextUsage context;
     };
 
     Snapshot FetchSnapshot();

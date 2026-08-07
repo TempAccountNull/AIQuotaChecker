@@ -200,6 +200,17 @@ void ClaudeProvider::RefreshAsync()
                         !snapshot.accountKey.empty() &&
                         self->m_lastSuccessfulAccountKey != snapshot.accountKey;
 
+                    const bool sameAccount = !snapshot.accountKey.empty() &&
+                        snapshot.accountKey == self->m_lastSuccessfulAccountKey;
+
+                    // Claude Desktop itself keeps the last full spend object when
+                    // a lightweight usage response omits extra_usage. Preserve it
+                    // only for the same account; an explicit reported disabled
+                    // state always replaces the old data.
+                    if (sameAccount && !snapshot.credits.reported && self->m_snapshot.credits.reported) {
+                        snapshot.credits = self->m_snapshot.credits;
+                    }
+
                     if (!snapshot.accountKey.empty()) {
                         self->m_lastSuccessfulAccountKey = snapshot.accountKey;
                     }
@@ -225,6 +236,7 @@ void ClaudeProvider::RefreshAsync()
                 Claude::Snapshot failedSnapshot;
                 failedSnapshot.statusText = error;
                 failedSnapshot.lastUpdated = "now";
+                failedSnapshot.access = UsageTelemetry::FromText(error);
 
                 std::lock_guard<std::mutex> lock(*self->StateMutex());
                 *self->Snapshot() = failedSnapshot;
@@ -238,6 +250,40 @@ void ClaudeProvider::RefreshAsync()
         if (sourceChanged) {
             self->RefreshAsync();
         }
+    }).detach();
+}
+
+void ClaudeProvider::RefreshContextAsync()
+{
+    if (m_contextLoading.exchange(true)) {
+        return;
+    }
+
+    std::thread([] {
+        ClaudeProvider* self = ClaudeProvider::get_instance();
+
+        try {
+            UsageTelemetry::ContextUsage context = Claude::ReadLocalContextUsage();
+            std::lock_guard<std::mutex> lock(*self->StateMutex());
+
+            if (context.valid) {
+                self->Snapshot()->context = std::move(context);
+            }
+            else if (context.compacting) {
+                // Keep the last exact current/max values visible during the
+                // transient compaction while changing only the heading.
+                self->Snapshot()->context.compacting = true;
+            }
+            else {
+                self->Snapshot()->context.compacting = false;
+            }
+        }
+        catch (...) {
+            std::lock_guard<std::mutex> lock(*self->StateMutex());
+            self->Snapshot()->context.compacting = false;
+        }
+
+        self->m_contextLoading = false;
     }).detach();
 }
 
