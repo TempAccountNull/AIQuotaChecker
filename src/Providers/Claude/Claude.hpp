@@ -58,9 +58,16 @@ namespace Claude {
         UsageCredits credits;
         UsageTelemetry::AccessStatus access;
         UsageTelemetry::ContextUsage context;
+        UsageTelemetry::RunUsage run;
+    };
+
+    struct LocalTelemetry {
+        UsageTelemetry::ContextUsage context;
+        UsageTelemetry::RunUsage run;
     };
 
     Snapshot FetchSnapshot(AccountSource source);
+    LocalTelemetry ReadLocalTelemetry();
     UsageTelemetry::ContextUsage ReadLocalContextUsage();
 
 }

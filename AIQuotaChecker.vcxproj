@@ -170,6 +170,7 @@
     <ClInclude Include="src\Resources\targetver.h" />
     <ClInclude Include="src\Text\Text.hpp" />
     <ClInclude Include="src\Win32\NotifyGUI.hpp" />
+    <ClInclude Include="src\Win32\notepad_logger.hpp" />
     <ClInclude Include="src\Window\Window.hpp" />
     <ClInclude Include="src\Providers\Codex\Codex.hpp" />
     <ClInclude Include="src\Providers\Codex\CodexAppServer.hpp" />
@@ -204,6 +205,9 @@
     <ClCompile Include="src\ResetTime\ResetTime.cpp" />
     <ClCompile Include="src\Text\Text.cpp" />
     <ClCompile Include="src\Win32\NotifyGUI.cpp" />
+    <ClCompile Include="src\Win32\notepad_logger.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\Window\Window.cpp" />
     <ClCompile Include="src\Providers\Codex\Codex.cpp" />
     <ClCompile Include="src\Providers\Codex\CodexAppServer.cpp" />

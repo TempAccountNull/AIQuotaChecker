@@ -22,6 +22,7 @@
 #include <iomanip>
 #include <initializer_list>
 #include <utility>
+#include <unordered_map>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -1250,10 +1251,139 @@ namespace Claude {
         return text;
     }
 
+    static std::filesystem::path ClaudeDesktopSessionsRoot() {
+        // Claude Desktop 3p uses LOCALAPPDATA\\Claude-3p\\claude-code-sessions
+        // on Windows. This mirrors the path visible in the supplied unpacked
+        // ASAR and is read-only here.
+        const std::string customUserData =
+            Network::get_instance()->GetEnvText("CLAUDE_USER_DATA_DIR");
+        if (!customUserData.empty()) {
+            return std::filesystem::path(customUserData) / "claude-code-sessions";
+        }
+
+        const std::string localAppData = Network::get_instance()->GetEnvText("LOCALAPPDATA");
+        if (localAppData.empty()) {
+            return {};
+        }
+        return std::filesystem::path(localAppData) / "Claude-3p" / "claude-code-sessions";
+    }
+
+    struct ClaudeDesktopSessionHint {
+        bool valid = false;
+        std::filesystem::path path;
+        std::filesystem::file_time_type writeTime{};
+        std::string sessionId;
+        std::string cliSessionId;
+        long long lastActivityAtMs = 0;
+        long long lastFocusedAtMs = 0;
+        long long completedTurns = 0;
+    };
+
+    static ClaudeDesktopSessionHint LatestClaudeDesktopSessionHint() {
+        const std::filesystem::path root = ClaudeDesktopSessionsRoot();
+        std::error_code ec;
+        if (root.empty() || !std::filesystem::exists(root, ec) || ec) {
+            return {};
+        }
+
+        struct Candidate {
+            std::filesystem::path path;
+            std::filesystem::file_time_type writeTime{};
+        };
+        std::vector<Candidate> files;
+        std::filesystem::recursive_directory_iterator it(
+            root,
+            std::filesystem::directory_options::skip_permission_denied,
+            ec
+        );
+        const std::filesystem::recursive_directory_iterator end;
+
+        for (; it != end; it.increment(ec)) {
+            if (ec) {
+                ec.clear();
+                continue;
+            }
+            const auto& entry = *it;
+            if (!entry.is_regular_file(ec) || ec || entry.path().extension() != ".json") {
+                ec.clear();
+                continue;
+            }
+            const std::string filename = ToLowerAscii(entry.path().filename().string());
+            if (filename.rfind("local_", 0) != 0) {
+                continue;
+            }
+            const auto writeTime = entry.last_write_time(ec);
+            if (ec) {
+                ec.clear();
+                continue;
+            }
+            files.push_back({ entry.path(), writeTime });
+        }
+
+        std::sort(files.begin(), files.end(), [](const Candidate& a, const Candidate& b) {
+            return a.writeTime > b.writeTime;
+        });
+        if (files.size() > 64) {
+            files.resize(64);
+        }
+
+        ClaudeDesktopSessionHint best;
+        for (const Candidate& file : files) {
+            const std::string raw = ReadClaudeTailSharedReadOnly(file.path, 10ULL * 1024ULL * 1024ULL);
+            if (raw.empty()) {
+                continue;
+            }
+
+            json value = json::parse(raw, nullptr, false);
+            if (value.is_discarded() || !value.is_object() || value.value("isArchived", false)) {
+                continue;
+            }
+
+            ClaudeDesktopSessionHint hint;
+            hint.valid = true;
+            hint.path = file.path;
+            hint.writeTime = file.writeTime;
+            hint.sessionId = value.value("sessionId", std::string{});
+            hint.cliSessionId = value.value("cliSessionId", std::string{});
+            hint.lastActivityAtMs = static_cast<long long>(std::max(
+                0.0,
+                ClaudeNumberAny(value, { "lastActivityAt" }).value_or(0.0)
+            ));
+            hint.lastFocusedAtMs = static_cast<long long>(std::max(
+                0.0,
+                ClaudeNumberAny(value, { "lastFocusedAt" }).value_or(0.0)
+            ));
+            hint.completedTurns = static_cast<long long>(std::max(
+                0.0,
+                ClaudeNumberAny(value, { "completedTurns" }).value_or(0.0)
+            ));
+
+            const auto score = [](const ClaudeDesktopSessionHint& h) {
+                return std::max(h.lastFocusedAtMs, h.lastActivityAtMs);
+            };
+            if (!best.valid || score(hint) > score(best) ||
+                (score(hint) == score(best) && hint.writeTime > best.writeTime)) {
+                best = std::move(hint);
+            }
+        }
+
+        return best;
+    }
+
     struct ClaudeSessionCandidate {
         std::filesystem::path path;
         std::filesystem::file_time_type writeTime{};
     };
+
+    static bool IsClaudeBackgroundSessionPath(const std::filesystem::path& path) {
+        for (const auto& component : path) {
+            if (ToLowerAscii(component.string()) == "subagents") {
+                return true;
+            }
+        }
+
+        return ToLowerAscii(path.filename().string()).rfind("agent-", 0) == 0;
+    }
 
     static std::vector<ClaudeSessionCandidate> LatestClaudeSessionFiles() {
         const std::filesystem::path projects = ClaudeProjectsPath();
@@ -1281,6 +1411,12 @@ namespace Claude {
 
             if (!entry.is_regular_file(ec) || ec || entry.path().extension() != ".jsonl") {
                 ec.clear();
+                continue;
+            }
+
+            // Task/subagent transcripts have independent context windows and
+            // must never replace the visible foreground conversation meter.
+            if (IsClaudeBackgroundSessionPath(entry.path())) {
                 continue;
             }
 
@@ -1457,9 +1593,141 @@ namespace Claude {
         return input + cacheCreate + cacheRead;
     }
 
+    static long long ClaudeOutputTokensFromUsage(const json& usage) {
+        if (!usage.is_object()) {
+            return 0;
+        }
+
+        const auto direct = ClaudeNumberAny(usage, { "output_tokens", "outputTokens" });
+        if (direct) {
+            return static_cast<long long>(std::max(0.0, *direct));
+        }
+
+        // Some Claude SDK snapshots expose usage first through iterations.
+        // Use the newest iteration as a fallback so AQC picks up the first
+        // persisted token count as early as the transcript allows.
+        if (usage.contains("iterations") && usage.at("iterations").is_array()) {
+            const json& iterations = usage.at("iterations");
+            for (auto it = iterations.rbegin(); it != iterations.rend(); ++it) {
+                if (!it->is_object()) {
+                    continue;
+                }
+                const auto value = ClaudeNumberAny(*it, { "output_tokens", "outputTokens" });
+                if (value) {
+                    return static_cast<long long>(std::max(0.0, *value));
+                }
+            }
+        }
+
+        return 0;
+    }
+
+    static long long ClaudeCacheCreationTokensFromUsage(const json& usage) {
+        if (!usage.is_object()) {
+            return 0;
+        }
+
+        const auto direct = ClaudeNumberAny(usage, {
+            "cache_creation_input_tokens", "cacheCreationInputTokens"
+        });
+        if (direct) {
+            return static_cast<long long>(std::max(0.0, *direct));
+        }
+
+        return 0;
+    }
+
+    static long long ClaudeCacheReadTokensFromUsage(const json& usage) {
+        if (!usage.is_object()) {
+            return 0;
+        }
+
+        const auto direct = ClaudeNumberAny(usage, {
+            "cache_read_input_tokens", "cacheReadInputTokens"
+        });
+        if (direct) {
+            return static_cast<long long>(std::max(0.0, *direct));
+        }
+
+        return 0;
+    }
+
+    static long long ClaudeRawInputTokensFromUsage(const json& usage) {
+        if (!usage.is_object()) {
+            return 0;
+        }
+
+        const auto direct = ClaudeNumberAny(usage, { "input_tokens", "inputTokens" });
+        if (direct) {
+            return static_cast<long long>(std::max(0.0, *direct));
+        }
+
+        if (usage.contains("iterations") && usage.at("iterations").is_array()) {
+            const json& iterations = usage.at("iterations");
+            for (auto it = iterations.rbegin(); it != iterations.rend(); ++it) {
+                if (!it->is_object()) {
+                    continue;
+                }
+                const auto value = ClaudeNumberAny(*it, { "input_tokens", "inputTokens" });
+                if (value) {
+                    return static_cast<long long>(std::max(0.0, *value));
+                }
+            }
+        }
+
+        return 0;
+    }
+
+    static long long ClaudeUsedTokensFromRecordLine(const std::string& line) {
+        std::optional<json> contextWindow = ExtractClaudeMetadataObject(
+            line,
+            "context_window"
+        );
+        if (!contextWindow) {
+            contextWindow = ExtractClaudeMetadataObject(line, "contextWindow");
+        }
+
+        if (contextWindow) {
+            const json* current = FindClaudeObjectRecursive(
+                *contextWindow,
+                { "current_usage", "currentUsage" }
+            );
+            if (current) {
+                const long long currentTokens = ClaudeInputTokensFromUsage(*current);
+                if (currentTokens > 0) {
+                    return currentTokens;
+                }
+            }
+
+            const auto total = ClaudeNumberAny(
+                *contextWindow,
+                { "total_input_tokens", "totalInputTokens" }
+            );
+            if (total && *total > 0.0) {
+                return static_cast<long long>(*total);
+            }
+        }
+
+        const bool assistantRecord =
+            line.find("\"type\":\"assistant\"") != std::string::npos ||
+            line.find("\"type\": \"assistant\"") != std::string::npos;
+        if (assistantRecord) {
+            if (auto usage = ExtractClaudeMetadataObject(line, "usage")) {
+                return ClaudeInputTokensFromUsage(*usage);
+            }
+        }
+
+        return 0;
+    }
+
     static bool LooksLikeClaudeAssistantRecord(const std::string& line) {
         return line.find("\"type\":\"assistant\"") != std::string::npos ||
             line.find("\"type\": \"assistant\"") != std::string::npos;
+    }
+
+    static bool LooksLikeClaudeSidechainRecord(const std::string& line) {
+        return line.find("\"isSidechain\":true") != std::string::npos ||
+            line.find("\"isSidechain\": true") != std::string::npos;
     }
 
     static std::string ExtractClaudeMetadataString(
@@ -1543,11 +1811,90 @@ namespace Claude {
         return 0;
     }
 
+    static bool ClaudeEnvTruthy(const std::string& value) {
+        const std::string lower = ToLowerAscii(value);
+        return lower == "1" || lower == "true" || lower == "yes" || lower == "on";
+    }
+
+    static UsageTelemetry::ContextUsage ApplyClaudeAutoCompactTelemetry(
+        UsageTelemetry::ContextUsage context
+    ) {
+        if (!context.valid || context.usedTokens < 0 || context.contextWindowTokens <= 0) {
+            return context;
+        }
+
+        // Respect explicit process-level disable switches. AIQuotaChecker never
+        // changes Claude settings; it only reads the environment it inherited.
+        if (ClaudeEnvTruthy(Network::get_instance()->GetEnvText("DISABLE_AUTO_COMPACT"))) {
+            return context;
+        }
+
+        long long compactWindow = context.contextWindowTokens;
+        const std::string configuredWindow =
+            Network::get_instance()->GetEnvText("CLAUDE_CODE_AUTO_COMPACT_WINDOW");
+
+        if (!configuredWindow.empty()) {
+            char* end = nullptr;
+            const long long parsed = std::strtoll(configuredWindow.c_str(), &end, 10);
+            if (end != configuredWindow.c_str() && parsed > 0) {
+                compactWindow = (std::min)(compactWindow, parsed);
+            }
+        }
+
+        // Claude Code reserves up to 20k output tokens for the compaction
+        // summary, then keeps a 13k safety buffer before auto-compaction.
+        // With the baseline algorithm this is 167k for a 200k context; Claude
+        // may lower the effective trigger through its own runtime feature flags.
+        constexpr long long kSummaryOutputReserve = 20000;
+        constexpr long long kAutoCompactBuffer = 13000;
+        const long long effectiveWindow = compactWindow -
+            (std::min)(compactWindow, kSummaryOutputReserve);
+
+        if (effectiveWindow <= kAutoCompactBuffer) {
+            return context;
+        }
+
+        long long threshold = effectiveWindow - kAutoCompactBuffer;
+        const std::string overrideText =
+            Network::get_instance()->GetEnvText("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE");
+
+        if (!overrideText.empty()) {
+            char* end = nullptr;
+            const double percentage = std::strtod(overrideText.c_str(), &end);
+            if (end != overrideText.c_str() && percentage > 0.0 && percentage <= 100.0) {
+                const long long overrideThreshold = static_cast<long long>(
+                    std::floor(static_cast<double>(compactWindow) * percentage / 100.0)
+                );
+                if (overrideThreshold > 0) {
+                    threshold = (std::min)(threshold, overrideThreshold);
+                }
+            }
+        }
+
+        if (threshold <= 0) {
+            return context;
+        }
+
+        const double percentLeft =
+            (static_cast<double>(threshold - context.usedTokens) /
+                static_cast<double>(threshold)) * 100.0;
+
+        context.autoCompactPercentValid = true;
+        context.autoCompactPercentLeft = static_cast<int>(std::clamp(
+            std::llround(percentLeft),
+            0LL,
+            100LL
+        ));
+        context.autoCompactThresholdTokens = threshold;
+        return context;
+    }
+
     static bool ClaudeCompactionStateFromLine(
         const std::string& line,
         bool& state
     ) {
-        if (ToLowerAscii(line).find("compact") == std::string::npos) {
+        const std::string lower = ToLowerAscii(line);
+        if (lower.find("compact") == std::string::npos) {
             return false;
         }
 
@@ -1562,29 +1909,43 @@ namespace Claude {
             combined.find("compaction_completed") != std::string::npos ||
             combined.find("compact_completed") != std::string::npos ||
             combined.find("context_compacted") != std::string::npos ||
+            lower.find("<local-command-stdout>compacted") != std::string::npos ||
+            lower.find("conversation compacted") != std::string::npos ||
             ((combined.find("compact") != std::string::npos) &&
                 (status == "completed" || status == "complete" || status == "done" ||
                     phase == "completed" || phase == "complete" || phase == "done")) ||
-            (line.find("\"completed\":true") != std::string::npos) ||
-            (line.find("\"completed\": true") != std::string::npos);
+            lower.find("\"completed\":true") != std::string::npos ||
+            lower.find("\"completed\": true") != std::string::npos;
 
         if (completed) {
             state = false;
             return true;
         }
 
-        const bool running =
+        // Manual /compact is persisted as a local command before the eventual
+        // compact_boundary. Recognize that command so the UI can show the
+        // transient state while Claude is actually generating the summary.
+        const bool manualCommand =
+            lower.find("<command-name>/compact</command-name>") != std::string::npos ||
+            lower.find("<command-message>compact</command-message>") != std::string::npos ||
+            ((type == "user" || type == "system") && subtype == "local_command" &&
+                (lower.find("/compact") != std::string::npos ||
+                    lower.find("command\":\"compact") != std::string::npos));
+
+        const bool running = manualCommand ||
             combined.find("compaction_started") != std::string::npos ||
             combined.find("compact_started") != std::string::npos ||
             combined.find("context_compaction") != std::string::npos ||
             combined.find("auto_compact") != std::string::npos ||
             combined.find("autocompact") != std::string::npos ||
+            combined.find("pre_compact") != std::string::npos ||
+            combined.find("precompact") != std::string::npos ||
             combined.find("compacting") != std::string::npos ||
             ((combined.find("compact") != std::string::npos) &&
                 (status == "running" || status == "started" || status == "in_progress" ||
                     phase == "running" || phase == "started" || phase == "in_progress")) ||
-            (line.find("\"completed\":false") != std::string::npos) ||
-            (line.find("\"completed\": false") != std::string::npos);
+            lower.find("\"completed\":false") != std::string::npos ||
+            lower.find("\"completed\": false") != std::string::npos;
 
         if (running) {
             state = true;
@@ -1594,17 +1955,370 @@ namespace Claude {
         return false;
     }
 
-    static UsageTelemetry::ContextUsage ReadClaudeContextFromSession(
+    static bool IsClaudeCompactBoundaryLine(const std::string& line) {
+        if (line.find("compact_boundary") == std::string::npos) {
+            return false;
+        }
+
+        return ToLowerAscii(ExtractClaudeMetadataString(line, "type")) == "system" &&
+            ToLowerAscii(ExtractClaudeMetadataString(line, "subtype")) == "compact_boundary";
+    }
+
+    static bool ClaudeJsonBool(const json& object, const char* key) {
+        return object.is_object() && object.contains(key) &&
+            object.at(key).is_boolean() && object.at(key).get<bool>();
+    }
+
+    static bool ClaudeUserRecordStartsRun(const json& record) {
+        if (!record.is_object() || record.value("type", std::string{}) != "user" ||
+            ClaudeJsonBool(record, "isSidechain") || ClaudeJsonBool(record, "isSynthetic") ||
+            ClaudeJsonBool(record, "isMeta") || ClaudeJsonBool(record, "isCompactSummary") ||
+            ClaudeJsonBool(record, "isVisibleInTranscriptOnly")) {
+            return false;
+        }
+
+        if (!record.contains("message") || !record.at("message").is_object()) {
+            return false;
+        }
+
+        const json& message = record.at("message");
+        if (!message.contains("content")) {
+            return true;
+        }
+
+        const json& content = message.at("content");
+        if (!content.is_array()) {
+            return true;
+        }
+
+        bool hasToolResult = false;
+        bool hasUserContent = false;
+
+        for (const json& block : content) {
+            if (!block.is_object()) {
+                continue;
+            }
+
+            const std::string type = block.value("type", std::string{});
+            if (type == "tool_result") {
+                hasToolResult = true;
+            }
+            else if (type == "text" || type == "image" || type == "document") {
+                hasUserContent = true;
+            }
+        }
+
+        // Tool-result records are emitted as role=user while a turn is already
+        // running. They must not reset the start time of the current run.
+        return !hasToolResult || hasUserContent;
+    }
+
+    static UsageTelemetry::RunUsage ReadClaudeRunFromLines(
+        const std::vector<std::string>& lines
+    ) {
+        UsageTelemetry::RunUsage run;
+        size_t runStart = std::string::npos;
+
+        // Claude Desktop does not consistently persist a top-level "result"
+        // record. In the captured Desktop transcripts an idle/finished turn is
+        // instead terminated by an assistant message whose stop_reason is
+        // "end_turn". Check for that marker while walking backwards, otherwise
+        // the last user prompt remains "running" forever after Claude is idle.
+        for (size_t i = lines.size(); i-- > 0;) {
+            const std::string& line = lines[i];
+
+            if (LooksLikeClaudeSidechainRecord(line)) {
+                continue;
+            }
+
+            const bool mayBeUser = line.find("\"type\":\"user\"") != std::string::npos ||
+                line.find("\"type\": \"user\"") != std::string::npos;
+            const bool mayBeResult = line.find("\"type\":\"result\"") != std::string::npos ||
+                line.find("\"type\": \"result\"") != std::string::npos;
+            const bool mayBeAssistant =
+                line.find("\"type\":\"assistant\"") != std::string::npos ||
+                line.find("\"type\": \"assistant\"") != std::string::npos;
+
+            if (!mayBeUser && !mayBeResult && !mayBeAssistant) {
+                continue;
+            }
+
+            json record = json::parse(line, nullptr, false);
+            if (record.is_discarded() || !record.is_object()) {
+                continue;
+            }
+
+            const std::string type = record.value("type", std::string{});
+            if (type == "result") {
+                return run;
+            }
+
+            if (type == "assistant" && record.contains("message") &&
+                record.at("message").is_object()) {
+                const json& message = record.at("message");
+                if (message.value("stop_reason", std::string{}) == "end_turn") {
+                    return run;
+                }
+            }
+
+            if (type == "user" && ClaudeUserRecordStartsRun(record)) {
+                runStart = i;
+                run.valid = true;
+                run.running = true;
+                // Claude starts the visible thinking timer as soon as the user
+                // submits the turn, before the first assistant usage snapshot
+                // is persisted. Treat that pre-snapshot interval as THINKING.
+                run.thinking = true;
+
+                if (record.contains("timestamp")) {
+                    run.startedAtUnixSeconds = TimePointToUnixSeconds(
+                        ParseTimeFlexible(record.at("timestamp"))
+                    );
+                    run.thinkingStartedAtUnixSeconds = run.startedAtUnixSeconds;
+                }
+                break;
+            }
+        }
+
+        if (runStart == std::string::npos) {
+            return run;
+        }
+
+        // Claude appends repeated snapshots for the same API message while it
+        // is being generated. Track the latest output count per message ID:
+        // currentTokens mirrors Claude Desktop's live "x.xk tokens", while
+        // tokens is the cumulative generated-token total for the whole turn.
+        std::unordered_map<std::string, long long> apiMessageOutputTokens;
+
+        auto recordTimestamp = [](const json& record) -> long long {
+            if (!record.contains("timestamp")) {
+                return 0;
+            }
+            return TimePointToUnixSeconds(ParseTimeFlexible(record.at("timestamp")));
+        };
+
+        auto beginThinking = [&](long long at) {
+            if (!run.thinking) {
+                run.thinking = true;
+                run.thinkingStartedAtUnixSeconds = at > 0 ? at : run.startedAtUnixSeconds;
+            }
+            else if (run.thinkingStartedAtUnixSeconds <= 0) {
+                run.thinkingStartedAtUnixSeconds = at > 0 ? at : run.startedAtUnixSeconds;
+            }
+        };
+
+        auto finishThinking = [&](long long at) {
+            if (run.thinking && run.thinkingStartedAtUnixSeconds > 0 &&
+                at >= run.thinkingStartedAtUnixSeconds) {
+                // The first thought begins at the user prompt. Later thoughts
+                // begin when a tool_result hands control back to the model, so
+                // measure each reasoning cycle from its own start instead of
+                // accidentally reusing the whole-turn timer.
+                run.lastThoughtDurationSeconds = at - run.thinkingStartedAtUnixSeconds;
+                run.lastThoughtCompletedAtUnixSeconds = at;
+            }
+            run.thinking = false;
+        };
+
+        for (size_t i = runStart + 1; i < lines.size(); ++i) {
+            const std::string& line = lines[i];
+            if (LooksLikeClaudeSidechainRecord(line)) {
+                continue;
+            }
+
+            const bool mayAffectRun =
+                line.find("\"type\":\"assistant\"") != std::string::npos ||
+                line.find("\"type\": \"assistant\"") != std::string::npos ||
+                line.find("\"type\":\"tool_progress\"") != std::string::npos ||
+                line.find("\"type\": \"tool_progress\"") != std::string::npos ||
+                line.find("\"type\":\"tool_use_summary\"") != std::string::npos ||
+                line.find("\"type\": \"tool_use_summary\"") != std::string::npos ||
+                line.find("\"type\":\"stream_event\"") != std::string::npos ||
+                line.find("\"type\": \"stream_event\"") != std::string::npos ||
+                line.find("\"type\":\"user\"") != std::string::npos ||
+                line.find("\"type\": \"user\"") != std::string::npos;
+
+            if (!mayAffectRun) {
+                continue;
+            }
+
+            json record = json::parse(line, nullptr, false);
+            if (record.is_discarded() || !record.is_object()) {
+                continue;
+            }
+
+            const std::string type = record.value("type", std::string{});
+
+            if (type == "stream_event") {
+                // Claude Desktop enables partial SDK messages. When those raw
+                // stream events are present in the transcript they provide the
+                // closest passive equivalent to Desktop's live thinking state.
+                // Fall back to completed assistant content below when a build
+                // does not persist partial events.
+                if (record.contains("event") && record.at("event").is_object()) {
+                    const json& event = record.at("event");
+                    const std::string eventType = event.value("type", std::string{});
+
+                    if (eventType == "content_block_delta" &&
+                        event.contains("delta") && event.at("delta").is_object()) {
+                        const std::string deltaType =
+                            event.at("delta").value("type", std::string{});
+
+                        const long long at = recordTimestamp(record);
+                        if (deltaType == "thinking_delta") {
+                            beginThinking(at);
+                        }
+                        else if (deltaType == "text_delta" ||
+                            deltaType == "input_json_delta") {
+                            finishThinking(at);
+                        }
+                    }
+                    else if (eventType == "content_block_start" &&
+                        event.contains("content_block") &&
+                        event.at("content_block").is_object()) {
+                        const std::string blockType =
+                            event.at("content_block").value("type", std::string{});
+                        const long long at = recordTimestamp(record);
+                        if (blockType == "thinking" || blockType == "redacted_thinking") {
+                            beginThinking(at);
+                        }
+                        else if (blockType == "text" || blockType == "tool_use") {
+                            finishThinking(at);
+                        }
+                    }
+                    else if (eventType == "message_stop") {
+                        finishThinking(recordTimestamp(record));
+                    }
+                }
+                continue;
+            }
+
+            if (type == "tool_progress" || type == "tool_use_summary") {
+                finishThinking(recordTimestamp(record));
+                continue;
+            }
+
+            if (type == "user") {
+                // Tool-result records mark the hand-off into Claude's next
+                // model cycle. They are the earliest persisted signal that the
+                // THOUGHT FOR state should flip back to THINKING.
+                const json* message = record.contains("message") && record.at("message").is_object()
+                    ? &record.at("message")
+                    : nullptr;
+
+                if (message && message->contains("content") && message->at("content").is_array()) {
+                    for (const json& block : message->at("content")) {
+                        if (block.is_object() && block.value("type", std::string{}) == "tool_result") {
+                            // Once the tool result is appended Claude immediately
+                            // starts the next model cycle. Current-message token
+                            // stats belong to the API message that just ended, so
+                            // clear them until Claude persists the next usage
+                            // snapshot. The cumulative turn total is retained.
+                            run.tokenStatsValid = false;
+                            run.currentTokens = 0;
+                            run.inputTokens = 0;
+                            run.rawInputTokens = 0;
+                            run.cacheCreationInputTokens = 0;
+                            run.cacheReadInputTokens = 0;
+                            beginThinking(recordTimestamp(record));
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if (type != "assistant" || !record.contains("message") ||
+                !record.at("message").is_object()) {
+                continue;
+            }
+
+            const json& message = record.at("message");
+            const std::string messageId = message.value("id", std::string{});
+
+            if (message.contains("usage") && message.at("usage").is_object()) {
+                const std::string dedupeId = messageId.empty()
+                    ? record.value("uuid", std::string{})
+                    : messageId;
+                const json& usage = message.at("usage");
+                const long long output = ClaudeOutputTokensFromUsage(usage);
+
+                run.tokenStatsValid = true;
+                run.currentTokens = output;
+                run.inputTokens = ClaudeInputTokensFromUsage(usage);
+                run.rawInputTokens = ClaudeRawInputTokensFromUsage(usage);
+                run.cacheCreationInputTokens = ClaudeCacheCreationTokensFromUsage(usage);
+                run.cacheReadInputTokens = ClaudeCacheReadTokensFromUsage(usage);
+
+                if (dedupeId.empty()) {
+                    // No stable ID means this record cannot be correlated with
+                    // later snapshots. These are rare; count the visible output
+                    // once rather than mixing input/cache tokens into the total.
+                    run.tokens += output;
+                }
+                else {
+                    long long& previous = apiMessageOutputTokens[dedupeId];
+                    if (output > previous) {
+                        run.tokens += output - previous;
+                        previous = output;
+                    }
+                }
+            }
+
+            bool sawActivityBlock = false;
+            bool latestBlockThinking = run.thinking;
+
+            if (message.contains("content") && message.at("content").is_array()) {
+                for (const json& block : message.at("content")) {
+                    if (!block.is_object()) {
+                        continue;
+                    }
+
+                    const std::string blockType = block.value("type", std::string{});
+                    if (blockType == "thinking" || blockType == "redacted_thinking") {
+                        sawActivityBlock = true;
+                        latestBlockThinking = true;
+                    }
+                    else if (blockType == "text" || blockType == "tool_use") {
+                        sawActivityBlock = true;
+                        latestBlockThinking = false;
+                    }
+                }
+            }
+
+            if (sawActivityBlock) {
+                const long long at = recordTimestamp(record);
+                if (latestBlockThinking) {
+                    beginThinking(at);
+                }
+                else {
+                    finishThinking(at);
+                }
+            }
+
+            // Do not force thinking=false merely because stop_reason is
+            // "tool_use". Claude persists that value on the same assistant
+            // snapshots that contain a thinking block. The following text/tool
+            // record is the reliable transition out of the thought. end_turn
+            // is handled by the reverse scan above.
+
+        }
+
+        return run;
+    }
+
+    static LocalTelemetry ReadClaudeLocalTelemetryFromSession(
         const std::filesystem::path& session
     ) {
-        UsageTelemetry::ContextUsage context;
+        LocalTelemetry local;
+        UsageTelemetry::ContextUsage& context = local.context;
         const std::string text = ReadClaudeTailSharedReadOnly(
             session,
             8ULL * 1024ULL * 1024ULL
         );
 
         if (text.empty()) {
-            return context;
+            return local;
         }
 
         std::vector<std::string> lines;
@@ -1617,44 +2331,130 @@ namespace Claude {
             }
         }
 
+        local.run = ReadClaudeRunFromLines(lines);
+
         long long usedTokens = 0;
         long long contextWindowTokens = 0;
         std::string model;
         bool modelWindowFallback = false;
         bool compacting = false;
+        size_t lastCompactBoundary = std::string::npos;
 
-        // Session metadata is processed in file order so a completed boundary
-        // or a newer assistant usage record switches the transient state back.
-        for (const std::string& candidate : lines) {
-            bool stateChanged = ClaudeCompactionStateFromLine(candidate, compacting);
+        // Process compaction metadata in file order. Most importantly, remember
+        // the last real compact_boundary so context usage before that boundary
+        // can never win the reverse scan after compaction completes.
+        for (size_t i = 0; i < lines.size(); ++i) {
+            const std::string& candidate = lines[i];
+            if (LooksLikeClaudeSidechainRecord(candidate)) {
+                continue;
+            }
 
-            if (!stateChanged && compacting && LooksLikeClaudeAssistantRecord(candidate) &&
-                candidate.find("\"usage\"") != std::string::npos) {
-                compacting = false;
+            ClaudeCompactionStateFromLine(candidate, compacting);
+
+            if (IsClaudeCompactBoundaryLine(candidate)) {
+                lastCompactBoundary = i;
+                context.compactionEventId = ExtractClaudeMetadataString(candidate, "uuid");
+
+                const std::string timestamp = ExtractClaudeMetadataString(candidate, "timestamp");
+                if (context.compactionEventId.empty() && !timestamp.empty()) {
+                    context.compactionEventId = timestamp;
+                }
+                if (!timestamp.empty()) {
+                    context.compactionCompletedAtUnixSeconds = TimePointToUnixSeconds(
+                        ParseTimeFlexible(json(timestamp))
+                    );
+                }
+
+                std::optional<json> metadata = ExtractClaudeMetadataObject(
+                    candidate,
+                    "compactMetadata"
+                );
+
+                if (!metadata) {
+                    metadata = ExtractClaudeMetadataObject(candidate, "compact_metadata");
+                }
+
+                if (metadata) {
+                    const auto pre = FindClaudeNumberRecursive(
+                        *metadata,
+                        { "preTokens", "pre_tokens" }
+                    );
+                    if (pre && *pre > 0.0) {
+                        context.compactionPreTokens = static_cast<long long>(*pre);
+                    }
+
+                    const auto post = FindClaudeNumberRecursive(
+                        *metadata,
+                        { "postTokens", "post_tokens" }
+                    );
+
+                    const auto saved = FindClaudeNumberRecursive(
+                        *metadata,
+                        { "savedTokens", "saved_tokens" }
+                    );
+                    if (saved && *saved > 0.0) {
+                        context.compactionSavedTokens = static_cast<long long>(*saved);
+                    }
+                    else if (pre && post && *pre > *post && *post >= 0.0) {
+                        // Current Claude Desktop compact_boundary records persist
+                        // both preTokens and postTokens. Prefer that exact pair
+                        // over subtracting a later context sample after work has
+                        // already resumed.
+                        context.compactionSavedTokens =
+                            static_cast<long long>(*pre - *post);
+                    }
+                }
             }
         }
 
         context.compacting = compacting;
+        const size_t scanBegin = lastCompactBoundary == std::string::npos
+            ? 0
+            : lastCompactBoundary + 1;
 
-        for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
+        // compactMetadata in current Desktop builds exposes preserved-segment
+        // information but does not guarantee a saved-token scalar. Capture the
+        // last real context count before the boundary so saved tokens can be
+        // calculated as pre - post when the new usage record arrives.
+        if (lastCompactBoundary != std::string::npos &&
+            context.compactionPreTokens <= 0) {
+            for (size_t i = lastCompactBoundary; i-- > 0;) {
+                const std::string& candidate = lines[i];
+                if (LooksLikeClaudeSidechainRecord(candidate)) {
+                    continue;
+                }
+                const long long previousUsed = ClaudeUsedTokensFromRecordLine(candidate);
+                if (previousUsed > 0) {
+                    context.compactionPreTokens = previousUsed;
+                    break;
+                }
+            }
+        }
+
+        // Claude Desktop's own transcript reader drops pre-boundary messages
+        // after a compact_boundary. Do the same for the live context meter so a
+        // 157k pre-compaction usage record cannot remain visible while Claude's
+        // UI has already fallen back to the new compacted context.
+        for (size_t i = lines.size(); i-- > scanBegin;) {
+            const std::string& candidate = lines[i];
             const bool relevant =
-                it->find("\"usage\"") != std::string::npos ||
-                it->find("context_window") != std::string::npos ||
-                it->find("contextWindow") != std::string::npos ||
-                it->find("modelUsage") != std::string::npos ||
-                it->find("\"model\"") != std::string::npos;
+                candidate.find("\"usage\"") != std::string::npos ||
+                candidate.find("context_window") != std::string::npos ||
+                candidate.find("contextWindow") != std::string::npos ||
+                candidate.find("modelUsage") != std::string::npos ||
+                candidate.find("\"model\"") != std::string::npos;
 
-            if (!relevant) {
+            if (!relevant || LooksLikeClaudeSidechainRecord(candidate)) {
                 continue;
             }
 
             std::optional<json> contextWindow = ExtractClaudeMetadataObject(
-                *it,
+                candidate,
                 "context_window"
             );
 
             if (!contextWindow) {
-                contextWindow = ExtractClaudeMetadataObject(*it, "contextWindow");
+                contextWindow = ExtractClaudeMetadataObject(candidate, "contextWindow");
             }
 
             if (contextWindow) {
@@ -1692,18 +2492,16 @@ namespace Claude {
                 }
             }
 
-            if (usedTokens <= 0 && LooksLikeClaudeAssistantRecord(*it)) {
-                if (auto usage = ExtractClaudeMetadataObject(*it, "usage")) {
-                    usedTokens = ClaudeInputTokensFromUsage(*usage);
-                }
+            if (usedTokens <= 0) {
+                usedTokens = ClaudeUsedTokensFromRecordLine(candidate);
             }
 
             if (model.empty()) {
-                model = ExtractClaudeMetadataString(*it, "model");
+                model = ExtractClaudeMetadataString(candidate, "model");
             }
 
             if (contextWindowTokens <= 0) {
-                if (auto modelUsage = ExtractClaudeMetadataObject(*it, "modelUsage")) {
+                if (auto modelUsage = ExtractClaudeMetadataObject(candidate, "modelUsage")) {
                     const auto maximum = FindClaudeNumberRecursive(
                         *modelUsage,
                         {
@@ -1719,8 +2517,49 @@ namespace Claude {
                 }
             }
 
-            if (usedTokens > 0 && contextWindowTokens > 0) {
+            if (usedTokens > 0 && contextWindowTokens > 0 && !model.empty()) {
                 break;
+            }
+        }
+
+        // The compacted segment may not repeat model/window metadata. Those are
+        // stable session properties, so they are safe to recover from earlier
+        // records; only the *used token count* is forbidden from crossing the
+        // compact boundary.
+        if (model.empty() || contextWindowTokens <= 0) {
+            for (size_t i = lines.size(); i-- > 0;) {
+                const std::string& candidate = lines[i];
+                if (LooksLikeClaudeSidechainRecord(candidate)) {
+                    continue;
+                }
+
+                if (model.empty()) {
+                    model = ExtractClaudeMetadataString(candidate, "model");
+                }
+
+                if (contextWindowTokens <= 0) {
+                    std::optional<json> contextWindow = ExtractClaudeMetadataObject(
+                        candidate,
+                        "context_window"
+                    );
+                    if (!contextWindow) {
+                        contextWindow = ExtractClaudeMetadataObject(candidate, "contextWindow");
+                    }
+
+                    if (contextWindow) {
+                        const auto maximum = ClaudeNumberAny(
+                            *contextWindow,
+                            { "context_window_size", "contextWindowSize" }
+                        );
+                        if (maximum && *maximum > 0.0) {
+                            contextWindowTokens = static_cast<long long>(*maximum);
+                        }
+                    }
+                }
+
+                if (!model.empty() && contextWindowTokens > 0) {
+                    break;
+                }
             }
         }
 
@@ -1730,40 +2569,146 @@ namespace Claude {
         }
 
         if (usedTokens <= 0 || contextWindowTokens <= 0) {
-            return context;
+            // compact_boundary means compaction has FINISHED. Do not turn it
+            // back into an in-progress state merely because the first new
+            // usage record has not been flushed yet. The provider preserves
+            // the old bar while it latches the completion notice.
+            if (lastCompactBoundary != std::string::npos) {
+                context.compacting = false;
+            }
+            return local;
+        }
+
+        if (context.compactionSavedTokens <= 0 &&
+            context.compactionPreTokens > usedTokens) {
+            context.compactionSavedTokens = context.compactionPreTokens - usedTokens;
         }
 
         context.valid = true;
+        context.compacting = compacting;
         context.usedTokens = usedTokens;
         context.contextWindowTokens = contextWindowTokens;
         context.model = model;
         context.sourceLabel = modelWindowFallback
             ? "Claude Code session usage + recognized model context limit"
             : "Claude Code session context metadata · direct read-only";
-        return context;
+        context = ApplyClaudeAutoCompactTelemetry(std::move(context));
+        return local;
     }
 
-    static UsageTelemetry::ContextUsage ReadLatestClaudeContextUsage() {
-        UsageTelemetry::ContextUsage newestTransient;
+    static LocalTelemetry ReadLatestClaudeLocalTelemetry() {
+        ClaudeDesktopSessionHint desktopHint = LatestClaudeDesktopSessionHint();
+        std::vector<ClaudeSessionCandidate> candidates = LatestClaudeSessionFiles();
 
-        for (const ClaudeSessionCandidate& candidate : LatestClaudeSessionFiles()) {
-            UsageTelemetry::ContextUsage context = ReadClaudeContextFromSession(candidate.path);
+        // The supplied Desktop ASAR persists cliSessionId in
+        // LOCALAPPDATA\\Claude-3p\\claude-code-sessions even though isRunning
+        // itself is intentionally NOT serialized. Use the ID only to pick the
+        // correct foreground transcript; never treat the session JSON as an
+        // authoritative running flag.
+        if (desktopHint.valid && !desktopHint.cliSessionId.empty()) {
+            std::stable_sort(
+                candidates.begin(),
+                candidates.end(),
+                [&](const ClaudeSessionCandidate& left, const ClaudeSessionCandidate& right) {
+                    const bool leftMatch =
+                        left.path.stem().string() == desktopHint.cliSessionId;
+                    const bool rightMatch =
+                        right.path.stem().string() == desktopHint.cliSessionId;
+                    return leftMatch && !rightMatch;
+                }
+            );
+        }
 
-            if (context.valid) {
-                return context;
+        for (const ClaudeSessionCandidate& candidate : candidates) {
+            LocalTelemetry local = ReadClaudeLocalTelemetryFromSession(candidate.path);
+
+            const bool matchesDesktopHint = desktopHint.valid &&
+                !desktopHint.cliSessionId.empty() &&
+                candidate.path.stem().string() == desktopHint.cliSessionId;
+
+            if (matchesDesktopHint && !local.run.running) {
+                const auto age = std::filesystem::file_time_type::clock::now() -
+                    desktopHint.writeTime;
+                const auto ageSeconds =
+                    std::chrono::duration_cast<std::chrono::seconds>(age).count();
+                const auto desktopLeadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    desktopHint.writeTime - candidate.writeTime
+                ).count();
+
+                // saveSession() runs immediately when Desktop enqueues a turn,
+                // while the CLI JSONL can trail that write. The persisted JSON
+                // does not contain isRunning, so use this only as a very short
+                // bridge until the transcript itself exposes the user/stream
+                // records. This is intentionally not latched for normal runs.
+                if (ageSeconds >= -2 && ageSeconds <= 8 && desktopLeadMs >= 250) {
+                    const long long now = static_cast<long long>(std::time(nullptr));
+                    local.run.valid = true;
+                    local.run.running = true;
+                    local.run.thinking = true;
+                    local.run.startedAtUnixSeconds = now - (std::max)(0LL, ageSeconds);
+                }
             }
 
-            if (context.compacting) {
-                newestTransient = context;
-                break;
+            if (matchesDesktopHint && local.context.valid &&
+                !local.context.compacting &&
+                local.context.autoCompactPercentValid &&
+                local.context.autoCompactPercentLeft <= 1) {
+                const auto clockNow = std::filesystem::file_time_type::clock::now();
+                const auto desktopAge = clockNow - desktopHint.writeTime;
+                const auto transcriptAge = clockNow - candidate.writeTime;
+                const auto desktopAgeSeconds =
+                    std::chrono::duration_cast<std::chrono::seconds>(desktopAge).count();
+                const auto transcriptAgeSeconds =
+                    std::chrono::duration_cast<std::chrono::seconds>(transcriptAge).count();
+
+                // The ASAR confirms isRunning/pendingCycle are in-memory state
+                // and are not serialized by the persisted-session writer. The
+                // transcript may also stop moving while the compaction summary
+                // is generated. The earliest passive signal we can safely use
+                // is therefore: the selected foreground conversation is at the
+                // auto-compact edge AND either its Desktop session or transcript
+                // was recently active, or the transcript already says a run is
+                // active. Once seen, the provider latches COMPACTING until the
+                // compact_boundary/new low-context value arrives.
+                const bool recentlyActive =
+                    (desktopAgeSeconds >= -2 && desktopAgeSeconds <= 60) ||
+                    (transcriptAgeSeconds >= -2 && transcriptAgeSeconds <= 60) ||
+                    local.run.running;
+
+                if (recentlyActive) {
+                    local.context.compacting = true;
+
+                    if (!local.run.running) {
+                        local.run.valid = true;
+                        local.run.running = true;
+                        local.run.thinking = false;
+                        const long long now = static_cast<long long>(std::time(nullptr));
+                        const long long hinted = desktopHint.lastActivityAtMs > 0
+                            ? desktopHint.lastActivityAtMs / 1000
+                            : 0;
+                        local.run.startedAtUnixSeconds =
+                            hinted > 0 && hinted <= now && now - hinted <= 5 * 60
+                                ? hinted
+                                : now;
+                    }
+
+                }
+            }
+
+            if (local.context.valid || local.context.compacting || local.run.running) {
+                return local;
             }
         }
 
-        return newestTransient;
+        return {};
+    }
+
+    LocalTelemetry ReadLocalTelemetry() {
+        return ReadLatestClaudeLocalTelemetry();
     }
 
     UsageTelemetry::ContextUsage ReadLocalContextUsage() {
-        return ReadLatestClaudeContextUsage();
+        return ReadLatestClaudeLocalTelemetry().context;
     }
 
     static void FinalizeClaudeAccess(Snapshot& snapshot) {
@@ -2275,7 +3220,9 @@ namespace Claude {
 
     Snapshot FetchSnapshot(AccountSource source) {
         Snapshot snapshot = FetchSnapshotForSource(source);
-        snapshot.context = ReadLatestClaudeContextUsage();
+        LocalTelemetry local = ReadLatestClaudeLocalTelemetry();
+        snapshot.context = std::move(local.context);
+        snapshot.run = std::move(local.run);
         return snapshot;
     }
 

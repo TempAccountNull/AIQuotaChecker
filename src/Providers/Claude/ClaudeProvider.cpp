@@ -5,6 +5,7 @@
 #include "Network.hpp"
 
 #include <exception>
+#include <ctime>
 #include <string>
 #include <thread>
 
@@ -96,6 +97,13 @@ void ClaudeProvider::SetAccountSource(int source)
         std::lock_guard<std::mutex> lock(m_mutex);
         m_snapshot = switching;
         m_lastSuccessfulAccountKey.clear();
+        m_compactionLatched = false;
+        m_compactionStartedAtUnixSeconds = 0;
+        m_lastActiveRunSeenAtUnixSeconds = 0;
+        m_compactionNoticeAtUnixSeconds = 0;
+        m_compactionNoticeEligible = false;
+        m_lastCompactionSavedTokens = 0;
+        m_lastCompactionEventId.clear();
     }
 }
 
@@ -152,6 +160,170 @@ void ClaudeProvider::RefreshThunk()
     ClaudeProvider::get_instance()->RefreshAsync();
 }
 
+void ClaudeProvider::ApplyLocalTelemetryLocked(
+    Claude::LocalTelemetry local,
+    Claude::Snapshot& target
+)
+{
+    const long long now = static_cast<long long>(std::time(nullptr));
+    UsageTelemetry::ContextUsage& incoming = local.context;
+
+    const bool hasBoundary = !incoming.compactionEventId.empty();
+    const bool newBoundary = hasBoundary &&
+        incoming.compactionEventId != m_lastCompactionEventId;
+
+    // AQC's parser already knows when a foreground user turn is still alive.
+    // Remember that fact independently of the most recent content block: when
+    // Claude enters auto-compaction it can stop touching the JSONL for several
+    // minutes, which otherwise makes the status fall back to AVAILABLE.
+    if (local.run.valid && local.run.running) {
+        m_lastActiveRunSeenAtUnixSeconds = now;
+    }
+
+    const bool atAutoCompactEdge = incoming.valid &&
+        incoming.autoCompactPercentValid &&
+        incoming.autoCompactPercentLeft <= 1;
+    const bool runRecentlyActive = m_lastActiveRunSeenAtUnixSeconds > 0 &&
+        now >= m_lastActiveRunSeenAtUnixSeconds &&
+        now - m_lastActiveRunSeenAtUnixSeconds <= 10 * 60;
+
+    if (!incoming.compacting && !m_compactionLatched &&
+        atAutoCompactEdge && runRecentlyActive) {
+        incoming.compacting = true;
+    }
+
+    if (incoming.compacting) {
+        if (!m_compactionLatched) {
+            // This timer is the compaction timer, not the whole user-turn timer.
+            m_compactionStartedAtUnixSeconds = now;
+        }
+        m_compactionLatched = true;
+    }
+
+    // A boundary or a fresh low-context reading normally clears the latch. If
+    // neither ever arrives (aborted/failed compaction), do not leave the app in
+    // COMPACTING forever. Ten minutes is comfortably longer than the multi-
+    // minute compactions observed in the captured Desktop transcript.
+    if (m_compactionLatched && !incoming.compacting && !newBoundary &&
+        m_compactionStartedAtUnixSeconds > 0 &&
+        now - m_compactionStartedAtUnixSeconds > 10 * 60) {
+        m_compactionLatched = false;
+        m_compactionStartedAtUnixSeconds = 0;
+    }
+
+    if (newBoundary) {
+        m_lastCompactionEventId = incoming.compactionEventId;
+        m_compactionLatched = false;
+        m_compactionStartedAtUnixSeconds = 0;
+        m_lastCompactionSavedTokens = incoming.compactionSavedTokens;
+        m_compactionNoticeAtUnixSeconds = 0;
+
+        // compact_boundary can be flushed several minutes after Claude Desktop
+        // already finished compacting. Give a delayed-but-current boundary its
+        // full UI notice when AQC first observes it, but do not resurrect an
+        // ancient compaction just because the app was started later.
+        const long long boundaryAt = incoming.compactionCompletedAtUnixSeconds;
+        m_compactionNoticeEligible = boundaryAt <= 0 ||
+            (now >= boundaryAt && now - boundaryAt <= 15 * 60);
+        if (m_compactionNoticeEligible && incoming.compactionSavedTokens > 0) {
+            m_compactionNoticeAtUnixSeconds = now;
+        }
+    }
+
+    if (hasBoundary && incoming.compactionEventId == m_lastCompactionEventId &&
+        incoming.compactionSavedTokens > 0) {
+        const bool learnedSavedAmount = m_lastCompactionSavedTokens <= 0;
+        m_lastCompactionSavedTokens = incoming.compactionSavedTokens;
+        if (learnedSavedAmount && m_compactionNoticeEligible) {
+            // Often the first post-boundary usage record is what lets us
+            // calculate pre - post. Give the user the full notice duration
+            // from the moment that exact saved amount becomes available.
+            m_compactionNoticeAtUnixSeconds = now;
+        }
+    }
+
+    // A new low-context value is independent confirmation that compaction is
+    // no longer active even if an intermediate start marker was inferred.
+    if (incoming.valid && !incoming.compacting &&
+        incoming.autoCompactPercentValid && incoming.autoCompactPercentLeft > 5) {
+        m_compactionLatched = false;
+        m_compactionStartedAtUnixSeconds = 0;
+    }
+
+    // Preserve the last exact bar across the tiny boundary -> first-post-usage
+    // gap. Never put a pre-boundary token count back into a newly valid local
+    // context, though.
+    if (incoming.valid) {
+        target.context = incoming;
+    }
+    else if (target.context.valid) {
+        target.context.compactionPreTokens = incoming.compactionPreTokens;
+        if (incoming.compactionSavedTokens > 0) {
+            target.context.compactionSavedTokens = incoming.compactionSavedTokens;
+        }
+        if (!incoming.compactionEventId.empty()) {
+            target.context.compactionEventId = incoming.compactionEventId;
+        }
+    }
+    else {
+        target.context = incoming;
+    }
+
+    target.context.compacting = m_compactionLatched;
+    target.context.compactionStartedAtUnixSeconds = m_compactionLatched
+        ? m_compactionStartedAtUnixSeconds
+        : 0;
+
+    if (!m_lastCompactionEventId.empty()) {
+        target.context.compactionEventId = m_lastCompactionEventId;
+    }
+
+    if (m_lastCompactionSavedTokens > 0 &&
+        m_compactionNoticeAtUnixSeconds > 0 &&
+        now >= m_compactionNoticeAtUnixSeconds &&
+        now - m_compactionNoticeAtUnixSeconds <= 15) {
+        target.context.compactionSavedTokens = m_lastCompactionSavedTokens;
+        target.context.compactionCompletedAtUnixSeconds =
+            m_compactionNoticeAtUnixSeconds;
+    }
+    else if (target.context.compactionEventId == m_lastCompactionEventId) {
+        // Prevent an old transcript timestamp from resurrecting the notice on
+        // every 2-second refresh after the 15-second display window expires.
+        target.context.compactionCompletedAtUnixSeconds = 0;
+    }
+
+    // During compaction Claude Desktop can stop flushing the transcript for
+    // quite a while. If the compaction signal arrived without a usable run,
+    // synthesize only the timer carrier; the visible state is COMPACTING, not
+    // THINKING. Once real run telemetry resumes it replaces this immediately.
+    if (m_compactionLatched && !(local.run.valid && local.run.running) &&
+        !(target.run.valid && target.run.running)) {
+        local.run.valid = true;
+        local.run.running = true;
+        local.run.thinking = false;
+        local.run.startedAtUnixSeconds = m_compactionStartedAtUnixSeconds > 0
+            ? m_compactionStartedAtUnixSeconds
+            : now;
+    }
+
+    // A real parsed active run is authoritative. In particular, when a
+    // tool_result starts a fresh model cycle tokenStatsValid=false is
+    // intentional. Never copy the prior API message's counters back into a
+    // real run: that was the source of the frozen/stale Current Tokens value.
+    if (local.run.valid && local.run.running) {
+        target.run = std::move(local.run);
+    }
+    else if (m_compactionLatched && target.run.valid && target.run.running) {
+        target.run.thinking = false;
+        if (target.run.startedAtUnixSeconds <= 0) {
+            target.run.startedAtUnixSeconds = m_compactionStartedAtUnixSeconds;
+        }
+    }
+    else {
+        target.run = std::move(local.run);
+    }
+}
+
 void ClaudeProvider::RefreshAsync()
 {
     if (m_loading.exchange(true)) {
@@ -200,6 +372,30 @@ void ClaudeProvider::RefreshAsync()
                         !snapshot.accountKey.empty() &&
                         self->m_lastSuccessfulAccountKey != snapshot.accountKey;
 
+                    Claude::LocalTelemetry local;
+                    local.context = std::move(snapshot.context);
+                    local.run = std::move(snapshot.run);
+
+                    // Seed the local-only telemetry with the previous exact
+                    // values. ApplyLocalTelemetryLocked will replace them when
+                    // the newest transcript data is valid and preserve them
+                    // only across the short boundary/post-usage gap.
+                    if (accountChanged) {
+                        snapshot.context = {};
+                        snapshot.run = {};
+                        self->m_compactionLatched = false;
+                        self->m_compactionStartedAtUnixSeconds = 0;
+                        self->m_lastActiveRunSeenAtUnixSeconds = 0;
+                        self->m_compactionNoticeAtUnixSeconds = 0;
+                        self->m_compactionNoticeEligible = false;
+                        self->m_lastCompactionSavedTokens = 0;
+                        self->m_lastCompactionEventId.clear();
+                    }
+                    else {
+                        snapshot.context = self->m_snapshot.context;
+                        snapshot.run = self->m_snapshot.run;
+                    }
+
                     const bool sameAccount = !snapshot.accountKey.empty() &&
                         snapshot.accountKey == self->m_lastSuccessfulAccountKey;
 
@@ -210,6 +406,8 @@ void ClaudeProvider::RefreshAsync()
                     if (sameAccount && !snapshot.credits.reported && self->m_snapshot.credits.reported) {
                         snapshot.credits = self->m_snapshot.credits;
                     }
+
+                    self->ApplyLocalTelemetryLocked(std::move(local), snapshot);
 
                     if (!snapshot.accountKey.empty()) {
                         self->m_lastSuccessfulAccountKey = snapshot.accountKey;
@@ -263,24 +461,14 @@ void ClaudeProvider::RefreshContextAsync()
         ClaudeProvider* self = ClaudeProvider::get_instance();
 
         try {
-            UsageTelemetry::ContextUsage context = Claude::ReadLocalContextUsage();
+            Claude::LocalTelemetry local = Claude::ReadLocalTelemetry();
             std::lock_guard<std::mutex> lock(*self->StateMutex());
-
-            if (context.valid) {
-                self->Snapshot()->context = std::move(context);
-            }
-            else if (context.compacting) {
-                // Keep the last exact current/max values visible during the
-                // transient compaction while changing only the heading.
-                self->Snapshot()->context.compacting = true;
-            }
-            else {
-                self->Snapshot()->context.compacting = false;
-            }
+            self->ApplyLocalTelemetryLocked(std::move(local), *self->Snapshot());
         }
         catch (...) {
-            std::lock_guard<std::mutex> lock(*self->StateMutex());
-            self->Snapshot()->context.compacting = false;
+            // Local telemetry is best-effort and read-only. A transient share/
+            // parse failure must not make COMPACTING/THINKING flash back to
+            // AVAILABLE between successful reads.
         }
 
         self->m_contextLoading = false;

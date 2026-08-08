@@ -45,6 +45,7 @@ namespace Renderer
         bool* zaiAutoRefreshEnabled = nullptr;
         bool* grokAutoRefreshEnabled = nullptr;
         int* claudeAccountSource = nullptr;
+        int* claudeThinkingShimmerSpeedPercent = nullptr;
         int* codexAccountSource = nullptr;
         std::string* codexCustomAuthPath = nullptr;
 

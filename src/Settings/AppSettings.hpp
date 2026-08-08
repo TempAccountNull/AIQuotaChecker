@@ -65,6 +65,9 @@ namespace AppSettings
         // 3 = CLAUDE_CODE_OAUTH_TOKEN only
         int claudeAccountSource = 0;
 
+        // 100 = default animation speed. Range is 25%-250%.
+        int claudeThinkingShimmerSpeedPercent = 100;
+
         // 0 = Auto (active Codex account, then default auth.json when app-server is unavailable)
         // 1 = Active Codex account only (app-server)
         // 2 = Default CODEX_HOME\auth.json only
@@ -91,6 +94,7 @@ namespace AppSettings
     int ClampAutoRefreshMinutes(int value);
     int ClampResetDisplayMode(int value);
     int ClampClaudeAccountSource(int value);
+    int ClampClaudeThinkingShimmerSpeedPercent(int value);
     int ClampCodexAccountSource(int value);
 
     void Load(Settings& settings);

@@ -333,6 +333,7 @@ namespace Renderer
 #define g_zaiAutoRefreshEnabled (*R().zaiAutoRefreshEnabled)
 #define g_grokAutoRefreshEnabled (*R().grokAutoRefreshEnabled)
 #define g_claudeAccountSource (*R().claudeAccountSource)
+#define g_claudeThinkingShimmerSpeedPercent (*R().claudeThinkingShimmerSpeedPercent)
 #define g_codexAccountSource (*R().codexAccountSource)
 #define g_codexCustomAuthPath (*R().codexCustomAuthPath)
 #define g_notifyPositionIndex (*R().notifyPositionIndex)
@@ -415,8 +416,12 @@ static void DrawProviderAccessStatus(const UsageTelemetry::AccessStatus& access)
         return;
     }
 
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f, 0.92f, 0.92f, 1.0f));
+    ImGui::TextUnformatted("Status:");
+    ImGui::PopStyleColor();
+    ImGui::SameLine(0.0f, 5.0f);
     ImGui::PushStyleColor(ImGuiCol_Text, AccessStateColor(access.state));
-    ImGui::Text("Status: %s", label);
+    ImGui::TextUnformatted(label);
     ImGui::PopStyleColor();
 
     if (!access.detail.empty()) {
@@ -1068,8 +1073,22 @@ static void DrawUnifiedUsageCard(const char* title, const std::vector<UiBar>& ba
     ImGui::TextUnformatted(title);
     ImGui::PopStyleColor();
 
-    ImGui::SetCursorPos(ImVec2(14.0f, 42.0f));
+    const bool hasValidBar = std::any_of(
+        bars.begin(),
+        bars.end(),
+        [](const UiBar& bar) { return bar.valid; }
+    );
 
+    if (!hasValidBar) {
+        // Do not move the cursor to the first row unless a row will actually
+        // submit an item. On startup an empty usage vector used to leave a raw
+        // SetCursorPos() as the final layout operation, which triggers ImGui's
+        // cursor-extent assertion in EndChild().
+        ImGui::EndChild();
+        return;
+    }
+
+    ImGui::SetCursorPos(ImVec2(14.0f, 42.0f));
     float barWidth = cardWidth - 28.0f;
 
     for (const UiBar& bar : bars) {
@@ -1602,11 +1621,252 @@ static std::string FormatCompactTokenCount(long long value)
     return out.str();
 }
 
+
+static std::string FormatRunDuration(long long seconds)
+{
+    seconds = std::max<long long>(0, seconds);
+
+    const long long hours = seconds / 3600;
+    const long long minutes = (seconds % 3600) / 60;
+    const long long remainingSeconds = seconds % 60;
+
+    std::ostringstream out;
+    if (hours > 0) {
+        out << hours << "h ";
+    }
+    if (hours > 0 || minutes > 0) {
+        out << minutes << "m ";
+    }
+    out << remainingSeconds << "s";
+    return out.str();
+}
+
+static void DrawClaudeThinkingShimmer(const char* text)
+{
+    if (!text || !*text) {
+        return;
+    }
+
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const ImVec2 size = ImGui::CalcTextSize(text);
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+
+    // Claude-style thinking label: muted gray base with a narrow white band
+    // moving across it. Draw directly so only the status word animates.
+    drawList->AddText(
+        pos,
+        ImGui::GetColorU32(ImVec4(0.60f, 0.60f, 0.60f, 1.0f)),
+        text
+    );
+
+    const float bandWidth = 13.0f;
+    const float travelWidth = size.x + bandWidth * 2.0f;
+    const int speedPercent = AppSettings::ClampClaudeThinkingShimmerSpeedPercent(
+        g_claudeThinkingShimmerSpeedPercent
+    );
+    // 60 px/s sits between the original slow sweep and the later 130 px/s
+    // version. The Claude setting scales it from 25%-250%.
+    const float pixelsPerSecond = 60.0f * (static_cast<float>(speedPercent) / 100.0f);
+    const float phase = std::fmod(
+        static_cast<float>(ImGui::GetTime()) * pixelsPerSecond,
+        travelWidth
+    );
+    const float bandCenter = pos.x - bandWidth + phase;
+
+    drawList->PushClipRect(
+        ImVec2(bandCenter - bandWidth * 0.5f, pos.y),
+        ImVec2(bandCenter + bandWidth * 0.5f, pos.y + size.y),
+        true
+    );
+    drawList->AddText(
+        pos,
+        ImGui::GetColorU32(ImVec4(0.96f, 0.96f, 0.96f, 1.0f)),
+        text
+    );
+    drawList->PopClipRect();
+
+    ImGui::Dummy(size);
+}
+
+static void DrawClaudeStatusValue(
+    const char* label,
+    bool thinking,
+    bool thoughtComplete,
+    bool compacting,
+    UsageTelemetry::AccessState accessState
+)
+{
+    if (thinking) {
+        DrawClaudeThinkingShimmer(label);
+        return;
+    }
+
+    const ImVec4 color = thoughtComplete
+        ? ImVec4(0.64f, 0.64f, 0.64f, 1.0f)
+        : (compacting
+            ? ImVec4(1.00f, 0.58f, 0.24f, 1.0f)
+            : AccessStateColor(accessState));
+
+    ImGui::PushStyleColor(ImGuiCol_Text, color);
+    ImGui::TextUnformatted(label);
+    ImGui::PopStyleColor();
+}
+
+static void DrawClaudeAccessStatus(
+    const UsageTelemetry::AccessStatus& access,
+    const UsageTelemetry::ContextUsage& context,
+    const UsageTelemetry::RunUsage& run
+)
+{
+    const bool canOverride =
+        access.state == UsageTelemetry::AccessState::Available ||
+        access.state == UsageTelemetry::AccessState::Unknown;
+    const bool compacting = canOverride && context.compacting;
+    const bool activeRun = canOverride && !compacting && run.valid && run.running;
+    const long long nowUnix = static_cast<long long>(std::time(nullptr));
+    constexpr long long kThoughtNoticeSeconds = 5;
+    const bool thoughtComplete = activeRun &&
+        run.lastThoughtDurationSeconds > 0 &&
+        run.lastThoughtCompletedAtUnixSeconds > 0 &&
+        nowUnix >= run.lastThoughtCompletedAtUnixSeconds &&
+        nowUnix - run.lastThoughtCompletedAtUnixSeconds <= kThoughtNoticeSeconds;
+    const bool thinking = activeRun && run.thinking && !thoughtComplete;
+
+    std::string stateLabel;
+    if (compacting) {
+        stateLabel = "COMPACTING";
+    }
+    else if (thoughtComplete) {
+        // Keep this visible briefly even if a tool_result has already started
+        // the next reasoning cycle. After five seconds it flips back to the
+        // live THINKING state automatically.
+        stateLabel = "THOUGHT FOR " + FormatRunDuration(run.lastThoughtDurationSeconds);
+    }
+    else if (thinking || activeRun) {
+        stateLabel = "THINKING";
+    }
+    else {
+        const char* accessLabel = AccessStateLabel(access.state);
+        stateLabel = accessLabel ? accessLabel : "";
+    }
+
+    if (stateLabel.empty()) {
+        return;
+    }
+
+    // Keep "Status:" white. Only the current state value carries state color.
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f, 0.92f, 0.92f, 1.0f));
+    ImGui::TextUnformatted("Status:");
+    ImGui::PopStyleColor();
+
+    ImGui::SameLine(0.0f, 5.0f);
+    DrawClaudeStatusValue(
+        stateLabel.c_str(),
+        thinking,
+        thoughtComplete,
+        compacting,
+        access.state
+    );
+
+    const bool transientState = compacting || activeRun;
+    if (transientState && run.valid && run.running) {
+        const long long timerStart = compacting && context.compactionStartedAtUnixSeconds > 0
+            ? context.compactionStartedAtUnixSeconds
+            : run.startedAtUnixSeconds;
+        const long long elapsed = timerStart > 0 && nowUnix >= timerStart
+            ? nowUnix - timerStart
+            : 0;
+
+        std::string telemetry = FormatRunDuration(elapsed);
+        if (run.tokenStatsValid) {
+            telemetry += " · Current Tokens: " + FormatCompactTokenCount(run.currentTokens);
+        }
+        if (run.tokens > 0) {
+            telemetry += " · Total Tokens: " + FormatCompactTokenCount(run.tokens);
+        }
+
+        // Match the right-aligned reset/usage text used by the quota rows.
+        ImGui::SameLine();
+        const float telemetryWidth = ImGui::CalcTextSize(telemetry.c_str()).x;
+        const float currentX = ImGui::GetCursorPosX();
+        const float targetX = currentX + ImGui::GetContentRegionAvail().x - telemetryWidth;
+        if (targetX > currentX) {
+            ImGui::SetCursorPosX(targetX);
+        }
+
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.70f, 0.70f, 1.0f));
+        ImGui::TextUnformatted(telemetry.c_str());
+        ImGui::PopStyleColor();
+
+        // Current Tokens above is already Claude's output_tokens, so do not
+        // duplicate it as "Out". "In" is the effective prompt input including
+        // cache reads/creation. Only render this row when real token telemetry
+        // is available so placeholder characters never appear in the UI.
+        if (run.tokenStatsValid) {
+            const std::string tokenStats =
+                "In: " + FormatCompactTokenCount(run.inputTokens) +
+                " · Cache Read: " + FormatCompactTokenCount(run.cacheReadInputTokens) +
+                " · Cache Create: " + FormatCompactTokenCount(run.cacheCreationInputTokens);
+
+            // Right-align the token breakdown to match the other detail text.
+            const float tokenStatsWidth = ImGui::CalcTextSize(tokenStats.c_str()).x;
+            const float availableWidth = ImGui::GetContentRegionAvail().x;
+            if (tokenStatsWidth < availableWidth) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + availableWidth - tokenStatsWidth);
+            }
+
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
+            ImGui::TextUnformatted(tokenStats.c_str());
+            ImGui::PopStyleColor();
+        }
+    }
+
+    if (!transientState && !access.detail.empty()) {
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
+        ImGui::TextWrapped("%s", access.detail.c_str());
+        ImGui::PopStyleColor();
+    }
+}
+
 enum class ContextMeterStyle
 {
     ClaudeBlueThin,
     CodexWhiteStandard
 };
+
+static ImU32 ClaudeContextFillColor(
+    const UsageTelemetry::ContextUsage& context,
+    float usedPercent
+) {
+    // Claude's normal context meter is blue. Enter the warning color in the
+    // same 20k pre-auto-compact band used by Claude Code, then use red only
+    // once the calculated auto-compact threshold has actually been reached.
+    // Severity always follows USED context, so the Remaining checkbox never
+    // reverses the warning color.
+    if (context.autoCompactPercentValid && context.autoCompactThresholdTokens > 0) {
+        if (context.usedTokens >= context.autoCompactThresholdTokens) {
+            return Color(235, 87, 87);
+        }
+
+        if (context.compacting ||
+            context.usedTokens >= context.autoCompactThresholdTokens - 20000) {
+            return Color(245, 190, 55);
+        }
+
+        return Color(38, 132, 255);
+    }
+
+    // Fallback for a valid context where an auto-compact threshold could not
+    // be calculated. This is visual only and never changes token values.
+    if (usedPercent >= 90.0f) {
+        return Color(235, 87, 87);
+    }
+    if (usedPercent >= 80.0f) {
+        return Color(245, 190, 55);
+    }
+    return Color(38, 132, 255);
+}
 
 static void DrawContextUsageCard(
     const UsageTelemetry::ContextUsage& context,
@@ -1617,6 +1877,7 @@ static void DrawContextUsageCard(
     const bool available = context.valid &&
         context.usedTokens >= 0 &&
         context.contextWindowTokens > 0;
+    const bool codexStyle = style == ContextMeterStyle::CodexWhiteStandard;
 
     if (!available && !showWhenUnavailable) {
         return;
@@ -1630,12 +1891,13 @@ static void DrawContextUsageCard(
         ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse
     );
 
-    ImGui::TextUnformatted(
-        context.compacting ? "Compacting conversation ..." : "Context window"
-    );
+    ImGui::TextUnformatted("Context window");
 
-    std::string usageText = context.compacting && !available ? "" : "Unavailable";
+    std::string usageText = context.compacting && !codexStyle
+        ? "Compacting Conversation..."
+        : "Unavailable";
     float displayPercent = 0.0f;
+    float usedPercent = 0.0f;
 
     if (available) {
         const long long clampedUsed = std::clamp<long long>(
@@ -1644,7 +1906,7 @@ static void DrawContextUsageCard(
             context.contextWindowTokens
         );
         const long long remainingTokens = context.contextWindowTokens - clampedUsed;
-        const float usedPercent = Math::get_instance()->ClampPercentFloat(
+        usedPercent = Math::get_instance()->ClampPercentFloat(
             static_cast<float>(
                 (static_cast<double>(clampedUsed) /
                     static_cast<double>(context.contextWindowTokens)) * 100.0
@@ -1654,10 +1916,33 @@ static void DrawContextUsageCard(
         displayPercent = g_showRemaining ? 100.0f - usedPercent : usedPercent;
         const long long displayTokens = g_showRemaining ? remainingTokens : clampedUsed;
 
-        usageText = FormatCompactTokenCount(displayTokens) + " / " +
-            FormatCompactTokenCount(context.contextWindowTokens) + " (" +
-            Format::get_instance()->Percent(displayPercent) +
-            (g_showRemaining ? " remaining)" : " used)");
+        if (context.compacting && !codexStyle) {
+            usageText = "Compacting Conversation...";
+        }
+        else {
+            const long long nowUnix = static_cast<long long>(std::time(nullptr));
+            const bool showCompactionNotice = !codexStyle &&
+                context.compactionSavedTokens > 0 &&
+                context.compactionCompletedAtUnixSeconds > 0 &&
+                nowUnix >= context.compactionCompletedAtUnixSeconds &&
+                nowUnix - context.compactionCompletedAtUnixSeconds <= 15;
+
+            if (showCompactionNotice) {
+                usageText = "Compacted Conversation · You saved " +
+                    FormatCompactTokenCount(context.compactionSavedTokens) + " tokens!";
+            }
+            else {
+                usageText = FormatCompactTokenCount(displayTokens) + " / " +
+                    FormatCompactTokenCount(context.contextWindowTokens) + " (" +
+                    Format::get_instance()->Percent(displayPercent) +
+                    (g_showRemaining ? " remaining)" : " used)");
+
+                if (!codexStyle && context.autoCompactPercentValid) {
+                    usageText += " · Auto Compact after: " +
+                        std::to_string(context.autoCompactPercentLeft) + "%";
+                }
+            }
+        }
     }
 
     if (!usageText.empty()) {
@@ -1669,23 +1954,33 @@ static void DrawContextUsageCard(
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + availableWidth - textWidth);
         }
 
-        if (!available) {
+        if (!available && !context.compacting) {
             ImGui::TextDisabled("%s", usageText.c_str());
             ImGui::EndChild();
             return;
         }
 
-        ImGui::TextUnformatted(usageText.c_str());
+        if (context.compacting && !codexStyle) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.96f, 0.75f, 0.22f, 1.0f));
+            ImGui::TextUnformatted(usageText.c_str());
+            ImGui::PopStyleColor();
+        }
+        else {
+            ImGui::TextUnformatted(usageText.c_str());
+        }
     }
     else if (!available) {
         ImGui::EndChild();
         return;
     }
 
-    const bool codexStyle = style == ContextMeterStyle::CodexWhiteStandard;
-    const ImU32 fillColor = codexStyle ? Color(235, 235, 235) : Color(38, 132, 255);
-    const float barHeight = codexStyle ? 7.0f : 3.0f;
-    DrawThinBar(displayPercent, ImGui::GetContentRegionAvail().x, fillColor, barHeight);
+    if (available) {
+        const ImU32 fillColor = codexStyle
+            ? Color(235, 235, 235)
+            : ClaudeContextFillColor(context, usedPercent);
+        const float barHeight = codexStyle ? 7.0f : 3.0f;
+        DrawThinBar(displayPercent, ImGui::GetContentRegionAvail().x, fillColor, barHeight);
+    }
 
     ImGui::EndChild();
 }
@@ -1803,7 +2098,7 @@ static void DrawClaudeTab() {
         ImGui::PopStyleColor();
     }
 
-    DrawProviderAccessStatus(snapshot.access);
+    DrawClaudeAccessStatus(snapshot.access, snapshot.context, snapshot.run);
     ImGui::Spacing();
 
     DrawContextUsageCard(
@@ -2944,6 +3239,27 @@ static void DrawClaudeSettingsCard(float width, float height)
     }
 
     DrawSettingsMutedText("This selection is saved automatically.");
+
+    ImGui::Spacing();
+    DrawSettingsSubHeader("Thinking animation");
+    int shimmerSpeed = AppSettings::ClampClaudeThinkingShimmerSpeedPercent(
+        g_claudeThinkingShimmerSpeedPercent
+    );
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::SliderInt(
+        "##claude_thinking_shimmer_speed",
+        &shimmerSpeed,
+        25,
+        250,
+        "%d%% speed"
+    )) {
+        g_claudeThinkingShimmerSpeedPercent =
+            AppSettings::ClampClaudeThinkingShimmerSpeedPercent(shimmerSpeed);
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit() && R().saveAppSettings) {
+        R().saveAppSettings();
+    }
+    DrawSettingsMutedText("Controls the white sweep through THINKING. Default: 100%.");
 
     ImGui::Spacing();
     DrawSettingsSubHeader("Auto refresh");

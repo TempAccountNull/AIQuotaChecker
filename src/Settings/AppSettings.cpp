@@ -276,6 +276,13 @@ namespace AppSettings
         return value;
     }
 
+    int ClampClaudeThinkingShimmerSpeedPercent(int value)
+    {
+        if (value < 25) return 25;
+        if (value > 250) return 250;
+        return value;
+    }
+
     int ClampCodexAccountSource(int value)
     {
         if (value < 0) return 0;
@@ -300,6 +307,14 @@ namespace AppSettings
         settings.grokAutoRefreshEnabled = ReadBool(L"AutoRefresh", L"GrokEnabled", settings.grokAutoRefreshEnabled, path);
         settings.claudeAccountSource = ClampClaudeAccountSource(
             ReadInt(L"Claude", L"AccountSource", settings.claudeAccountSource, path)
+        );
+        settings.claudeThinkingShimmerSpeedPercent = ClampClaudeThinkingShimmerSpeedPercent(
+            ReadInt(
+                L"Claude",
+                L"ThinkingShimmerSpeedPercent",
+                settings.claudeThinkingShimmerSpeedPercent,
+                path
+            )
         );
         settings.codexAccountSource = ClampCodexAccountSource(
             ReadInt(L"Codex", L"AccountSource", settings.codexAccountSource, path)
@@ -360,6 +375,12 @@ namespace AppSettings
             L"Claude",
             L"AccountSource",
             ClampClaudeAccountSource(settings.claudeAccountSource),
+            path
+        ) && ok;
+        ok = WriteInt(
+            L"Claude",
+            L"ThinkingShimmerSpeedPercent",
+            ClampClaudeThinkingShimmerSpeedPercent(settings.claudeThinkingShimmerSpeedPercent),
             path
         ) && ok;
         ok = WriteInt(

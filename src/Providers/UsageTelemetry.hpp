@@ -25,9 +25,8 @@ namespace UsageTelemetry
     struct ContextUsage
     {
         bool valid = false;
-        // True only while the newest local session metadata explicitly reports
-        // an in-progress context compaction. The quota checker never infers
-        // this state from token percentages.
+        // True while local session data reports compaction, or while the
+        // provider has latched the earliest safe passive auto-compact signal.
         bool compacting = false;
         long long usedTokens = 0;
         long long contextWindowTokens = 0;
@@ -35,8 +34,61 @@ namespace UsageTelemetry
         long long cachedInputTokens = 0;
         long long outputTokens = 0;
         long long reasoningOutputTokens = 0;
+        // Claude-only passive auto-compact telemetry. Other providers leave
+        // these unset. The values are calculated from the same foreground
+        // context token count used by the context meter.
+        bool autoCompactPercentValid = false;
+        int autoCompactPercentLeft = 0;
+        long long autoCompactThresholdTokens = 0;
+
+        // Claude writes an explicit compact_boundary record when compaction
+        // finishes. Current Desktop builds do not guarantee a persisted
+        // saved-token scalar, so AQC can calculate it from pre/post usage.
+        // Pre/post values are kept so AQC can calculate the saved amount
+        // itself when Claude does not persist a saved-token field.
+        long long compactionPreTokens = 0;
+        long long compactionSavedTokens = 0;
+        // Provider-side timestamp for the beginning of the live compaction
+        // latch. This is separate from the completed-boundary timestamp.
+        long long compactionStartedAtUnixSeconds = 0;
+        long long compactionCompletedAtUnixSeconds = 0;
+        std::string compactionEventId;
+
         std::string sourceLabel;
         std::string model;
+    };
+
+    struct RunUsage
+    {
+        bool valid = false;
+        bool running = false;
+        bool thinking = false;
+        long long startedAtUnixSeconds = 0;
+        // True once Claude has persisted a usage snapshot for the current
+        // API message. Before this arrives, a zero token count would be
+        // misleading because the Desktop UI may already be streaming tokens.
+        bool tokenStatsValid = false;
+        // Tokens produced by the API message Claude is currently working on.
+        // This mirrors the live "x.xk tokens" value shown in Claude Desktop.
+        long long currentTokens = 0;
+        // Effective input for the current Claude API message: uncached input
+        // plus cache creation and cache reads. Claude often reports raw
+        // input_tokens as only 1-3 tokens when nearly all context came from
+        // cache, so expose the components separately as well.
+        long long inputTokens = 0;
+        long long rawInputTokens = 0;
+        long long cacheCreationInputTokens = 0;
+        long long cacheReadInputTokens = 0;
+        // Total generated tokens across the active user turn. This is kept
+        // separate from currentTokens because one turn can span many tool/API
+        // cycles before the final end_turn.
+        long long tokens = 0;
+        // Claude can alternate thinking -> tool/text -> thinking within one
+        // user turn. Preserve the latest completed thought duration so the UI
+        // can say THOUGHT FOR <time> and flip back on the next thinking block.
+        long long thinkingStartedAtUnixSeconds = 0;
+        long long lastThoughtDurationSeconds = 0;
+        long long lastThoughtCompletedAtUnixSeconds = 0;
     };
 
     inline std::string LowerCopy(std::string text)

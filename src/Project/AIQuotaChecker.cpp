@@ -62,6 +62,7 @@ namespace
     static bool g_zaiAutoRefreshEnabled = true;
     static bool g_grokAutoRefreshEnabled = true;
     static int g_claudeAccountSource = 0;
+    static int g_claudeThinkingShimmerSpeedPercent = 100;
     static int g_codexAccountSource = 0;
     static std::string g_codexCustomAuthPath;
 
@@ -201,6 +202,9 @@ namespace
         g_zaiAutoRefreshEnabled = settings.zaiAutoRefreshEnabled;
         g_grokAutoRefreshEnabled = settings.grokAutoRefreshEnabled;
         g_claudeAccountSource = AppSettings::ClampClaudeAccountSource(settings.claudeAccountSource);
+        g_claudeThinkingShimmerSpeedPercent = AppSettings::ClampClaudeThinkingShimmerSpeedPercent(
+            settings.claudeThinkingShimmerSpeedPercent
+        );
         g_codexAccountSource = AppSettings::ClampCodexAccountSource(settings.codexAccountSource);
         g_codexCustomAuthPath = settings.codexCustomAuthPath;
 
@@ -227,6 +231,9 @@ namespace
         settings.zaiAutoRefreshEnabled = g_zaiAutoRefreshEnabled;
         settings.grokAutoRefreshEnabled = g_grokAutoRefreshEnabled;
         settings.claudeAccountSource = AppSettings::ClampClaudeAccountSource(g_claudeAccountSource);
+        settings.claudeThinkingShimmerSpeedPercent = AppSettings::ClampClaudeThinkingShimmerSpeedPercent(
+            g_claudeThinkingShimmerSpeedPercent
+        );
         settings.codexAccountSource = AppSettings::ClampCodexAccountSource(g_codexAccountSource);
         settings.codexCustomAuthPath = g_codexCustomAuthPath;
 
@@ -511,7 +518,10 @@ namespace
             return;
         }
 
-        nextContextRefresh = now + 2;
+        // Local telemetry is passive file I/O only (no provider request).
+        // Poll once per second so Claude's first persisted output_tokens value
+        // reaches the UI with as little additional AQC-side lag as possible.
+        nextContextRefresh = now + 1;
         CodexProvider::get_instance()->RefreshContextAsync();
         ClaudeProvider::get_instance()->RefreshContextAsync();
     }
@@ -581,6 +591,7 @@ namespace
         g_rendererState.zaiAutoRefreshEnabled = &g_zaiAutoRefreshEnabled;
         g_rendererState.grokAutoRefreshEnabled = &g_grokAutoRefreshEnabled;
         g_rendererState.claudeAccountSource = &g_claudeAccountSource;
+        g_rendererState.claudeThinkingShimmerSpeedPercent = &g_claudeThinkingShimmerSpeedPercent;
         g_rendererState.codexAccountSource = &g_codexAccountSource;
         g_rendererState.codexCustomAuthPath = &g_codexCustomAuthPath;
         g_rendererState.autoRefreshWarning = &g_autoRefreshWarning;

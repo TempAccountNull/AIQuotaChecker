@@ -41,12 +41,27 @@ private:
 
     static void RefreshThunk();
     void HandleRateLimit(const std::string& detail);
+    void ApplyLocalTelemetryLocked(Claude::LocalTelemetry local, Claude::Snapshot& target);
 
     std::mutex m_mutex;
     Claude::Snapshot m_snapshot;
     std::string m_lastSuccessfulAccountKey;
     std::atomic_bool m_loading = false;
     std::atomic_bool m_contextLoading = false;
+
+    // Compaction is intentionally latched because Claude Desktop can start
+    // showing its compaction UI before compact_boundary is flushed to the
+    // JSONL transcript. The boundary/new low-context value clears the latch.
+    bool m_compactionLatched = false;
+    long long m_compactionStartedAtUnixSeconds = 0;
+    // Last time the foreground JSONL positively showed an active user turn.
+    // Compaction can stop transcript writes for minutes, so this lets the
+    // provider bridge the 0%-until-auto-compact edge without polling Claude.
+    long long m_lastActiveRunSeenAtUnixSeconds = 0;
+    long long m_compactionNoticeAtUnixSeconds = 0;
+    bool m_compactionNoticeEligible = false;
+    long long m_lastCompactionSavedTokens = 0;
+    std::string m_lastCompactionEventId;
 
     AppSettings::ProviderNotifications m_notifySettings;
     AppSettings::ClaudeQuotaWarnings m_quotaWarnings;
