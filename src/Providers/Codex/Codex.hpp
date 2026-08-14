@@ -69,9 +69,16 @@ namespace Codex {
         CreditBalance creditBalance;
         UsageTelemetry::AccessStatus access;
         UsageTelemetry::ContextUsage context;
+        UsageTelemetry::RunUsage run;
+    };
+
+    struct LocalTelemetry {
+        UsageTelemetry::ContextUsage context;
+        UsageTelemetry::RunUsage run;
     };
 
     Snapshot FetchSnapshot(AccountSource source, const std::string& customAuthPath);
+    LocalTelemetry ReadLocalTelemetry();
     UsageTelemetry::ContextUsage ReadLocalContextUsage();
 
 }

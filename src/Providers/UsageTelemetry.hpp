@@ -79,9 +79,13 @@ namespace UsageTelemetry
         long long rawInputTokens = 0;
         long long cacheCreationInputTokens = 0;
         long long cacheReadInputTokens = 0;
-        // Total generated tokens across the active user turn. This is kept
-        // separate from currentTokens because one turn can span many tool/API
-        // cycles before the final end_turn.
+        // Provider-reported reasoning tokens for the latest model request.
+        // Claude currently leaves this at zero; Codex exposes it directly.
+        long long reasoningOutputTokens = 0;
+        // Total generated/spent tokens across the active user turn. Providers
+        // define this from their native cumulative counters when available.
+        // This stays separate from currentTokens because one turn can span
+        // many tool/API cycles before the final end_turn.
         long long tokens = 0;
         // Claude can alternate thinking -> tool/text -> thinking within one
         // user turn. Preserve the latest completed thought duration so the UI

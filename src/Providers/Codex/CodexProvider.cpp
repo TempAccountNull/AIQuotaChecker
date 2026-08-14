@@ -241,22 +241,30 @@ void CodexProvider::RefreshContextAsync()
         CodexProvider* self = CodexProvider::get_instance();
 
         try {
-            UsageTelemetry::ContextUsage context = Codex::ReadLocalContextUsage();
+            Codex::LocalTelemetry local = Codex::ReadLocalTelemetry();
             std::lock_guard<std::mutex> lock(*self->StateMutex());
 
-            if (context.valid) {
-                self->Snapshot()->context = std::move(context);
+            if (local.context.valid) {
+                self->Snapshot()->context = std::move(local.context);
             }
-            else if (context.compacting) {
+            else if (local.context.compacting) {
                 self->Snapshot()->context.compacting = true;
+                self->Snapshot()->context.compactionStartedAtUnixSeconds =
+                    local.context.compactionStartedAtUnixSeconds;
             }
             else {
                 self->Snapshot()->context.compacting = false;
             }
+
+            // Run telemetry is local-only and updates once per second. Keep the
+            // latest parsed state so THINKING/COMPACTING and token spend can be
+            // shown without waiting for the much slower quota refresh.
+            self->Snapshot()->run = std::move(local.run);
         }
         catch (...) {
             std::lock_guard<std::mutex> lock(*self->StateMutex());
             self->Snapshot()->context.compacting = false;
+            self->Snapshot()->run = {};
         }
 
         self->m_contextLoading = false;

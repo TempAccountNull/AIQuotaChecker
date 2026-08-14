@@ -1829,6 +1829,159 @@ static void DrawClaudeAccessStatus(
     }
 }
 
+static void DrawCodexAccessStatus(
+    const UsageTelemetry::AccessStatus& access,
+    const UsageTelemetry::ContextUsage& context,
+    const UsageTelemetry::RunUsage& run
+)
+{
+    // Capture the full row bounds before drawing any right-aligned telemetry.
+    // GetContentRegionAvail() becomes very small after the first right-aligned
+    // item, which previously caused the second token row to begin at the far
+    // right edge and wrap one character per line.
+    const float contentStartX = ImGui::GetCursorPosX();
+    const float contentRightX = contentStartX + ImGui::GetContentRegionAvail().x;
+
+    const bool canOverride =
+        access.state == UsageTelemetry::AccessState::Available ||
+        access.state == UsageTelemetry::AccessState::Unknown;
+    const bool compacting = canOverride && context.compacting;
+    const bool activeRun = canOverride && !compacting && run.valid && run.running;
+
+    std::string stateLabel;
+    if (compacting) {
+        stateLabel = "COMPACTING";
+    }
+    else if (activeRun) {
+        stateLabel = "THINKING";
+    }
+    else {
+        const char* accessLabel = AccessStateLabel(access.state);
+        stateLabel = accessLabel ? accessLabel : "";
+    }
+
+    if (stateLabel.empty()) {
+        return;
+    }
+
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f, 0.92f, 0.92f, 1.0f));
+    ImGui::TextUnformatted("Status:");
+    ImGui::PopStyleColor();
+
+    ImGui::SameLine(0.0f, 5.0f);
+    DrawClaudeStatusValue(
+        stateLabel.c_str(),
+        activeRun,
+        false,
+        compacting,
+        access.state
+    );
+
+    const long long nowUnix = static_cast<long long>(std::time(nullptr));
+    const bool runStats = activeRun && run.tokenStatsValid;
+    // Do not label the previous request's context counters as live spend
+    // while a new Codex turn is still waiting for its first token update.
+    const bool contextStats = !activeRun && !compacting && context.valid &&
+        (context.inputTokens > 0 || context.outputTokens > 0 ||
+            context.cachedInputTokens > 0);
+    const bool haveStats = runStats || contextStats;
+
+    long long rawInput = 0;
+    long long netInput = 0;
+    long long cachedInput = 0;
+    long long output = 0;
+    long long reasoning = 0;
+    long long spent = 0;
+
+    if (runStats) {
+        rawInput = run.rawInputTokens;
+        netInput = run.inputTokens;
+        cachedInput = run.cacheReadInputTokens;
+        output = run.currentTokens;
+        reasoning = run.reasoningOutputTokens;
+        spent = run.tokens > 0
+            ? run.tokens
+            : std::max(0LL, rawInput + output);
+    }
+    else if (contextStats) {
+        rawInput = context.inputTokens;
+        cachedInput = context.cachedInputTokens;
+        netInput = std::max(0LL, rawInput - cachedInput);
+        output = context.outputTokens;
+        reasoning = context.reasoningOutputTokens;
+        spent = std::max(0LL, rawInput + output);
+    }
+
+    if (haveStats || compacting || activeRun) {
+        std::string telemetry;
+
+        if (compacting || activeRun) {
+            const long long timerStart = compacting && context.compactionStartedAtUnixSeconds > 0
+                ? context.compactionStartedAtUnixSeconds
+                : run.startedAtUnixSeconds;
+            const long long elapsed = timerStart > 0 && nowUnix >= timerStart
+                ? nowUnix - timerStart
+                : 0;
+            telemetry = FormatRunDuration(elapsed);
+        }
+
+        if (haveStats) {
+            if (!telemetry.empty()) {
+                telemetry += " · ";
+            }
+            telemetry += (activeRun ? "Spent: " : "Last request: ") +
+                FormatCompactTokenCount(spent) + " tokens";
+        }
+
+        if (!telemetry.empty()) {
+            ImGui::SameLine();
+            const float telemetryWidth = ImGui::CalcTextSize(telemetry.c_str()).x;
+            const float currentX = ImGui::GetCursorPosX();
+            const float targetX = contentRightX - telemetryWidth;
+            if (targetX > currentX) {
+                ImGui::SetCursorPosX(targetX);
+            }
+
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.70f, 0.70f, 1.0f));
+            ImGui::TextUnformatted(telemetry.c_str());
+            ImGui::PopStyleColor();
+        }
+
+        if (haveStats) {
+            std::string tokenStats =
+                "In: " + FormatCompactTokenCount(netInput) +
+                " · Out: " + FormatCompactTokenCount(output) +
+                " · Cache: " + FormatCompactTokenCount(cachedInput);
+
+            if (reasoning > 0) {
+                tokenStats += " · Reasoning: " + FormatCompactTokenCount(reasoning);
+            }
+
+            // Always align against the original full row, not the remaining
+            // width after the telemetry line above. This keeps the token row
+            // on one line instead of wrapping vertically at the right edge.
+            const float tokenStatsWidth = ImGui::CalcTextSize(tokenStats.c_str()).x;
+            const float targetX = std::max(contentStartX, contentRightX - tokenStatsWidth);
+            ImGui::SetCursorPosX(targetX);
+
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
+            ImGui::TextUnformatted(tokenStats.c_str());
+            ImGui::PopStyleColor();
+        }
+    }
+
+    const bool transientState = compacting || activeRun;
+    // OUT OF USAGE is already the complete user-facing Codex state. Keep the
+    // underlying quota detail for detection/debugging, but do not clutter the
+    // status row with redundant text such as "Usage exhausted: Weekly".
+    if (!transientState && access.state != UsageTelemetry::AccessState::OutOfUsage && !access.detail.empty()) {
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
+        ImGui::TextWrapped("%s", access.detail.c_str());
+        ImGui::PopStyleColor();
+    }
+}
+
 enum class ContextMeterStyle
 {
     ClaudeBlueThin,
@@ -1893,7 +2046,7 @@ static void DrawContextUsageCard(
 
     ImGui::TextUnformatted("Context window");
 
-    std::string usageText = context.compacting && !codexStyle
+    std::string usageText = context.compacting
         ? "Compacting Conversation..."
         : "Unavailable";
     float displayPercent = 0.0f;
@@ -1916,12 +2069,12 @@ static void DrawContextUsageCard(
         displayPercent = g_showRemaining ? 100.0f - usedPercent : usedPercent;
         const long long displayTokens = g_showRemaining ? remainingTokens : clampedUsed;
 
-        if (context.compacting && !codexStyle) {
+        if (context.compacting) {
             usageText = "Compacting Conversation...";
         }
         else {
             const long long nowUnix = static_cast<long long>(std::time(nullptr));
-            const bool showCompactionNotice = !codexStyle &&
+            const bool showCompactionNotice =
                 context.compactionSavedTokens > 0 &&
                 context.compactionCompletedAtUnixSeconds > 0 &&
                 nowUnix >= context.compactionCompletedAtUnixSeconds &&
@@ -1960,7 +2113,7 @@ static void DrawContextUsageCard(
             return;
         }
 
-        if (context.compacting && !codexStyle) {
+        if (context.compacting) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.96f, 0.75f, 0.22f, 1.0f));
             ImGui::TextUnformatted(usageText.c_str());
             ImGui::PopStyleColor();
@@ -2049,7 +2202,7 @@ static void DrawCodexTab() {
         ImGui::PopStyleColor();
     }
 
-    DrawProviderAccessStatus(snapshot.access);
+    DrawCodexAccessStatus(snapshot.access, snapshot.context, snapshot.run);
     ImGui::Spacing();
 
     DrawContextUsageCard(

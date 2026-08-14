@@ -2167,6 +2167,109 @@ namespace Codex {
         return latest;
     }
 
+    struct CodexTokenUsageRecord {
+        bool valid = false;
+        long long totalTokens = 0;
+        long long inputTokens = 0;
+        long long cachedInputTokens = 0;
+        long long outputTokens = 0;
+        long long reasoningOutputTokens = 0;
+        long long modelContextWindow = 0;
+        bool cumulativeValid = false;
+        long long cumulativeTotalTokens = 0;
+    };
+
+    static long long CodexRecordUnixSeconds(const json& record) {
+        if (!record.is_object() || !record.contains("timestamp")) {
+            return 0;
+        }
+
+        const auto parsed = ParseTimeFlexible(record.at("timestamp"));
+        if (parsed.time_since_epoch().count() == 0) {
+            return 0;
+        }
+
+        return static_cast<long long>(std::chrono::system_clock::to_time_t(parsed));
+    }
+
+    static CodexTokenUsageRecord ParseCodexTokenUsageRecord(const json& record) {
+        CodexTokenUsageRecord usage;
+        const json* payload = FindObjectField(record, { "payload" });
+
+        if (!payload) {
+            return usage;
+        }
+
+        const std::string payloadType = UsageTelemetry::LowerCopy(
+            ReadStringFlexible(*payload, { "type" })
+        );
+        if (payloadType != "token_count" && payloadType != "tokencount") {
+            return usage;
+        }
+
+        const json* info = FindObjectField(*payload, { "info" });
+        if (!info) {
+            return usage;
+        }
+
+        const json* last = FindObjectField(
+            *info,
+            { "last_token_usage", "lastTokenUsage", "last" }
+        );
+
+        if (!last) {
+            return usage;
+        }
+
+        auto readCount = [](const json& object, std::initializer_list<const char*> keys) {
+            return static_cast<long long>(std::max(
+                0.0,
+                ReadNumberFlexible(object, keys).value_or(0.0)
+            ));
+        };
+
+        usage.totalTokens = readCount(*last, { "total_tokens", "totalTokens" });
+        usage.inputTokens = readCount(*last, { "input_tokens", "inputTokens" });
+        usage.cachedInputTokens = readCount(
+            *last,
+            { "cached_input_tokens", "cachedInputTokens" }
+        );
+        usage.outputTokens = readCount(*last, { "output_tokens", "outputTokens" });
+        usage.reasoningOutputTokens = readCount(
+            *last,
+            { "reasoning_output_tokens", "reasoningOutputTokens" }
+        );
+        usage.modelContextWindow = readCount(
+            *info,
+            { "model_context_window", "modelContextWindow" }
+        );
+
+        if (usage.totalTokens <= 0) {
+            usage.totalTokens = std::max(0LL, usage.inputTokens + usage.outputTokens);
+        }
+
+        const json* cumulative = FindObjectField(
+            *info,
+            { "total_token_usage", "totalTokenUsage", "total" }
+        );
+
+        if (cumulative) {
+            const std::optional<double> cumulativeTotal = ReadNumberFlexible(
+                *cumulative,
+                { "total_tokens", "totalTokens" }
+            );
+
+            if (cumulativeTotal) {
+                usage.cumulativeValid = true;
+                usage.cumulativeTotalTokens = static_cast<long long>(std::max(0.0, *cumulativeTotal));
+            }
+        }
+
+        usage.valid = usage.totalTokens > 0 || usage.modelContextWindow > 0 ||
+            usage.inputTokens > 0 || usage.outputTokens > 0;
+        return usage;
+    }
+
     static const json* FindCodexCompactionObjectRecursive(
         const json& value,
         int depth = 0
@@ -2238,8 +2341,10 @@ namespace Codex {
 
         const bool completionEvent =
             combined.find("context_compacted") != std::string::npos ||
+            combined.find("thread/compacted") != std::string::npos ||
             combined.find("compaction_completed") != std::string::npos ||
             combined.find("compact_completed") != std::string::npos ||
+            combined.find("compacted") != std::string::npos ||
             status == "completed" || status == "complete" || status == "done" ||
             (completed.has_value() && *completed);
 
@@ -2252,6 +2357,7 @@ namespace Codex {
             combined.find("compaction_started") != std::string::npos ||
             combined.find("compact_started") != std::string::npos ||
             combined.find("context_compaction") != std::string::npos ||
+            combined.find("contextcompaction") != std::string::npos ||
             combined.find("compacting") != std::string::npos ||
             status == "running" || status == "started" || status == "in_progress" ||
             (completed.has_value() && !*completed);
@@ -2264,12 +2370,152 @@ namespace Codex {
         return false;
     }
 
-    static UsageTelemetry::ContextUsage ReadLatestCodexContextUsage() {
-        UsageTelemetry::ContextUsage context;
+    static UsageTelemetry::RunUsage ReadCodexRunFromLines(
+        const std::vector<std::string>& lines
+    ) {
+        UsageTelemetry::RunUsage run;
+        long long lastCumulativeTotal = 0;
+        bool haveCumulativeTotal = false;
+        long long runBaselineTotal = 0;
+        bool haveRunBaseline = false;
+
+        auto startRun = [&](long long at) {
+            run = {};
+            run.valid = true;
+            run.running = true;
+            run.thinking = true;
+            run.startedAtUnixSeconds = at;
+            run.thinkingStartedAtUnixSeconds = at;
+            haveRunBaseline = haveCumulativeTotal;
+            runBaselineTotal = lastCumulativeTotal;
+        };
+
+        for (const std::string& candidate : lines) {
+            const bool mayAffectRun =
+                candidate.find("user_message") != std::string::npos ||
+                candidate.find("userMessage") != std::string::npos ||
+                candidate.find("task_started") != std::string::npos ||
+                candidate.find("taskStarted") != std::string::npos ||
+                candidate.find("turn_started") != std::string::npos ||
+                candidate.find("turnStarted") != std::string::npos ||
+                candidate.find("task_complete") != std::string::npos ||
+                candidate.find("taskComplete") != std::string::npos ||
+                candidate.find("turn_completed") != std::string::npos ||
+                candidate.find("turnCompleted") != std::string::npos ||
+                candidate.find("turn_aborted") != std::string::npos ||
+                candidate.find("turnAborted") != std::string::npos ||
+                candidate.find("agent_reasoning") != std::string::npos ||
+                candidate.find("agentReasoning") != std::string::npos ||
+                candidate.find("agent_message") != std::string::npos ||
+                candidate.find("agentMessage") != std::string::npos ||
+                candidate.find("tool_call") != std::string::npos ||
+                candidate.find("toolCall") != std::string::npos ||
+                candidate.find("exec_command") != std::string::npos ||
+                candidate.find("execCommand") != std::string::npos ||
+                candidate.find("token_count") != std::string::npos ||
+                candidate.find("tokenCount") != std::string::npos;
+
+            if (!mayAffectRun) {
+                continue;
+            }
+
+            json record = json::parse(candidate, nullptr, false);
+            if (record.is_discarded() || !record.is_object()) {
+                continue;
+            }
+
+            const long long at = CodexRecordUnixSeconds(record);
+            const json* payload = FindObjectField(record, { "payload" });
+            const std::string type = payload
+                ? UsageTelemetry::LowerCopy(ReadStringFlexible(*payload, { "type" }))
+                : std::string{};
+
+            const CodexTokenUsageRecord tokenUsage = ParseCodexTokenUsageRecord(record);
+            if (tokenUsage.valid) {
+                if (tokenUsage.cumulativeValid) {
+                    lastCumulativeTotal = tokenUsage.cumulativeTotalTokens;
+                    haveCumulativeTotal = true;
+                }
+
+                if (run.valid && run.running) {
+                    run.tokenStatsValid = true;
+                    run.rawInputTokens = tokenUsage.inputTokens;
+                    run.cacheReadInputTokens = tokenUsage.cachedInputTokens;
+                    run.inputTokens = std::max(
+                        0LL,
+                        tokenUsage.inputTokens - tokenUsage.cachedInputTokens
+                    );
+                    run.currentTokens = tokenUsage.outputTokens;
+                    run.reasoningOutputTokens = tokenUsage.reasoningOutputTokens;
+
+                    if (tokenUsage.cumulativeValid && haveRunBaseline) {
+                        run.tokens = std::max(
+                            0LL,
+                            tokenUsage.cumulativeTotalTokens - runBaselineTotal
+                        );
+                    }
+                    else {
+                        run.tokens = tokenUsage.totalTokens;
+                    }
+                }
+                continue;
+            }
+
+            const bool startsRun =
+                type == "user_message" || type == "usermessage" ||
+                type == "task_started" || type == "taskstarted" ||
+                type == "turn_started" || type == "turnstarted";
+
+            if (startsRun) {
+                // task_started can immediately follow user_message for the same
+                // turn. Do not reset the timer or cumulative baseline twice.
+                if (!run.valid || !run.running ||
+                    type == "user_message" || type == "usermessage") {
+                    startRun(at);
+                }
+                continue;
+            }
+
+            if (!run.valid || !run.running) {
+                continue;
+            }
+
+            if (type == "task_complete" || type == "taskcomplete" ||
+                type == "turn_completed" || type == "turncompleted" ||
+                type == "turn_aborted" || type == "turnaborted") {
+                run.running = false;
+                run.thinking = false;
+                continue;
+            }
+
+            if (type.find("agent_reasoning") != std::string::npos ||
+                type.find("agentreasoning") != std::string::npos ||
+                type == "reasoning") {
+                run.thinking = true;
+                if (run.thinkingStartedAtUnixSeconds <= 0) {
+                    run.thinkingStartedAtUnixSeconds = at;
+                }
+            }
+            else if (type.find("agent_message") != std::string::npos ||
+                type.find("agentmessage") != std::string::npos ||
+                type.find("tool_call") != std::string::npos ||
+                type.find("toolcall") != std::string::npos ||
+                type.find("exec_command") != std::string::npos ||
+                type.find("execcommand") != std::string::npos) {
+                run.thinking = false;
+            }
+        }
+
+        return run;
+    }
+
+    static LocalTelemetry ReadLatestCodexTelemetry() {
+        LocalTelemetry local;
+        UsageTelemetry::ContextUsage& context = local.context;
         const std::filesystem::path session = LatestCodexSessionFile();
 
         if (session.empty()) {
-            return context;
+            return local;
         }
 
         // Read only the most recent portion. Token-count records are emitted
@@ -2277,7 +2523,7 @@ namespace Codex {
         const std::string text = ReadTailSharedReadOnly(session, 8ULL * 1024ULL * 1024ULL);
 
         if (text.empty()) {
-            return context;
+            return local;
         }
 
         std::vector<std::string> lines;
@@ -2292,6 +2538,9 @@ namespace Codex {
 
         bool foundUsage = false;
         bool compacting = false;
+        long long lastRetainedTokens = 0;
+        long long preCompactionTokens = 0;
+        bool waitingForPostCompactionUsage = false;
 
         for (const std::string& candidate : lines) {
             const bool mayContainState =
@@ -2308,19 +2557,52 @@ namespace Codex {
                 continue;
             }
 
+            const long long at = CodexRecordUnixSeconds(record);
+            const bool wasCompacting = compacting;
             const bool stateChanged = CodexCompactionStateFromRecord(record, compacting);
-            const json* payload = FindObjectField(record, { "payload" });
 
-            if (!stateChanged && compacting && payload &&
-                ReadStringFlexible(*payload, { "type" }) == "token_count") {
-                // A fresh token-count record after the start marker means the
-                // new compacted context is active even if this Codex version
-                // omitted a dedicated completion event.
-                compacting = false;
+            if (stateChanged && !wasCompacting && compacting) {
+                context.compactionStartedAtUnixSeconds = at;
+                preCompactionTokens = lastRetainedTokens;
+                context.compactionPreTokens = preCompactionTokens;
             }
+            else if (stateChanged && wasCompacting && !compacting) {
+                context.compactionCompletedAtUnixSeconds = at;
+                waitingForPostCompactionUsage = preCompactionTokens > 0;
+            }
+
+            const CodexTokenUsageRecord tokenUsage = ParseCodexTokenUsageRecord(record);
+            if (!tokenUsage.valid) {
+                continue;
+            }
+
+            const long long retainedTokens = std::max(
+                0LL,
+                tokenUsage.totalTokens - tokenUsage.reasoningOutputTokens
+            );
+
+            if (compacting) {
+                // Codex persists a fresh token-count record once the compacted
+                // context becomes active. This is a reliable passive completion
+                // signal even when no explicit completion event is persisted.
+                compacting = false;
+                context.compactionCompletedAtUnixSeconds = at;
+                waitingForPostCompactionUsage = preCompactionTokens > 0;
+            }
+
+            if (waitingForPostCompactionUsage && retainedTokens > 0) {
+                context.compactionSavedTokens = std::max(
+                    0LL,
+                    preCompactionTokens - retainedTokens
+                );
+                waitingForPostCompactionUsage = false;
+            }
+
+            lastRetainedTokens = retainedTokens;
         }
 
         context.compacting = compacting;
+        local.run = ReadCodexRunFromLines(lines);
 
         for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
             // Do not parse transcript/message records. Only the two metadata
@@ -2345,48 +2627,24 @@ namespace Codex {
                 continue;
             }
 
-            const std::string type = ReadStringFlexible(*payload, { "type" });
+            const std::string type = UsageTelemetry::LowerCopy(
+                ReadStringFlexible(*payload, { "type" })
+            );
 
             if (context.model.empty() && type == "turn_context") {
                 context.model = ReadStringFlexible(*payload, { "model" });
             }
 
-            if (!foundUsage && type == "token_count") {
-                const json* info = FindObjectField(*payload, { "info" });
-
-                if (!info) {
+            if (!foundUsage && (type == "token_count" || type == "tokencount")) {
+                const CodexTokenUsageRecord usage = ParseCodexTokenUsageRecord(record);
+                if (!usage.valid) {
                     continue;
                 }
 
-                const json* last = FindObjectField(
-                    *info,
-                    { "last_token_usage", "lastTokenUsage" }
-                );
-
-                if (!last) {
-                    continue;
-                }
-
-                const long long rawTotalTokens = static_cast<long long>(std::max(
-                    0.0,
-                    ReadNumberFlexible(*last, { "total_tokens", "totalTokens" }).value_or(0.0)
-                ));
-                context.inputTokens = static_cast<long long>(std::max(
-                    0.0,
-                    ReadNumberFlexible(*last, { "input_tokens", "inputTokens" }).value_or(0.0)
-                ));
-                context.cachedInputTokens = static_cast<long long>(std::max(
-                    0.0,
-                    ReadNumberFlexible(*last, { "cached_input_tokens", "cachedInputTokens" }).value_or(0.0)
-                ));
-                context.outputTokens = static_cast<long long>(std::max(
-                    0.0,
-                    ReadNumberFlexible(*last, { "output_tokens", "outputTokens" }).value_or(0.0)
-                ));
-                context.reasoningOutputTokens = static_cast<long long>(std::max(
-                    0.0,
-                    ReadNumberFlexible(*last, { "reasoning_output_tokens", "reasoningOutputTokens" }).value_or(0.0)
-                ));
+                context.inputTokens = usage.inputTokens;
+                context.cachedInputTokens = usage.cachedInputTokens;
+                context.outputTokens = usage.outputTokens;
+                context.reasoningOutputTokens = usage.reasoningOutputTokens;
 
                 // Codex's own context accounting excludes reasoning output from
                 // the tokens retained in the active model context. Keep the raw
@@ -2394,17 +2652,11 @@ namespace Codex {
                 // for the context-window progress bar.
                 context.usedTokens = std::max(
                     0LL,
-                    rawTotalTokens - context.reasoningOutputTokens
+                    usage.totalTokens - context.reasoningOutputTokens
                 );
-                context.contextWindowTokens = static_cast<long long>(std::max(
-                    0.0,
-                    ReadNumberFlexible(
-                        *info,
-                        { "model_context_window", "modelContextWindow" }
-                    ).value_or(0.0)
-                ));
+                context.contextWindowTokens = usage.modelContextWindow;
 
-                if (context.usedTokens <= 0 && rawTotalTokens <= 0) {
+                if (context.usedTokens <= 0 && usage.totalTokens <= 0) {
                     context.usedTokens = std::max(
                         0LL,
                         context.inputTokens + context.outputTokens - context.reasoningOutputTokens
@@ -2421,11 +2673,15 @@ namespace Codex {
             }
         }
 
-        return context;
+        return local;
+    }
+
+    LocalTelemetry ReadLocalTelemetry() {
+        return ReadLatestCodexTelemetry();
     }
 
     UsageTelemetry::ContextUsage ReadLocalContextUsage() {
-        return ReadLatestCodexContextUsage();
+        return ReadLatestCodexTelemetry().context;
     }
 
     static void FinalizeCodexAccess(Snapshot& snapshot) {
@@ -2444,7 +2700,17 @@ namespace Codex {
             std::vector<std::string> exhaustedRateLimits;
 
             for (const UsageBar& bar : snapshot.bars) {
-                if (bar.valid && bar.blocksProvider && UsageTelemetry::IsExhausted(bar.usedPercent)) {
+                const std::string resetCreditText = UsageTelemetry::LowerCopy(
+                    bar.label + " " + bar.sublabel
+                );
+                const bool resetCreditOnly =
+                    resetCreditText.find("reset credit") != std::string::npos;
+
+                // Reset credits are supplemental recovery credits. Having zero
+                // banked credits (or an exhausted reset-credit-only bucket) does
+                // not mean the normal Codex plan itself is out of usage.
+                if (bar.valid && bar.blocksProvider && !resetCreditOnly &&
+                    UsageTelemetry::IsExhausted(bar.usedPercent)) {
                     exhaustedRateLimits.push_back(bar.label.empty() ? "Usage" : bar.label);
                 }
             }
@@ -2474,15 +2740,14 @@ namespace Codex {
                 snapshot.access.state = UsageTelemetry::AccessState::OutOfUsage;
                 snapshot.access.detail = std::move(detail);
             }
-            else if (snapshot.creditBalance.valid &&
-                !snapshot.creditBalance.unlimited &&
-                !snapshot.creditBalance.hasCredits) {
-                snapshot.access.state = UsageTelemetry::AccessState::OutOfUsage;
-                snapshot.access.detail = "No Codex credits remain";
-            }
         }
 
-        snapshot.context = ReadLatestCodexContextUsage();
+        // Credit and reset-credit balances are supplemental to the core plan
+        // quota. Zero supplemental credits must not force OUT OF USAGE while a
+        // normal blocking Codex quota window is still available.
+        LocalTelemetry local = ReadLatestCodexTelemetry();
+        snapshot.context = std::move(local.context);
+        snapshot.run = std::move(local.run);
     }
 
     Snapshot FetchSnapshot(AccountSource source, const std::string& customAuthPath) {
