@@ -16,6 +16,10 @@ namespace CodexAppServer {
         ResultKind kind = ResultKind::Unavailable;
         nlohmann::json accountResult;
         nlohmann::json rateLimitsResult;
+        // Optional effective config returned by config/read. This is kept
+        // separate from quota/account state because older app-server builds
+        // may not expose the method.
+        nlohmann::json configResult;
         std::string detail;
     };
 

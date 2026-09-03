@@ -8,3 +8,4 @@ AIQuotaChecker.vcxproj.user
 third_party/
 release-assets/
 build/
+/ref

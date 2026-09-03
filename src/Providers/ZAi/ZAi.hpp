@@ -30,6 +30,12 @@ namespace ZAi
         std::string rightLabel;
     };
 
+    struct LocalTelemetry
+    {
+        UsageTelemetry::ContextUsage context;
+        UsageTelemetry::RunUsage run;
+    };
+
     struct Snapshot
     {
         std::string plan = "Z.Ai";
@@ -39,7 +45,9 @@ namespace ZAi
         std::vector<DetailRow> details;
         UsageTelemetry::AccessStatus access;
         UsageTelemetry::ContextUsage context;
+        UsageTelemetry::RunUsage run;
     };
 
+    LocalTelemetry ReadLocalTelemetry();
     Snapshot FetchSnapshot();
 }

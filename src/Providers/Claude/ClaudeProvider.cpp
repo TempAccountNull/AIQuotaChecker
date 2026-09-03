@@ -180,17 +180,10 @@ void ClaudeProvider::ApplyLocalTelemetryLocked(
         m_lastActiveRunSeenAtUnixSeconds = now;
     }
 
-    const bool atAutoCompactEdge = incoming.valid &&
-        incoming.autoCompactPercentValid &&
-        incoming.autoCompactPercentLeft <= 1;
-    const bool runRecentlyActive = m_lastActiveRunSeenAtUnixSeconds > 0 &&
-        now >= m_lastActiveRunSeenAtUnixSeconds &&
-        now - m_lastActiveRunSeenAtUnixSeconds <= 10 * 60;
-
-    if (!incoming.compacting && !m_compactionLatched &&
-        atAutoCompactEdge && runRecentlyActive) {
-        incoming.compacting = true;
-    }
+    // Never synthesize COMPACTING from context percentage alone. Claude can
+    // expose 200K and 1M variants of the same model, and a stale/guessed limit
+    // must not latch a false compact state. Only explicit transcript/provider
+    // compact markers may enter the latch below.
 
     if (incoming.compacting) {
         if (!m_compactionLatched) {

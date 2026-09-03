@@ -602,10 +602,35 @@ Result ReadCurrentAccountRateLimits() {
         return Failure(ResultKind::Error, "Codex app-server returned no rate-limit result");
     }
 
+    // Codex Desktop reads the effective config through this same RPC.
+    // In current builds it contains model_auto_compact_token_limit, which is
+    // the real automatic-compaction edge. This request is intentionally
+    // optional: quota/account reads must keep working with older app-servers.
+    json configResult;
+    std::string configDetail;
+
+    if (server.Send(json{
+        { "method", "config/read" },
+        { "id", 4 },
+        { "params", {
+            { "includeLayers", false },
+            { "cwd", nullptr }
+        } }
+    }, configDetail)) {
+        json configResponse;
+        if (server.WaitForResponse(4, configResponse, 5000, configDetail) &&
+            !configResponse.contains("error") &&
+            configResponse.contains("result") &&
+            configResponse.at("result").is_object()) {
+            configResult = configResponse.at("result");
+        }
+    }
+
     Result result;
     result.kind = ResultKind::Success;
     result.accountResult = std::move(accountResult);
     result.rateLimitsResult = rateLimitsResponse.at("result");
+    result.configResult = std::move(configResult);
     return result;
 }
 

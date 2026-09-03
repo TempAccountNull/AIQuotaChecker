@@ -4,6 +4,7 @@
 #include <cctype>
 #include <initializer_list>
 #include <string>
+#include <vector>
 
 namespace UsageTelemetry
 {
@@ -22,11 +23,18 @@ namespace UsageTelemetry
         std::string detail;
     };
 
+    struct ContextBreakdownEntry
+    {
+        std::string label;
+        long long value = 0;
+        double percent = 0.0;
+    };
+
     struct ContextUsage
     {
         bool valid = false;
-        // True while local session data reports compaction, or while the
-        // provider has latched the earliest safe passive auto-compact signal.
+        // True only while provider/local session data explicitly reports a
+        // compaction operation. Context percentage alone is never sufficient.
         bool compacting = false;
         long long usedTokens = 0;
         long long contextWindowTokens = 0;
@@ -34,9 +42,30 @@ namespace UsageTelemetry
         long long cachedInputTokens = 0;
         long long outputTokens = 0;
         long long reasoningOutputTokens = 0;
-        // Claude-only passive auto-compact telemetry. Other providers leave
-        // these unset. The values are calculated from the same foreground
-        // context token count used by the context meter.
+
+        // Optional provider-native cache telemetry. ZCode exposes both the
+        // latest request and cumulative cache hit ratio; other providers can
+        // leave these unset without changing the existing context card.
+        bool cacheStatsValid = false;
+        long long cacheInputTokens = 0;
+        long long cacheReadTokens = 0;
+        long long cacheWriteTokens = 0;
+        bool latestCacheHitPercentValid = false;
+        double latestCacheHitPercent = 0.0;
+        bool averageCacheHitPercentValid = false;
+        double averageCacheHitPercent = 0.0;
+        long long totalCacheInputTokens = 0;
+        long long totalCacheReadTokens = 0;
+        long long totalCacheWriteTokens = 0;
+
+        // Provider-native composition data. ZCode reports character counts for
+        // messages/system/tools/etc.; keep the raw value and a normalized
+        // percentage so the renderer never needs provider-specific parsing.
+        std::vector<ContextBreakdownEntry> breakdown;
+
+        // Provider-reported/calculated passive auto-compact telemetry.
+        // Providers leave this unset when no trustworthy threshold is known;
+        // the UI must never substitute the full context window as the trigger.
         bool autoCompactPercentValid = false;
         int autoCompactPercentLeft = 0;
         long long autoCompactThresholdTokens = 0;

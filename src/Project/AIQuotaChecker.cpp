@@ -524,6 +524,7 @@ namespace
         nextContextRefresh = now + 1;
         CodexProvider::get_instance()->RefreshContextAsync();
         ClaudeProvider::get_instance()->RefreshContextAsync();
+        ZAiProvider::get_instance()->RefreshContextAsync();
     }
 
     static void PollAppNotifications()

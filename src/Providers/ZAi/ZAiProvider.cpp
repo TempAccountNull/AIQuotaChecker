@@ -7,6 +7,7 @@
 #include <exception>
 #include <string>
 #include <thread>
+#include <utility>
 
 namespace
 {
@@ -121,12 +122,56 @@ void ZAiProvider::RefreshAsync()
             failedSnapshot.statusText = error;
             failedSnapshot.lastUpdated = "now";
             failedSnapshot.access = UsageTelemetry::FromText(error);
+            try {
+                ZAi::LocalTelemetry local = ZAi::ReadLocalTelemetry();
+                failedSnapshot.context = std::move(local.context);
+                failedSnapshot.run = std::move(local.run);
+            }
+            catch (...) {
+            }
 
             std::lock_guard<std::mutex> lock(*self->StateMutex());
             *self->Snapshot() = failedSnapshot;
         }
 
         *self->Loading() = false;
+    }).detach();
+}
+
+void ZAiProvider::RefreshContextAsync()
+{
+    if (m_contextLoading.exchange(true)) {
+        return;
+    }
+
+    std::thread([] {
+        ZAiProvider* self = ZAiProvider::get_instance();
+        try {
+            ZAi::LocalTelemetry local = ZAi::ReadLocalTelemetry();
+            std::lock_guard<std::mutex> lock(*self->StateMutex());
+
+            // Keep the last valid context meter across a momentary SQLite/WAL
+            // read gap, just like the Codex/Claude local telemetry paths. A
+            // definite non-compacting read still clears the transient state.
+            if (local.context.valid) {
+                self->Snapshot()->context = std::move(local.context);
+            }
+            else if (local.context.compacting) {
+                self->Snapshot()->context.compacting = true;
+                self->Snapshot()->context.compactionStartedAtUnixSeconds =
+                    local.context.compactionStartedAtUnixSeconds;
+            }
+            else {
+                self->Snapshot()->context.compacting = false;
+            }
+
+            self->Snapshot()->run = std::move(local.run);
+        }
+        catch (...) {
+            // Passive local telemetry must never disturb the quota snapshot or
+            // make a valid context meter flicker because the live DB was busy.
+        }
+        self->m_contextLoading = false;
     }).detach();
 }
 

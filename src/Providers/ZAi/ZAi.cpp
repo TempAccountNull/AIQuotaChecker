@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <initializer_list>
 #include <optional>
 #include <regex>
 #include <set>
@@ -360,15 +361,780 @@ namespace ZAi
         return Text::get_instance()->CompactLower(text);
     }
 
-    static std::string NormalizeModelName(std::string label)
-    {
-        std::string compact = CompactLower(label);
+    struct Sqlite3;
+    struct Sqlite3Stmt;
 
-        if (compact.find("turbo") != std::string::npos) {
-            return "GLM-5-Turbo";
+    class DynamicSqlite
+    {
+    public:
+        using OpenV2Fn = int(__cdecl*)(const char*, Sqlite3**, int, const char*);
+        using CloseV2Fn = int(__cdecl*)(Sqlite3*);
+        using PrepareV2Fn = int(__cdecl*)(Sqlite3*, const char*, int, Sqlite3Stmt**, const char**);
+        using StepFn = int(__cdecl*)(Sqlite3Stmt*);
+        using FinalizeFn = int(__cdecl*)(Sqlite3Stmt*);
+        using ColumnCountFn = int(__cdecl*)(Sqlite3Stmt*);
+        using ColumnTextFn = const unsigned char*(__cdecl*)(Sqlite3Stmt*, int);
+        using BusyTimeoutFn = int(__cdecl*)(Sqlite3*, int);
+
+        ~DynamicSqlite()
+        {
+            Close();
+            if (m_module) {
+                FreeLibrary(m_module);
+            }
         }
 
-        if (compact.find("glm52") != std::string::npos || compact.find("glm5.2") != std::string::npos || compact.find("52") != std::string::npos) {
+        bool OpenReadOnly(const std::filesystem::path& path)
+        {
+            if (!LoadApi()) {
+                return false;
+            }
+
+            Close();
+            const std::string utf8 = WidePathToUtf8(path.wstring());
+            if (utf8.empty()) {
+                return false;
+            }
+
+            constexpr int kSqliteOk = 0;
+            constexpr int kOpenReadOnly = 0x00000001;
+            constexpr int kOpenNoMutex = 0x00008000;
+            const int result = m_openV2(
+                utf8.c_str(),
+                &m_db,
+                kOpenReadOnly | kOpenNoMutex,
+                nullptr
+            );
+            if (result != kSqliteOk || !m_db) {
+                Close();
+                return false;
+            }
+
+            if (m_busyTimeout) {
+                m_busyTimeout(m_db, 50);
+            }
+            return true;
+        }
+
+        std::vector<std::vector<std::string>> Query(const std::string& sql) const
+        {
+            std::vector<std::vector<std::string>> rows;
+            if (!m_db || !m_prepareV2 || !m_step || !m_finalize) {
+                return rows;
+            }
+
+            Sqlite3Stmt* statement = nullptr;
+            constexpr int kSqliteOk = 0;
+            constexpr int kSqliteRow = 100;
+            if (m_prepareV2(m_db, sql.c_str(), -1, &statement, nullptr) != kSqliteOk || !statement) {
+                return rows;
+            }
+
+            const int columnCount = m_columnCount(statement);
+            while (m_step(statement) == kSqliteRow) {
+                std::vector<std::string> row;
+                row.reserve(static_cast<size_t>(std::max(0, columnCount)));
+                for (int column = 0; column < columnCount; ++column) {
+                    const unsigned char* value = m_columnText(statement, column);
+                    row.emplace_back(value ? reinterpret_cast<const char*>(value) : "");
+                }
+                rows.push_back(std::move(row));
+            }
+
+            m_finalize(statement);
+            return rows;
+        }
+
+    private:
+        static std::string WidePathToUtf8(const std::wstring& value)
+        {
+            if (value.empty()) {
+                return {};
+            }
+
+            const int required = WideCharToMultiByte(
+                CP_UTF8,
+                WC_ERR_INVALID_CHARS,
+                value.c_str(),
+                static_cast<int>(value.size()),
+                nullptr,
+                0,
+                nullptr,
+                nullptr
+            );
+            if (required <= 0) {
+                return {};
+            }
+
+            std::string result(static_cast<size_t>(required), '\0');
+            if (WideCharToMultiByte(
+                CP_UTF8,
+                WC_ERR_INVALID_CHARS,
+                value.c_str(),
+                static_cast<int>(value.size()),
+                result.data(),
+                required,
+                nullptr,
+                nullptr
+            ) != required) {
+                return {};
+            }
+            return result;
+        }
+
+        template <typename T>
+        bool LoadProc(T& target, const char* name)
+        {
+            target = reinterpret_cast<T>(GetProcAddress(m_module, name));
+            return target != nullptr;
+        }
+
+        bool LoadApi()
+        {
+            if (m_module) {
+                return true;
+            }
+
+            // Windows 10/11 ship the system SQLite component as winsqlite3.
+            // Fall back to sqlite3.dll for environments that provide their own
+            // compatible runtime. Loading dynamically keeps AQC dependency-free.
+            m_module = LoadLibraryW(L"winsqlite3.dll");
+            if (!m_module) {
+                m_module = LoadLibraryW(L"sqlite3.dll");
+            }
+            if (!m_module) {
+                return false;
+            }
+
+            const bool required =
+                LoadProc(m_openV2, "sqlite3_open_v2") &&
+                LoadProc(m_closeV2, "sqlite3_close_v2") &&
+                LoadProc(m_prepareV2, "sqlite3_prepare_v2") &&
+                LoadProc(m_step, "sqlite3_step") &&
+                LoadProc(m_finalize, "sqlite3_finalize") &&
+                LoadProc(m_columnCount, "sqlite3_column_count") &&
+                LoadProc(m_columnText, "sqlite3_column_text");
+            LoadProc(m_busyTimeout, "sqlite3_busy_timeout");
+
+            if (!required) {
+                FreeLibrary(m_module);
+                m_module = nullptr;
+                return false;
+            }
+            return true;
+        }
+
+        void Close()
+        {
+            if (m_db && m_closeV2) {
+                m_closeV2(m_db);
+            }
+            m_db = nullptr;
+        }
+
+        HMODULE m_module = nullptr;
+        Sqlite3* m_db = nullptr;
+        OpenV2Fn m_openV2 = nullptr;
+        CloseV2Fn m_closeV2 = nullptr;
+        PrepareV2Fn m_prepareV2 = nullptr;
+        StepFn m_step = nullptr;
+        FinalizeFn m_finalize = nullptr;
+        ColumnCountFn m_columnCount = nullptr;
+        ColumnTextFn m_columnText = nullptr;
+        BusyTimeoutFn m_busyTimeout = nullptr;
+    };
+
+    static long long ParsePositiveLongLong(const std::string& text)
+    {
+        if (text.empty()) {
+            return 0;
+        }
+        char* end = nullptr;
+        const long long value = std::strtoll(text.c_str(), &end, 10);
+        return end != text.c_str() && value > 0 ? value : 0;
+    }
+
+    static long long MillisecondsOrSecondsToUnixSeconds(long long value)
+    {
+        if (value <= 0) {
+            return 0;
+        }
+        return value > 100000000000LL ? value / 1000LL : value;
+    }
+
+    static std::string SqlQuote(std::string value)
+    {
+        size_t at = 0;
+        while ((at = value.find('\'', at)) != std::string::npos) {
+            value.insert(at, 1, '\'');
+            at += 2;
+        }
+        return "'" + value + "'";
+    }
+
+    static std::optional<double> FindNumberByKeyRecursive(
+        const json& value,
+        std::initializer_list<const char*> keys,
+        int depth = 0
+    ) {
+        if (depth > 10) {
+            return std::nullopt;
+        }
+
+        if (value.is_object()) {
+            for (const char* key : keys) {
+                auto it = value.find(key);
+                if (it == value.end()) {
+                    continue;
+                }
+                if (it->is_number()) {
+                    return it->get<double>();
+                }
+                if (it->is_string()) {
+                    char* end = nullptr;
+                    const std::string text = it->get<std::string>();
+                    const double parsed = std::strtod(text.c_str(), &end);
+                    if (end != text.c_str() && std::isfinite(parsed)) {
+                        return parsed;
+                    }
+                }
+            }
+            for (auto it = value.begin(); it != value.end(); ++it) {
+                if (auto found = FindNumberByKeyRecursive(it.value(), keys, depth + 1)) {
+                    return found;
+                }
+            }
+        }
+        else if (value.is_array()) {
+            for (const json& item : value) {
+                if (auto found = FindNumberByKeyRecursive(item, keys, depth + 1)) {
+                    return found;
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
+    static const json* FindObjectByKeyRecursive(
+        const json& value,
+        std::initializer_list<const char*> keys,
+        int depth = 0
+    ) {
+        if (depth > 10) {
+            return nullptr;
+        }
+        if (value.is_object()) {
+            for (const char* key : keys) {
+                auto it = value.find(key);
+                if (it != value.end() && it->is_object()) {
+                    return &*it;
+                }
+            }
+            for (auto it = value.begin(); it != value.end(); ++it) {
+                if (const json* found = FindObjectByKeyRecursive(it.value(), keys, depth + 1)) {
+                    return found;
+                }
+            }
+        }
+        else if (value.is_array()) {
+            for (const json& item : value) {
+                if (const json* found = FindObjectByKeyRecursive(item, keys, depth + 1)) {
+                    return found;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    static const json* FindArrayByKeyRecursive(
+        const json& value,
+        std::initializer_list<const char*> keys,
+        int depth = 0
+    ) {
+        if (depth > 10) {
+            return nullptr;
+        }
+        if (value.is_object()) {
+            for (const char* key : keys) {
+                auto it = value.find(key);
+                if (it != value.end() && it->is_array()) {
+                    return &*it;
+                }
+            }
+            for (auto it = value.begin(); it != value.end(); ++it) {
+                if (const json* found = FindArrayByKeyRecursive(it.value(), keys, depth + 1)) {
+                    return found;
+                }
+            }
+        }
+        else if (value.is_array()) {
+            for (const json& item : value) {
+                if (const json* found = FindArrayByKeyRecursive(item, keys, depth + 1)) {
+                    return found;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    static std::string FriendlyZCodeContextSource(std::string source)
+    {
+        if (source == "system_prompt") return "System prompt";
+        if (source == "meta_user_context") return "Meta context";
+        if (source == "skills") return "Skills";
+        if (source == "tool_prompt") return "Tool prompt";
+        if (source == "system_tool_schemas") return "System tools";
+        if (source == "mcp_tool_schemas") return "MCP tools";
+        if (source == "messages") return "Messages";
+        std::replace(source.begin(), source.end(), '_', ' ');
+        if (!source.empty()) source.front() = static_cast<char>(std::toupper(static_cast<unsigned char>(source.front())));
+        return source;
+    }
+
+    static std::string JsonStringLower(const json& value, const char* key) {
+        if (!value.is_object()) return {};
+        auto it = value.find(key);
+        if (it == value.end() || !it->is_string()) return {};
+        return Text::get_instance()->ToLowerCopy(it->get<std::string>());
+    }
+
+    static std::optional<bool> ZCodeCompactionStateFromJson(
+        const json& value,
+        int depth = 0
+    ) {
+        if (depth > 10) return std::nullopt;
+        if (value.is_object()) {
+            const std::string activeTurnKind = JsonStringLower(value, "activeTurnKind");
+            if (activeTurnKind == "compact") return true;
+            if (activeTurnKind == "regular" || activeTurnKind == "rewind") return false;
+
+            const std::string type = JsonStringLower(value, "type");
+            const std::string status = JsonStringLower(value, "status");
+            if (type == "compact") {
+                if (status == "running") return true;
+                if (status == "success" || status == "failed" || status == "noop" ||
+                    status == "cancelled" || status == "completed" || status == "complete") {
+                    return false;
+                }
+            }
+
+            // Runtime state is sometimes nested one level under payload/state.
+            for (auto it = value.begin(); it != value.end(); ++it) {
+                if (!it.value().is_object()) continue;
+                if (auto state = ZCodeCompactionStateFromJson(it.value(), depth + 1)) {
+                    return state;
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
+    static void ApplyZCodeRuntimeJson(
+        const json& root,
+        UsageTelemetry::ContextUsage& context
+    ) {
+        if (root.is_discarded() || root.is_null()) {
+            return;
+        }
+
+        std::optional<double> used = FindNumberByKeyRecursive(
+            root,
+            { "usedTokens", "contextUsed", "context_used" }
+        );
+        std::optional<double> maximum = FindNumberByKeyRecursive(
+            root,
+            { "maxTokens", "contextWindow", "context_window", "contextWindowTokens" }
+        );
+        std::optional<double> compactThreshold = FindNumberByKeyRecursive(
+            root,
+            { "autoCompactThresholdTokens", "auto_compact_threshold_tokens" }
+        );
+
+        // The host UI's normalized runtime form is contextUsage:{used,size}.
+        // Only accept those generic names from an actual context object so an
+        // unrelated quota/usage {used,size} cannot corrupt the context meter.
+        if (const json* contextObject = FindObjectByKeyRecursive(
+            root, { "contextWindow", "contextUsage", "context_usage" })) {
+            if (!used) {
+                used = FindNumberByKeyRecursive(*contextObject, { "usedTokens", "used" });
+            }
+            if (!maximum) {
+                maximum = FindNumberByKeyRecursive(
+                    *contextObject, { "maxTokens", "contextWindowTokens", "size" });
+            }
+            if (!compactThreshold) {
+                compactThreshold = FindNumberByKeyRecursive(
+                    *contextObject, { "autoCompactThresholdTokens", "auto_compact_threshold_tokens" });
+            }
+        }
+
+        if (used && *used > 0.0) {
+            context.usedTokens = static_cast<long long>(std::floor(*used));
+        }
+        if (maximum && *maximum > 0.0) {
+            context.contextWindowTokens = static_cast<long long>(std::floor(*maximum));
+        }
+        if (compactThreshold && *compactThreshold > 0.0) {
+            context.autoCompactThresholdTokens = static_cast<long long>(std::floor(*compactThreshold));
+        }
+
+        if (const json* cache = FindObjectByKeyRecursive(root, { "cache", "cacheHit" })) {
+            auto number = [&](std::initializer_list<const char*> keys) -> long long {
+                const auto value = FindNumberByKeyRecursive(*cache, keys);
+                return value && *value >= 0.0 ? static_cast<long long>(std::floor(*value)) : 0LL;
+            };
+            context.cacheInputTokens = number({ "inputTokens", "input_tokens" });
+            context.cacheReadTokens = number({ "cacheReadTokens", "cachedReadTokens", "cache_read_tokens" });
+            context.cacheWriteTokens = number({ "cacheWriteTokens", "cachedWriteTokens", "cache_write_tokens" });
+            context.totalCacheInputTokens = number({ "totalInputTokens", "total_input_tokens" });
+            context.totalCacheReadTokens = number({ "totalCacheReadTokens", "total_cache_read_tokens" });
+            context.totalCacheWriteTokens = number({ "totalCacheWriteTokens", "total_cache_write_tokens" });
+
+            const auto latest = FindNumberByKeyRecursive(*cache, { "latestHitRate", "latest_hit_rate" });
+            const auto average = FindNumberByKeyRecursive(*cache, { "hitRate", "cacheHitRate", "hit_rate" });
+            if (latest && std::isfinite(*latest)) {
+                context.latestCacheHitPercentValid = true;
+                context.latestCacheHitPercent = std::clamp(*latest <= 1.0 ? *latest * 100.0 : *latest, 0.0, 100.0);
+            }
+            if (average && std::isfinite(*average)) {
+                context.averageCacheHitPercentValid = true;
+                context.averageCacheHitPercent = std::clamp(*average <= 1.0 ? *average * 100.0 : *average, 0.0, 100.0);
+            }
+            context.cacheStatsValid = context.cacheInputTokens > 0 ||
+                context.cacheReadTokens > 0 || context.cacheWriteTokens > 0 ||
+                context.latestCacheHitPercentValid || context.averageCacheHitPercentValid;
+        }
+
+        if (const json* breakdown = FindArrayByKeyRecursive(root, { "contextUsageBreakdown", "breakdown" })) {
+            std::vector<UsageTelemetry::ContextBreakdownEntry> entries;
+            long long total = 0;
+            for (const json& item : *breakdown) {
+                if (!item.is_object()) continue;
+                const std::string source = JsonUtils::get_instance()->String(item, "source");
+                const auto chars = FindNumberByKeyRecursive(item, { "chars", "value", "tokens" });
+                if (source.empty() || !chars || *chars < 0.0) continue;
+                UsageTelemetry::ContextBreakdownEntry entry;
+                entry.label = FriendlyZCodeContextSource(source);
+                entry.value = static_cast<long long>(std::floor(*chars));
+                total += entry.value;
+                entries.push_back(std::move(entry));
+            }
+            if (total > 0) {
+                for (auto& entry : entries) {
+                    entry.percent = (static_cast<double>(entry.value) / static_cast<double>(total)) * 100.0;
+                }
+                context.breakdown = std::move(entries);
+            }
+        }
+    }
+
+    static long long ZCodeConfiguredContextWindow(const std::string& model)
+    {
+        if (model.empty()) {
+            return 0;
+        }
+        const std::filesystem::path path =
+            Network::get_instance()->UserProfilePath() / ".zcode" / "v2" / "config.json";
+        const std::string text = Network::get_instance()->ReadTextFile(path);
+        if (text.empty()) {
+            return 0;
+        }
+
+        const json root = json::parse(text, nullptr, false);
+        if (root.is_discarded() || !root.is_object()) {
+            return 0;
+        }
+        const auto providersIt = root.find("provider");
+        if (providersIt == root.end() || !providersIt->is_object()) {
+            return 0;
+        }
+
+        const std::string wanted = CompactLower(model);
+        long long best = 0;
+        for (auto provider = providersIt->begin(); provider != providersIt->end(); ++provider) {
+            if (!provider.value().is_object()) continue;
+            auto models = provider.value().find("models");
+            if (models == provider.value().end() || !models->is_object()) continue;
+            for (auto item = models->begin(); item != models->end(); ++item) {
+                if (!item.value().is_object()) continue;
+                const std::string displayName = JsonUtils::get_instance()->String(item.value(), "name");
+                if (CompactLower(item.key()) != wanted &&
+                    (displayName.empty() || CompactLower(displayName) != wanted)) {
+                    continue;
+                }
+                const auto limit = item.value().find("limit");
+                if (limit == item.value().end() || !limit->is_object()) continue;
+                const auto contextValue = FindNumberByKeyRecursive(*limit, { "context" });
+                if (contextValue && *contextValue > 0.0) {
+                    best = std::max(best, static_cast<long long>(std::floor(*contextValue)));
+                }
+            }
+        }
+        return best;
+    }
+
+    struct ZCodeLocalTelemetry
+    {
+        UsageTelemetry::ContextUsage context;
+        UsageTelemetry::RunUsage run;
+        std::string model;
+    };
+
+    static ZCodeLocalTelemetry ReadZCodeLocalTelemetry()
+    {
+        ZCodeLocalTelemetry local;
+        const std::filesystem::path dbPath =
+            Network::get_instance()->UserProfilePath() / ".zcode" / "cli" / "db" / "db.sqlite";
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(dbPath, ec) || ec) {
+            return local;
+        }
+
+        DynamicSqlite db;
+        if (!db.OpenReadOnly(dbPath)) {
+            return local;
+        }
+
+        const auto sessions = db.Query(
+            "SELECT id, COALESCE(time_compacting,0), time_updated "
+            "FROM session WHERE time_archived IS NULL AND (parent_id IS NULL OR parent_id='') "
+            "ORDER BY time_updated DESC LIMIT 1"
+        );
+        if (sessions.empty() || sessions.front().empty() || sessions.front()[0].empty()) {
+            return local;
+        }
+
+        const std::string sessionId = sessions.front()[0];
+        const std::string sessionSql = SqlQuote(sessionId);
+
+        auto modelRows = db.Query(
+            "SELECT model_id,status,started_at,COALESCE(first_token_at,0),input_tokens,output_tokens,"
+            "reasoning_tokens,cache_creation_input_tokens,cache_read_input_tokens,computed_total_tokens,"
+            "COALESCE(raw_usage_json,''),COALESCE(provider_metadata_json,''),provider_id,query_source "
+            "FROM model_usage WHERE session_id=" + sessionSql +
+            " AND (query_source='main_turn' OR query_source='main') "
+            "ORDER BY started_at DESC, attempt_index DESC LIMIT 1"
+        );
+        if (modelRows.empty()) {
+            modelRows = db.Query(
+                "SELECT model_id,status,started_at,COALESCE(first_token_at,0),input_tokens,output_tokens,"
+                "reasoning_tokens,cache_creation_input_tokens,cache_read_input_tokens,computed_total_tokens,"
+                "COALESCE(raw_usage_json,''),COALESCE(provider_metadata_json,''),provider_id,query_source "
+                "FROM model_usage WHERE session_id=" + sessionSql +
+                " ORDER BY started_at DESC, attempt_index DESC LIMIT 1"
+            );
+        }
+
+        if (!modelRows.empty() && modelRows.front().size() >= 14) {
+            const auto& row = modelRows.front();
+            local.model = row[0];
+            const std::string status = Text::get_instance()->ToLowerCopy(row[1]);
+            const long long startedAt = MillisecondsOrSecondsToUnixSeconds(ParsePositiveLongLong(row[2]));
+            const long long input = ParsePositiveLongLong(row[4]);
+            const long long output = ParsePositiveLongLong(row[5]);
+            const long long reasoning = ParsePositiveLongLong(row[6]);
+            const long long cacheWrite = ParsePositiveLongLong(row[7]);
+            const long long cacheRead = ParsePositiveLongLong(row[8]);
+            const long long computed = ParsePositiveLongLong(row[9]);
+
+            local.context.inputTokens = input;
+            local.context.outputTokens = output;
+            local.context.reasoningOutputTokens = reasoning;
+            local.context.cachedInputTokens = cacheRead;
+            local.context.usedTokens = input + output;
+            local.context.model = local.model;
+            local.context.sourceLabel = "ZCode live session database · direct read-only";
+
+            local.context.cacheStatsValid = input > 0 || cacheRead > 0 || cacheWrite > 0;
+            local.context.cacheInputTokens = input;
+            local.context.cacheReadTokens = cacheRead;
+            local.context.cacheWriteTokens = cacheWrite;
+            if (input > 0) {
+                local.context.latestCacheHitPercentValid = true;
+                local.context.latestCacheHitPercent = std::clamp(
+                    static_cast<double>(cacheRead) * 100.0 / static_cast<double>(input),
+                    0.0,
+                    100.0
+                );
+            }
+
+            local.run.valid = true;
+            local.run.running = status == "running";
+            local.run.thinking = local.run.running;
+            local.run.startedAtUnixSeconds = startedAt;
+            local.run.tokenStatsValid = input > 0 || output > 0 || reasoning > 0 || cacheRead > 0 || cacheWrite > 0;
+            local.run.currentTokens = output;
+            local.run.inputTokens = input;
+            local.run.rawInputTokens = input;
+            local.run.cacheCreationInputTokens = cacheWrite;
+            local.run.cacheReadInputTokens = cacheRead;
+            local.run.reasoningOutputTokens = reasoning;
+            local.run.tokens = computed > 0 ? computed : input + output;
+
+            for (const std::string& blob : { row[10], row[11] }) {
+                if (blob.empty()) continue;
+                const json metadata = json::parse(blob, nullptr, false);
+                if (!metadata.is_discarded()) {
+                    ApplyZCodeRuntimeJson(metadata, local.context);
+                }
+            }
+        }
+
+        // turn_usage has cumulative counters for the whole active user turn.
+        // Use them only to enrich a currently-running model request; do not
+        // call tool execution between model requests "THINKING".
+        const auto turnRows = db.Query(
+            "SELECT status,started_at,input_tokens,output_tokens,reasoning_tokens,"
+            "cache_creation_input_tokens,cache_read_input_tokens,computed_total_tokens "
+            "FROM turn_usage WHERE session_id=" + sessionSql +
+            " ORDER BY started_at DESC LIMIT 1"
+        );
+        if (local.run.running && !turnRows.empty() && turnRows.front().size() >= 8) {
+            const auto& row = turnRows.front();
+            const std::string turnStatus = Text::get_instance()->ToLowerCopy(row[0]);
+            if (turnStatus == "running") {
+                const long long started =
+                    MillisecondsOrSecondsToUnixSeconds(ParsePositiveLongLong(row[1]));
+                if (started > 0) local.run.startedAtUnixSeconds = started;
+
+                const long long input = ParsePositiveLongLong(row[2]);
+                const long long output = ParsePositiveLongLong(row[3]);
+                const long long reasoning = ParsePositiveLongLong(row[4]);
+                const long long cacheWrite = ParsePositiveLongLong(row[5]);
+                const long long cacheRead = ParsePositiveLongLong(row[6]);
+                const long long computed = ParsePositiveLongLong(row[7]);
+                if (input > 0 || output > 0 || reasoning > 0 ||
+                    cacheWrite > 0 || cacheRead > 0) {
+                    local.run.tokenStatsValid = true;
+                    local.run.inputTokens = input;
+                    local.run.rawInputTokens = input;
+                    local.run.cacheCreationInputTokens = cacheWrite;
+                    local.run.cacheReadInputTokens = cacheRead;
+                    local.run.reasoningOutputTokens = reasoning;
+                    local.run.tokens = computed > 0 ? computed : input + output;
+                }
+            }
+        }
+
+        // ZCode's runtime context surface is model-agnostic. Resolve the max
+        // window from the active model's local registry when the request row
+        // did not persist it. This supports every model ZCode adds to config,
+        // rather than hard-coding only GLM-5.x names in AQC.
+        if (local.context.contextWindowTokens <= 0 && !local.model.empty()) {
+            local.context.contextWindowTokens = ZCodeConfiguredContextWindow(local.model);
+        }
+
+        const auto aggregate = db.Query(
+            "SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(cache_read_input_tokens),0),"
+            "COALESCE(SUM(cache_creation_input_tokens),0) FROM model_usage WHERE session_id=" +
+            sessionSql + " AND (query_source='main_turn' OR query_source='main') "
+            "AND status IN ('running','completed')"
+        );
+        if (!aggregate.empty() && aggregate.front().size() >= 3) {
+            const long long totalInput = ParsePositiveLongLong(aggregate.front()[0]);
+            const long long totalRead = ParsePositiveLongLong(aggregate.front()[1]);
+            const long long totalWrite = ParsePositiveLongLong(aggregate.front()[2]);
+            local.context.totalCacheInputTokens = totalInput;
+            local.context.totalCacheReadTokens = totalRead;
+            local.context.totalCacheWriteTokens = totalWrite;
+            if (totalInput > 0) {
+                local.context.averageCacheHitPercentValid = true;
+                local.context.averageCacheHitPercent = std::clamp(
+                    static_cast<double>(totalRead) * 100.0 / static_cast<double>(totalInput),
+                    0.0,
+                    100.0
+                );
+                local.context.cacheStatsValid = true;
+            }
+        }
+
+        // Exact persisted compact markers win. Never infer compaction merely
+        // because the context is near a threshold: ZCode exposes an explicit
+        // compact turn/status, so false COMPACTING states are unnecessary.
+        const auto entries = db.Query(
+            "SELECT data FROM session_entry WHERE session_id=" + sessionSql +
+            " ORDER BY time_updated DESC LIMIT 32"
+        );
+
+        // Apply oldest -> newest so the newest runtime context wins.
+        for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+            if (it->empty() || (*it)[0].empty()) continue;
+            const json entry = json::parse((*it)[0], nullptr, false);
+            if (!entry.is_discarded()) {
+                ApplyZCodeRuntimeJson(entry, local.context);
+            }
+        }
+
+        // Resolve compact state newest -> oldest and stop at the first explicit
+        // runtime marker. A historic "compact: running" event must never keep
+        // a later completed/regular turn stuck in COMPACTING.
+        for (const auto& row : entries) {
+            if (row.empty() || row[0].empty()) continue;
+            const json entry = json::parse(row[0], nullptr, false);
+            if (entry.is_discarded()) continue;
+            const auto compactState = ZCodeCompactionStateFromJson(entry);
+            if (!compactState) continue;
+            local.context.compacting = *compactState;
+            if (*compactState && sessions.front().size() > 1) {
+                local.context.compactionStartedAtUnixSeconds =
+                    MillisecondsOrSecondsToUnixSeconds(
+                        ParsePositiveLongLong(sessions.front()[1]));
+            }
+            break;
+        }
+
+        if (local.context.autoCompactThresholdTokens > 0 && local.context.usedTokens >= 0) {
+            const long long threshold = local.context.autoCompactThresholdTokens;
+            const long long used = std::clamp(local.context.usedTokens, 0LL, threshold);
+            local.context.autoCompactPercentValid = true;
+            local.context.autoCompactPercentLeft = static_cast<int>(std::clamp(
+                std::llround(
+                    static_cast<double>(threshold - used) * 100.0 /
+                    static_cast<double>(threshold)
+                ),
+                0LL,
+                100LL
+            ));
+        }
+
+        local.context.valid = local.context.usedTokens > 0 &&
+            local.context.contextWindowTokens > 0;
+        return local;
+    }
+
+
+    LocalTelemetry ReadLocalTelemetry()
+    {
+        const ZCodeLocalTelemetry local = ReadZCodeLocalTelemetry();
+        LocalTelemetry result;
+        result.context = local.context;
+        result.run = local.run;
+        return result;
+    }
+
+    static void ApplyLocalTelemetryToSnapshot(
+        Snapshot& snapshot,
+        const ZCodeLocalTelemetry& local
+    ) {
+        snapshot.context = local.context;
+        snapshot.run = local.run;
+    }
+
+
+    static std::string NormalizeModelName(std::string label)
+    {
+        const std::string compact = CompactLower(label);
+
+        if (compact.find("turbo") != std::string::npos &&
+            compact.find("glm") != std::string::npos) {
+            return "GLM-5-Turbo";
+        }
+        if (compact.find("glm53") != std::string::npos ||
+            compact.find("glm5.3") != std::string::npos) {
+            return "GLM-5.3";
+        }
+        if (compact.find("glm52") != std::string::npos ||
+            compact.find("glm5.2") != std::string::npos) {
             return "GLM-5.2";
         }
 
@@ -377,16 +1143,19 @@ namespace ZAi
 
     static bool IsZaiModelLabel(const std::string& label)
     {
-        std::string normalized = NormalizeModelName(label);
-        return normalized == "GLM-5.2" || normalized == "GLM-5-Turbo";
+        const std::string normalized = NormalizeModelName(label);
+        const std::string compact = CompactLower(normalized);
+        // Keep future/new GLM models instead of dropping them merely because
+        // AQC did not know their name at compile time.
+        return compact.rfind("glm", 0) == 0;
     }
 
     static int ModelSortRank(const std::string& label)
     {
-        std::string normalized = NormalizeModelName(label);
-
-        if (normalized == "GLM-5.2") return 0;
-        if (normalized == "GLM-5-Turbo") return 1;
+        const std::string normalized = NormalizeModelName(label);
+        if (normalized == "GLM-5.3") return 0;
+        if (normalized == "GLM-5.2") return 1;
+        if (normalized == "GLM-5-Turbo") return 2;
         return 10;
     }
 
@@ -921,6 +1690,8 @@ namespace ZAi
     {
         Snapshot snapshot;
         snapshot.lastUpdated = "now";
+        const ZCodeLocalTelemetry local = ReadZCodeLocalTelemetry();
+        ApplyLocalTelemetryToSnapshot(snapshot, local);
 
         std::vector<std::string> tokens = LoadCandidateTokens();
 
@@ -964,6 +1735,7 @@ namespace ZAi
         for (const std::string& token : tokens) {
             Snapshot candidate;
             candidate.lastUpdated = "now";
+            ApplyLocalTelemetryToSnapshot(candidate, local);
             bool activeStartPlan = false;
             bool usableUsageData = false;
             bool receivedSuccessfulResponse = false;

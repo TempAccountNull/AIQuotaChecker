@@ -9,6 +9,7 @@
 
 #include <windows.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cmath>
@@ -18,6 +19,7 @@
 #include <fstream>
 #include <iomanip>
 #include <initializer_list>
+#include <mutex>
 #include <optional>
 #include <utility>
 #include <sstream>
@@ -29,6 +31,21 @@ using json = nlohmann::json;
 
 namespace Codex {
 
+
+    // Explicit user/effective override returned by Codex app-server config/read.
+    // A zero value is normal: Codex usually derives the compaction edge from
+    // the active model catalog instead of materializing it in config/read.
+    static std::atomic<long long> g_modelAutoCompactTokenLimit{ 0 };
+    // Effective context window returned by Codex app-server config/read. This
+    // is a model-agnostic fallback when a freshly created local thread has not
+    // emitted its first token_count model_context_window yet.
+    static std::atomic<long long> g_modelContextWindow{ 0 };
+    static std::mutex g_configModelMutex;
+    static std::string g_configModel;
+    // 0 = total (Codex default), 1 = body_after_prefix. The latter needs a
+    // different numerator than total active-context tokens, so AQC only shows
+    // the countdown when it has trustworthy accounting for the selected scope.
+    static std::atomic<int> g_modelAutoCompactTokenLimitScope{ 0 };
 
     static std::filesystem::path CodexHomePath() {
         std::string configuredHome = Network::get_instance()->GetEnvText("CODEX_HOME");
@@ -2175,9 +2192,208 @@ namespace Codex {
         long long outputTokens = 0;
         long long reasoningOutputTokens = 0;
         long long modelContextWindow = 0;
+        long long modelAutoCompactTokenLimit = 0;
         bool cumulativeValid = false;
         long long cumulativeTotalTokens = 0;
     };
+
+    struct CodexModelCompactionMetadata {
+        bool valid = false;
+        long long contextWindow = 0;
+        long long autoCompactTokenLimit = 0;
+        int effectiveContextWindowPercent = 0;
+    };
+
+    static const json* FindCodexModelMetadataRecursive(
+        const json& value,
+        const std::string& model,
+        int depth = 0
+    ) {
+        if (depth > 8 || model.empty()) {
+            return nullptr;
+        }
+
+        if (value.is_object()) {
+            const std::string slug = ReadStringFlexible(
+                value,
+                { "slug", "model", "id" }
+            );
+
+            if (slug == model) {
+                return &value;
+            }
+
+            for (auto it = value.begin(); it != value.end(); ++it) {
+                if (const json* found = FindCodexModelMetadataRecursive(
+                    it.value(),
+                    model,
+                    depth + 1
+                )) {
+                    return found;
+                }
+            }
+        }
+        else if (value.is_array()) {
+            for (const json& item : value) {
+                if (const json* found = FindCodexModelMetadataRecursive(
+                    item,
+                    model,
+                    depth + 1
+                )) {
+                    return found;
+                }
+            }
+        }
+
+        return nullptr;
+    }
+
+    static CodexModelCompactionMetadata ReadCodexModelCompactionMetadata(
+        const std::string& model
+    ) {
+        CodexModelCompactionMetadata metadata;
+
+        if (model.empty()) {
+            return metadata;
+        }
+
+        const std::filesystem::path cachePath = CodexHomePath() / "models_cache.json";
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(cachePath, ec) || ec) {
+            return metadata;
+        }
+
+        const std::string text = Network::get_instance()->ReadTextFile(cachePath);
+        if (text.empty()) {
+            return metadata;
+        }
+
+        const json root = json::parse(text, nullptr, false);
+        if (root.is_discarded()) {
+            return metadata;
+        }
+
+        const json* modelObject = FindCodexModelMetadataRecursive(root, model);
+        if (!modelObject) {
+            return metadata;
+        }
+
+        auto readPositiveCount = [](const json& object, std::initializer_list<const char*> keys) {
+            const std::optional<double> value = ReadNumberFlexible(object, keys);
+            if (!value || !std::isfinite(*value) || *value <= 0.0) {
+                return 0LL;
+            }
+            return static_cast<long long>(std::floor(*value));
+        };
+
+        metadata.contextWindow = readPositiveCount(
+            *modelObject,
+            { "context_window", "contextWindow", "max_context_window", "maxContextWindow" }
+        );
+        metadata.autoCompactTokenLimit = readPositiveCount(
+            *modelObject,
+            { "auto_compact_token_limit", "autoCompactTokenLimit" }
+        );
+
+        const long long effectivePercent = readPositiveCount(
+            *modelObject,
+            { "effective_context_window_percent", "effectiveContextWindowPercent" }
+        );
+        if (effectivePercent > 0 && effectivePercent <= 100) {
+            metadata.effectiveContextWindowPercent = static_cast<int>(effectivePercent);
+        }
+
+        metadata.valid = metadata.contextWindow > 0 ||
+            metadata.autoCompactTokenLimit > 0 ||
+            metadata.effectiveContextWindowPercent > 0;
+        return metadata;
+    }
+
+    static long long ResolveCodexContextWindowForModel(const std::string& model)
+    {
+        const long long configured = g_modelContextWindow.load();
+        if (configured > 0) {
+            std::string configuredModel;
+            {
+                std::lock_guard<std::mutex> lock(g_configModelMutex);
+                configuredModel = g_configModel;
+            }
+            // config/read reflects the configured model, while a thread may
+            // temporarily use a different per-thread selection. Never apply a
+            // context override captured for one model to another model.
+            if (configuredModel.empty() || model.empty() || configuredModel == model) {
+                return configured;
+            }
+        }
+
+        const CodexModelCompactionMetadata metadata =
+            ReadCodexModelCompactionMetadata(model);
+        if (!metadata.valid || metadata.contextWindow <= 0) {
+            return 0;
+        }
+
+        if (metadata.effectiveContextWindowPercent > 0 &&
+            metadata.effectiveContextWindowPercent <= 100) {
+            return static_cast<long long>(std::llround(
+                static_cast<double>(metadata.contextWindow) *
+                static_cast<double>(metadata.effectiveContextWindowPercent) / 100.0
+            ));
+        }
+        return metadata.contextWindow;
+    }
+
+    static long long ResolveCodexDefaultAutoCompactTokenLimit(
+        const std::string& model,
+        long long liveEffectiveContextWindow
+    ) {
+        const CodexModelCompactionMetadata metadata =
+            ReadCodexModelCompactionMetadata(model);
+
+        if (!metadata.valid) {
+            return 0;
+        }
+
+        // Token telemetry reports Codex's effective modelContextWindow, while
+        // the model catalog stores the raw context window plus the percentage
+        // considered usable. Convert the LIVE window back to the corresponding
+        // raw catalog window so stale cache sizes cannot override live session
+        // accounting. Codex then derives the default auto-compact edge at 90%
+        // of that raw window.
+        long long rawContextWindow = 0;
+        if (liveEffectiveContextWindow > 0 && metadata.effectiveContextWindowPercent > 0) {
+            rawContextWindow = static_cast<long long>(std::llround(
+                static_cast<double>(liveEffectiveContextWindow) * 100.0 /
+                static_cast<double>(metadata.effectiveContextWindowPercent)
+            ));
+        }
+        else if (metadata.contextWindow > 0 &&
+            liveEffectiveContextWindow == metadata.contextWindow) {
+            // Some catalogs use 100% as the effective window and may omit the
+            // percentage in older cache formats.
+            rawContextWindow = metadata.contextWindow;
+        }
+
+        if (rawContextWindow <= 0) {
+            return 0;
+        }
+
+        const long long ninetyPercentOfContext =
+            (rawContextWindow / 10LL) * 9LL +
+            ((rawContextWindow % 10LL) * 9LL) / 10LL;
+
+        if (ninetyPercentOfContext <= 0) {
+            return 0;
+        }
+
+        // A model-specific catalog limit, when present, is itself clamped by
+        // Codex to 90% of the resolved raw model context window. When absent,
+        // 90% is Codex's default automatic-compaction limit.
+        if (metadata.autoCompactTokenLimit > 0) {
+            return (std::min)(metadata.autoCompactTokenLimit, ninetyPercentOfContext);
+        }
+
+        return ninetyPercentOfContext;
+    }
 
     static long long CodexRecordUnixSeconds(const json& record) {
         if (!record.is_object() || !record.contains("timestamp")) {
@@ -2243,6 +2459,19 @@ namespace Codex {
             *info,
             { "model_context_window", "modelContextWindow" }
         );
+        // Some/newer transcript shapes may carry the effective threshold next
+        // to token usage. Prefer it whenever present; otherwise the app-server
+        // config/read cache below supplies the value.
+        usage.modelAutoCompactTokenLimit = readCount(
+            *info,
+            { "model_auto_compact_token_limit", "modelAutoCompactTokenLimit" }
+        );
+        if (usage.modelAutoCompactTokenLimit <= 0) {
+            usage.modelAutoCompactTokenLimit = readCount(
+                *payload,
+                { "model_auto_compact_token_limit", "modelAutoCompactTokenLimit" }
+            );
+        }
 
         if (usage.totalTokens <= 0) {
             usage.totalTokens = std::max(0LL, usage.inputTokens + usage.outputTokens);
@@ -2539,6 +2768,8 @@ namespace Codex {
         bool foundUsage = false;
         bool compacting = false;
         long long lastRetainedTokens = 0;
+        long long latestTotalTokens = 0;
+        long long latestRecordAutoCompactTokenLimit = 0;
         long long preCompactionTokens = 0;
         bool waitingForPostCompactionUsage = false;
 
@@ -2645,6 +2876,8 @@ namespace Codex {
                 context.cachedInputTokens = usage.cachedInputTokens;
                 context.outputTokens = usage.outputTokens;
                 context.reasoningOutputTokens = usage.reasoningOutputTokens;
+                latestTotalTokens = usage.totalTokens;
+                latestRecordAutoCompactTokenLimit = usage.modelAutoCompactTokenLimit;
 
                 // Codex's own context accounting excludes reasoning output from
                 // the tokens retained in the active model context. Keep the raw
@@ -2664,12 +2897,60 @@ namespace Codex {
                 }
 
                 context.valid = context.usedTokens > 0 && context.contextWindowTokens > 0;
+
                 context.sourceLabel = "Newest local Codex thread · direct read-only metadata";
                 foundUsage = context.valid;
             }
 
             if (foundUsage && !context.model.empty()) {
                 break;
+            }
+        }
+
+        // New/changed Codex models are resolved from live config or the local
+        // models_cache catalog instead of a hard-coded model-name table. This
+        // also fills the brief gap before token_count persists its own window.
+        if (context.usedTokens > 0 && context.contextWindowTokens <= 0) {
+            context.contextWindowTokens = ResolveCodexContextWindowForModel(context.model);
+        }
+        context.valid = context.usedTokens > 0 && context.contextWindowTokens > 0;
+
+        if (context.valid && g_modelAutoCompactTokenLimitScope.load() == 0) {
+            // Priority matches Codex itself: per-event/effective metadata first,
+            // then an explicit config override, then the active model's catalog
+            // default. config/read commonly returns null for the limit because
+            // the normal default belongs to ModelInfo, not Config.
+            long long autoCompactThreshold = latestRecordAutoCompactTokenLimit;
+            if (autoCompactThreshold <= 0) {
+                autoCompactThreshold = g_modelAutoCompactTokenLimit.load();
+            }
+            if (autoCompactThreshold <= 0) {
+                autoCompactThreshold = ResolveCodexDefaultAutoCompactTokenLimit(
+                    context.model,
+                    context.contextWindowTokens
+                );
+            }
+
+            if (autoCompactThreshold > 0) {
+                // The live modelContextWindow is already the effective usable
+                // context (for example 272k * 95% = 258.4k). Codex's normal
+                // auto-compact threshold can therefore legitimately be below
+                // this displayed window.
+                context.autoCompactThresholdTokens = autoCompactThreshold;
+                const long long autoCompactUsedTokens = std::clamp(
+                    latestTotalTokens > 0 ? latestTotalTokens : context.usedTokens,
+                    0LL,
+                    context.autoCompactThresholdTokens
+                );
+                const double percentLeft =
+                    (static_cast<double>(context.autoCompactThresholdTokens - autoCompactUsedTokens) /
+                        static_cast<double>(context.autoCompactThresholdTokens)) * 100.0;
+                context.autoCompactPercentValid = true;
+                context.autoCompactPercentLeft = static_cast<int>(std::clamp(
+                    std::llround(percentLeft),
+                    0LL,
+                    100LL
+                ));
             }
         }
 
@@ -2682,6 +2963,84 @@ namespace Codex {
 
     UsageTelemetry::ContextUsage ReadLocalContextUsage() {
         return ReadLatestCodexTelemetry().context;
+    }
+
+    static std::string ReadConfiguredModel(const json& configResult) {
+        if (!configResult.is_object()) {
+            return {};
+        }
+        const json* config = &configResult;
+        if (configResult.contains("config") && configResult.at("config").is_object()) {
+            config = &configResult.at("config");
+        }
+        return ReadStringFlexible(*config, { "model" });
+    }
+
+    static long long ReadModelContextWindow(const json& configResult) {
+        if (!configResult.is_object()) {
+            return 0;
+        }
+        const json* config = &configResult;
+        if (configResult.contains("config") && configResult.at("config").is_object()) {
+            config = &configResult.at("config");
+        }
+        const std::optional<double> value = ReadNumberFlexible(
+            *config, { "model_context_window", "modelContextWindow" });
+        if (!value || !std::isfinite(*value) || *value <= 0.0) {
+            return 0;
+        }
+        return static_cast<long long>(std::floor(*value));
+    }
+
+    static long long ReadModelAutoCompactTokenLimit(const json& configResult) {
+        if (!configResult.is_object()) {
+            return 0;
+        }
+
+        const json* config = &configResult;
+        if (configResult.contains("config") && configResult.at("config").is_object()) {
+            config = &configResult.at("config");
+        }
+
+        const std::optional<double> value = ReadNumberFlexible(
+            *config,
+            { "model_auto_compact_token_limit", "modelAutoCompactTokenLimit" }
+        );
+
+        if (!value || !std::isfinite(*value) || *value <= 0.0) {
+            return 0;
+        }
+
+        return static_cast<long long>(std::floor(*value));
+    }
+
+    static int ReadModelAutoCompactTokenLimitScope(const json& configResult) {
+        // Codex defaults this setting to Total. Only BodyAfterPrefix needs
+        // special handling because the ordinary total-token telemetry cannot
+        // be used as the numerator for that scope.
+        if (!configResult.is_object()) {
+            return 0;
+        }
+
+        const json* config = &configResult;
+        if (configResult.contains("config") && configResult.at("config").is_object()) {
+            config = &configResult.at("config");
+        }
+
+        std::string scope = UsageTelemetry::LowerCopy(ReadStringFlexible(
+            *config,
+            { "model_auto_compact_token_limit_scope", "modelAutoCompactTokenLimitScope" }
+        ));
+
+        scope.erase(std::remove_if(scope.begin(), scope.end(), [](unsigned char ch) {
+            return ch == '_' || ch == '-';
+        }), scope.end());
+
+        if (scope == "bodyafterprefix") {
+            return 1;
+        }
+
+        return 0;
     }
 
     static void FinalizeCodexAccess(Snapshot& snapshot) {
@@ -2753,6 +3112,17 @@ namespace Codex {
     Snapshot FetchSnapshot(AccountSource source, const std::string& customAuthPath) {
         Snapshot snapshot;
 
+        // Never carry an old explicit auto-compact override/scope into a new
+        // refresh. If no override is returned, local telemetry resolves the
+        // active model's normal catalog-derived threshold instead.
+        g_modelAutoCompactTokenLimit.store(0);
+        g_modelContextWindow.store(0);
+        {
+            std::lock_guard<std::mutex> lock(g_configModelMutex);
+            g_configModel.clear();
+        }
+        g_modelAutoCompactTokenLimitScope.store(0);
+
         if (source == AccountSource::AuthFile) {
             snapshot = FetchSnapshotFromAuthFile(
                 DefaultAuthPath(),
@@ -2780,6 +3150,19 @@ namespace Codex {
         CodexAppServer::Result current = CodexAppServer::ReadCurrentAccountRateLimits();
 
         if (current.kind == CodexAppServer::ResultKind::Success) {
+            g_modelAutoCompactTokenLimit.store(
+                ReadModelAutoCompactTokenLimit(current.configResult)
+            );
+            {
+                std::lock_guard<std::mutex> lock(g_configModelMutex);
+                g_configModel = ReadConfiguredModel(current.configResult);
+            }
+            g_modelContextWindow.store(
+                ReadModelContextWindow(current.configResult)
+            );
+            g_modelAutoCompactTokenLimitScope.store(
+                ReadModelAutoCompactTokenLimitScope(current.configResult)
+            );
             snapshot = ParseAppServerSnapshot(current.accountResult, current.rateLimitsResult);
             FinalizeCodexAccess(snapshot);
             return snapshot;

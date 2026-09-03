@@ -21,6 +21,7 @@
 #include <fstream>
 #include <iomanip>
 #include <initializer_list>
+#include <mutex>
 #include <utility>
 #include <unordered_map>
 #include <optional>
@@ -1277,7 +1278,165 @@ namespace Claude {
         long long lastActivityAtMs = 0;
         long long lastFocusedAtMs = 0;
         long long completedTurns = 0;
+        std::string selectedModel;
     };
+
+    static std::string ClaudeSelectedModelFromJson(const json& value, int depth = 0) {
+        if (depth > 12) {
+            return {};
+        }
+        if (value.is_object()) {
+            // Claude Desktop stores picker state by surface. For a Code/Cowork
+            // session prefer those surfaces over chat, but preserve the exact
+            // selected value (including an explicit "[1m]" suffix). Returning
+            // the standard selection too is important: it prevents a different
+            // surface's saved 1M choice from overriding a known 200K session.
+            auto selector = value.find("__model_selector_state");
+            if (selector != value.end() && selector->is_object()) {
+                for (const char* surface : { "code", "cowork", "chat" }) {
+                    auto surfaceIt = selector->find(surface);
+                    if (surfaceIt == selector->end() || !surfaceIt->is_object()) continue;
+                    auto model = surfaceIt->find("model");
+                    if (model != surfaceIt->end() && model->is_string()) {
+                        const std::string candidate = model->get<std::string>();
+                        if (!candidate.empty()) return candidate;
+                    }
+                }
+                for (auto it = selector->begin(); it != selector->end(); ++it) {
+                    if (!it.value().is_object()) continue;
+                    auto model = it.value().find("model");
+                    if (model != it.value().end() && model->is_string()) {
+                        const std::string candidate = model->get<std::string>();
+                        if (!candidate.empty()) return candidate;
+                    }
+                }
+            }
+
+            for (const char* key : { "selectedModel", "selected_model", "model" }) {
+                auto it = value.find(key);
+                if (it != value.end() && it->is_string()) {
+                    const std::string candidate = it->get<std::string>();
+                    if (!candidate.empty()) return candidate;
+                }
+            }
+
+            for (auto it = value.begin(); it != value.end(); ++it) {
+                if (it.value().is_object() || it.value().is_array()) {
+                    std::string candidate = ClaudeSelectedModelFromJson(it.value(), depth + 1);
+                    if (!candidate.empty()) return candidate;
+                }
+            }
+        }
+        else if (value.is_array()) {
+            for (const json& item : value) {
+                std::string candidate = ClaudeSelectedModelFromJson(item, depth + 1);
+                if (!candidate.empty()) return candidate;
+            }
+        }
+        return {};
+    }
+
+    static std::filesystem::path ClaudeDesktopUserDataRoot() {
+        const std::string customUserData =
+            Network::get_instance()->GetEnvText("CLAUDE_USER_DATA_DIR");
+        if (!customUserData.empty()) {
+            return std::filesystem::path(customUserData);
+        }
+        const std::string localAppData = Network::get_instance()->GetEnvText("LOCALAPPDATA");
+        if (localAppData.empty()) {
+            return {};
+        }
+        return std::filesystem::path(localAppData) / "Claude-3p";
+    }
+
+    static std::string LatestClaudeDesktopSelectedModel() {
+        struct Cache {
+            long long checkedAt = 0;
+            std::string model;
+        };
+        static Cache cache;
+        static std::mutex cacheMutex;
+        std::lock_guard<std::mutex> lock(cacheMutex);
+
+        const long long now = static_cast<long long>(std::time(nullptr));
+        if (cache.checkedAt > 0 && now >= cache.checkedAt && now - cache.checkedAt < 5) {
+            return cache.model;
+        }
+        cache.checkedAt = now;
+        cache.model.clear();
+
+        std::filesystem::path root = ClaudeDesktopUserDataRoot();
+        std::error_code ec;
+        if (root.empty()) {
+            return {};
+        }
+        // The Desktop ASAR stores account settings under
+        // userData/local-agent-mode-sessions/<account>/<org>/.
+        const std::filesystem::path accountRoot = root / "local-agent-mode-sessions";
+        if (std::filesystem::exists(accountRoot, ec) && !ec) {
+            root = accountRoot;
+        }
+        ec.clear();
+        if (!std::filesystem::exists(root, ec) || ec) {
+            return {};
+        }
+
+        struct Candidate {
+            std::filesystem::path path;
+            std::filesystem::file_time_type writeTime{};
+        };
+        std::vector<Candidate> files;
+        std::filesystem::recursive_directory_iterator it(
+            root,
+            std::filesystem::directory_options::skip_permission_denied,
+            ec
+        );
+        const std::filesystem::recursive_directory_iterator end;
+        for (; it != end; it.increment(ec)) {
+            if (ec) { ec.clear(); continue; }
+            const auto& entry = *it;
+            if (!entry.is_regular_file(ec) || ec) { ec.clear(); continue; }
+            if (ToLowerAscii(entry.path().filename().string()) != "cowork_account_settings.json") {
+                continue;
+            }
+            const auto writeTime = entry.last_write_time(ec);
+            if (ec) { ec.clear(); continue; }
+            files.push_back({ entry.path(), writeTime });
+        }
+        std::sort(files.begin(), files.end(), [](const Candidate& a, const Candidate& b) {
+            return a.writeTime > b.writeTime;
+        });
+        if (files.size() > 16) files.resize(16);
+
+        for (const Candidate& file : files) {
+            const std::string raw = ReadClaudeTailSharedReadOnly(file.path, 4ULL * 1024ULL * 1024ULL);
+            if (raw.empty()) continue;
+            const json value = json::parse(raw, nullptr, false);
+            if (value.is_discarded()) continue;
+            std::string selected = ClaudeSelectedModelFromJson(value);
+            if (!selected.empty()) {
+                cache.model = std::move(selected);
+                break;
+            }
+        }
+        return cache.model;
+    }
+
+    static long long ClaudeDesktopSelectedContextWindowHint(
+        const ClaudeDesktopSessionHint& hint
+    ) {
+        std::string selected = hint.selectedModel;
+        if (selected.empty()) {
+            selected = LatestClaudeDesktopSelectedModel();
+        }
+        const std::string lower = ToLowerAscii(selected);
+        if (lower.find("[1m]") != std::string::npos ||
+            lower.find("context-1m") != std::string::npos ||
+            lower.find("context_1m") != std::string::npos) {
+            return 1000000;
+        }
+        return 0;
+    }
 
     static ClaudeDesktopSessionHint LatestClaudeDesktopSessionHint() {
         const std::filesystem::path root = ClaudeDesktopSessionsRoot();
@@ -1357,6 +1516,7 @@ namespace Claude {
                 0.0,
                 ClaudeNumberAny(value, { "completedTurns" }).value_or(0.0)
             ));
+            hint.selectedModel = ClaudeSelectedModelFromJson(value);
 
             const auto score = [](const ClaudeDesktopSessionHint& h) {
                 return std::max(h.lastFocusedAtMs, h.lastActivityAtMs);
@@ -2308,7 +2468,8 @@ namespace Claude {
     }
 
     static LocalTelemetry ReadClaudeLocalTelemetryFromSession(
-        const std::filesystem::path& session
+        const std::filesystem::path& session,
+        long long contextWindowHint = 0
     ) {
         LocalTelemetry local;
         UsageTelemetry::ContextUsage& context = local.context;
@@ -2563,6 +2724,11 @@ namespace Claude {
             }
         }
 
+        if (contextWindowTokens <= 0 && contextWindowHint > 0) {
+            contextWindowTokens = contextWindowHint;
+            modelWindowFallback = false;
+        }
+
         if (contextWindowTokens <= 0) {
             contextWindowTokens = KnownClaudeContextWindowForModel(model);
             modelWindowFallback = contextWindowTokens > 0;
@@ -2591,13 +2757,21 @@ namespace Claude {
         context.model = model;
         context.sourceLabel = modelWindowFallback
             ? "Claude Code session usage + recognized model context limit"
-            : "Claude Code session context metadata · direct read-only";
-        context = ApplyClaudeAutoCompactTelemetry(std::move(context));
+            : "Claude Code session context metadata / selected model · direct read-only";
+        // A guessed model-name fallback is useful for showing a last-resort
+        // context bar, but it must never manufacture an auto-compact edge.
+        // Claude Desktop's selected [1m] state or persisted context metadata is
+        // authoritative; unknown/future model limits remain model-agnostic.
+        if (!modelWindowFallback) {
+            context = ApplyClaudeAutoCompactTelemetry(std::move(context));
+        }
         return local;
     }
 
     static LocalTelemetry ReadLatestClaudeLocalTelemetry() {
         ClaudeDesktopSessionHint desktopHint = LatestClaudeDesktopSessionHint();
+        const long long desktopContextWindowHint =
+            ClaudeDesktopSelectedContextWindowHint(desktopHint);
         std::vector<ClaudeSessionCandidate> candidates = LatestClaudeSessionFiles();
 
         // The supplied Desktop ASAR persists cliSessionId in
@@ -2620,11 +2794,13 @@ namespace Claude {
         }
 
         for (const ClaudeSessionCandidate& candidate : candidates) {
-            LocalTelemetry local = ReadClaudeLocalTelemetryFromSession(candidate.path);
-
             const bool matchesDesktopHint = desktopHint.valid &&
                 !desktopHint.cliSessionId.empty() &&
                 candidate.path.stem().string() == desktopHint.cliSessionId;
+            LocalTelemetry local = ReadClaudeLocalTelemetryFromSession(
+                candidate.path,
+                matchesDesktopHint ? desktopContextWindowHint : 0
+            );
 
             if (matchesDesktopHint && !local.run.running) {
                 const auto age = std::filesystem::file_time_type::clock::now() -
@@ -2645,55 +2821,13 @@ namespace Claude {
                     local.run.valid = true;
                     local.run.running = true;
                     local.run.thinking = true;
-                    local.run.startedAtUnixSeconds = now - (std::max)(0LL, ageSeconds);
+                    local.run.startedAtUnixSeconds = now - (std::max)(0LL, static_cast<long long>(ageSeconds));
                 }
             }
 
-            if (matchesDesktopHint && local.context.valid &&
-                !local.context.compacting &&
-                local.context.autoCompactPercentValid &&
-                local.context.autoCompactPercentLeft <= 1) {
-                const auto clockNow = std::filesystem::file_time_type::clock::now();
-                const auto desktopAge = clockNow - desktopHint.writeTime;
-                const auto transcriptAge = clockNow - candidate.writeTime;
-                const auto desktopAgeSeconds =
-                    std::chrono::duration_cast<std::chrono::seconds>(desktopAge).count();
-                const auto transcriptAgeSeconds =
-                    std::chrono::duration_cast<std::chrono::seconds>(transcriptAge).count();
-
-                // The ASAR confirms isRunning/pendingCycle are in-memory state
-                // and are not serialized by the persisted-session writer. The
-                // transcript may also stop moving while the compaction summary
-                // is generated. The earliest passive signal we can safely use
-                // is therefore: the selected foreground conversation is at the
-                // auto-compact edge AND either its Desktop session or transcript
-                // was recently active, or the transcript already says a run is
-                // active. Once seen, the provider latches COMPACTING until the
-                // compact_boundary/new low-context value arrives.
-                const bool recentlyActive =
-                    (desktopAgeSeconds >= -2 && desktopAgeSeconds <= 60) ||
-                    (transcriptAgeSeconds >= -2 && transcriptAgeSeconds <= 60) ||
-                    local.run.running;
-
-                if (recentlyActive) {
-                    local.context.compacting = true;
-
-                    if (!local.run.running) {
-                        local.run.valid = true;
-                        local.run.running = true;
-                        local.run.thinking = false;
-                        const long long now = static_cast<long long>(std::time(nullptr));
-                        const long long hinted = desktopHint.lastActivityAtMs > 0
-                            ? desktopHint.lastActivityAtMs / 1000
-                            : 0;
-                        local.run.startedAtUnixSeconds =
-                            hinted > 0 && hinted <= now && now - hinted <= 5 * 60
-                                ? hinted
-                                : now;
-                    }
-
-                }
-            }
+            // Compaction state comes only from explicit Claude transcript/provider
+            // markers. Reaching an estimated threshold is not proof that a
+            // compact operation is actually running.
 
             if (local.context.valid || local.context.compacting || local.run.running) {
                 return local;

@@ -452,6 +452,19 @@ static std::string FormatPercent(float value) {
     return Format::get_instance()->Percent(value);
 }
 
+static std::string FormatDetailedPercent(double value) {
+    std::ostringstream out;
+    const double rounded = std::round(value);
+    if (std::fabs(value - rounded) < 0.05) {
+        out << std::fixed << std::setprecision(0) << value;
+    }
+    else {
+        out << std::fixed << std::setprecision(1) << value;
+    }
+    out << "%";
+    return out.str();
+}
+
 static float DisplayPercentValue(float usedPercent) {
     usedPercent = Math::get_instance()->ClampPercentFloat(usedPercent);
 
@@ -1878,7 +1891,7 @@ static void DrawCodexAccessStatus(
     );
 
     const long long nowUnix = static_cast<long long>(std::time(nullptr));
-    const bool runStats = activeRun && run.tokenStatsValid;
+    const bool runStats = run.valid && run.tokenStatsValid && (activeRun || compacting);
     // Do not label the previous request's context counters as live spend
     // while a new Codex turn is still waiting for its first token update.
     const bool contextStats = !activeRun && !compacting && context.valid &&
@@ -1982,6 +1995,119 @@ static void DrawCodexAccessStatus(
     }
 }
 
+static void DrawZAiAccessStatus(
+    const UsageTelemetry::AccessStatus& access,
+    const UsageTelemetry::ContextUsage& context,
+    const UsageTelemetry::RunUsage& run
+)
+{
+    const float contentStartX = ImGui::GetCursorPosX();
+    const float contentRightX = contentStartX + ImGui::GetContentRegionAvail().x;
+
+    // ZCode runtime telemetry is local and independent of the billing API. If
+    // the quota endpoint is temporarily unavailable, an explicit live local
+    // turn/compact marker is still authoritative for the transient status.
+    const bool compacting = context.compacting;
+    const bool activeRun = !compacting && run.valid && run.running;
+
+    std::string stateLabel;
+    if (compacting) stateLabel = "COMPACTING";
+    else if (activeRun) stateLabel = "THINKING";
+    else {
+        const char* label = AccessStateLabel(access.state);
+        stateLabel = label ? label : "";
+    }
+    if (stateLabel.empty()) return;
+
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f, 0.92f, 0.92f, 1.0f));
+    ImGui::TextUnformatted("Status:");
+    ImGui::PopStyleColor();
+    ImGui::SameLine(0.0f, 5.0f);
+    DrawClaudeStatusValue(stateLabel.c_str(), activeRun, false, compacting, access.state);
+
+    const long long nowUnix = static_cast<long long>(std::time(nullptr));
+    const bool runStats = run.valid && run.tokenStatsValid && (activeRun || compacting);
+    const bool contextStats = !activeRun && !compacting && context.valid &&
+        (context.inputTokens > 0 || context.outputTokens > 0 ||
+            context.cachedInputTokens > 0 || context.cacheReadTokens > 0);
+    const bool haveStats = runStats || contextStats;
+
+    long long input = 0;
+    long long output = 0;
+    long long cacheRead = 0;
+    long long cacheCreate = 0;
+    long long reasoning = 0;
+    long long total = 0;
+
+    if (runStats) {
+        input = run.inputTokens;
+        output = run.currentTokens;
+        cacheRead = run.cacheReadInputTokens;
+        cacheCreate = run.cacheCreationInputTokens;
+        reasoning = run.reasoningOutputTokens;
+        total = run.tokens > 0 ? run.tokens : std::max(0LL, input + output);
+    }
+    else if (contextStats) {
+        input = context.inputTokens;
+        output = context.outputTokens;
+        cacheRead = context.cacheReadTokens > 0
+            ? context.cacheReadTokens : context.cachedInputTokens;
+        cacheCreate = context.cacheWriteTokens;
+        reasoning = context.reasoningOutputTokens;
+        total = std::max(0LL, input + output);
+    }
+
+    if (activeRun || compacting || haveStats) {
+        std::string telemetry;
+        if (activeRun || compacting) {
+            const long long timerStart = compacting && context.compactionStartedAtUnixSeconds > 0
+                ? context.compactionStartedAtUnixSeconds : run.startedAtUnixSeconds;
+            const long long elapsed = timerStart > 0 && nowUnix >= timerStart
+                ? nowUnix - timerStart : 0;
+            telemetry = FormatRunDuration(elapsed);
+        }
+        if (haveStats) {
+            if (!telemetry.empty()) telemetry += " · ";
+            telemetry += ((activeRun || compacting) ? "Total Tokens: " : "Last request: ") +
+                FormatCompactTokenCount(total);
+        }
+
+        if (!telemetry.empty()) {
+            ImGui::SameLine();
+            const float width = ImGui::CalcTextSize(telemetry.c_str()).x;
+            const float targetX = contentRightX - width;
+            if (targetX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(targetX);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.70f, 0.70f, 1.0f));
+            ImGui::TextUnformatted(telemetry.c_str());
+            ImGui::PopStyleColor();
+        }
+
+        if (haveStats) {
+            std::string tokenStats =
+                "In: " + FormatCompactTokenCount(input) +
+                " · Out: " + FormatCompactTokenCount(output) +
+                " · Cache Read: " + FormatCompactTokenCount(cacheRead) +
+                " · Cache Create: " + FormatCompactTokenCount(cacheCreate);
+            if (reasoning > 0) {
+                tokenStats += " · Reasoning: " + FormatCompactTokenCount(reasoning);
+            }
+            const float width = ImGui::CalcTextSize(tokenStats.c_str()).x;
+            ImGui::SetCursorPosX(std::max(contentStartX, contentRightX - width));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
+            ImGui::TextUnformatted(tokenStats.c_str());
+            ImGui::PopStyleColor();
+        }
+    }
+
+    if (!activeRun && !compacting && !access.detail.empty() &&
+        access.state != UsageTelemetry::AccessState::OutOfUsage) {
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
+        ImGui::TextWrapped("%s", access.detail.c_str());
+        ImGui::PopStyleColor();
+    }
+}
+
 enum class ContextMeterStyle
 {
     ClaudeBlueThin,
@@ -2036,7 +2162,12 @@ static void DrawContextUsageCard(
         return;
     }
 
-    const float cardHeight = available ? 70.0f : 48.0f;
+    const bool showCache = available && (context.cacheStatsValid ||
+        context.latestCacheHitPercentValid || context.averageCacheHitPercentValid);
+    const size_t breakdownCount = available ? std::min<size_t>(context.breakdown.size(), 10) : 0;
+    float cardHeight = available ? 70.0f : 48.0f;
+    if (showCache) cardHeight += 22.0f;
+    if (breakdownCount > 0) cardHeight += 8.0f + static_cast<float>(breakdownCount) * 18.0f;
     ImGui::BeginChild(
         "##context_usage_card",
         ImVec2(cardWidth, cardHeight),
@@ -2133,6 +2264,48 @@ static void DrawContextUsageCard(
             : ClaudeContextFillColor(context, usedPercent);
         const float barHeight = codexStyle ? 7.0f : 3.0f;
         DrawThinBar(displayPercent, ImGui::GetContentRegionAvail().x, fillColor, barHeight);
+
+        if (showCache) {
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
+            ImGui::TextUnformatted("Cache hit rate");
+            std::string cacheText;
+            if (context.averageCacheHitPercentValid) {
+                cacheText = "Average " + FormatDetailedPercent(
+                    context.averageCacheHitPercent);
+            }
+            if (context.latestCacheHitPercentValid) {
+                if (!cacheText.empty()) cacheText += " · ";
+                cacheText += "Latest " + FormatDetailedPercent(
+                    context.latestCacheHitPercent);
+            }
+            if (cacheText.empty()) {
+                cacheText = "Read " + FormatCompactTokenCount(context.cacheReadTokens) +
+                    " · Create " + FormatCompactTokenCount(context.cacheWriteTokens);
+            }
+            ImGui::SameLine();
+            const float width = ImGui::CalcTextSize(cacheText.c_str()).x;
+            const float avail = ImGui::GetContentRegionAvail().x;
+            if (width < avail) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - width);
+            ImGui::TextUnformatted(cacheText.c_str());
+            ImGui::PopStyleColor();
+        }
+
+        if (breakdownCount > 0) {
+            ImGui::Separator();
+            for (size_t i = 0; i < breakdownCount; ++i) {
+                const auto& entry = context.breakdown[i];
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.68f, 0.68f, 0.68f, 1.0f));
+                ImGui::TextUnformatted(entry.label.c_str());
+                const std::string percentText = FormatDetailedPercent(entry.percent);
+                ImGui::SameLine();
+                const float width = ImGui::CalcTextSize(percentText.c_str()).x;
+                const float avail = ImGui::GetContentRegionAvail().x;
+                if (width < avail) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - width);
+                ImGui::TextUnformatted(percentText.c_str());
+                ImGui::PopStyleColor();
+            }
+        }
     }
 
     ImGui::EndChild();
@@ -2298,8 +2471,13 @@ static void DrawZAiTab() {
         ImGui::PopStyleColor();
     }
 
-    DrawProviderAccessStatus(snapshot.access);
+    DrawZAiAccessStatus(snapshot.access, snapshot.context, snapshot.run);
     ImGui::Spacing();
+
+    DrawContextUsageCard(snapshot.context, cardWidth);
+    if (snapshot.context.valid) {
+        ImGui::Spacing();
+    }
 
     std::string title = snapshot.plan.empty() ? "Z.Ai" : snapshot.plan;
     std::vector<UiBar> bars = BuildZAiBars(snapshot);
@@ -2310,11 +2488,6 @@ static void DrawZAiTab() {
     }
 
     DrawZAiDetailsCard(snapshot, cardWidth);
-
-    if (snapshot.context.valid) {
-        ImGui::Spacing();
-        DrawContextUsageCard(snapshot.context, cardWidth);
-    }
 }
 
 static void DrawGrokTab() {
