@@ -3350,6 +3350,17 @@ namespace Claude {
     static Snapshot ParseSnapshot(const json& root, const ClaudeOAuth& oauth, const std::string& usageHeading) {
         Snapshot snapshot;
 
+        // Diagnostic only: set AQC_CLAUDE_DUMP_USAGE to a path to capture the
+        // raw usage payload. Off unless the variable is set.
+        {
+            const std::string dumpPath =
+                Network::get_instance()->GetEnvText("AQC_CLAUDE_DUMP_USAGE");
+            if (!dumpPath.empty()) {
+                std::ofstream out(dumpPath, std::ios::binary);
+                if (out) out << root.dump(2);
+            }
+        }
+
         snapshot.usageHeading = usageHeading;
         snapshot.plan = FormatPlan(oauth);
         snapshot.statusText = "Plan: " + snapshot.plan;
@@ -3449,6 +3460,136 @@ namespace Claude {
             "GET",
             Network::get_instance()->Utf8ToWide(headers)
         );
+    }
+
+    // The usage payload carries no plan at all - every key in it is a limit
+    // window or a spend figure. Claude Desktop gets the plan from a separate
+    // call to /api/oauth/profile, whose cookie-authenticated equivalent is
+    // /api/account: memberships[].organization.{rate_limit_tier, billing_type}
+    // plus memberships[].seat_tier.
+    static Network::HttpResponse FetchDesktopAccount(
+        const ClaudeDesktopAuth::Result& desktop,
+        const std::string& baseUrl
+    ) {
+        const std::string cookie = Network::get_instance()->StripHeaderValue(desktop.cookieHeader);
+
+        if (cookie.empty()) {
+            return {};
+        }
+
+        std::string headers;
+        headers += "Accept: application/json\r\n";
+        headers += "Cache-Control: no-cache, no-store, max-age=0\r\n";
+        headers += "Pragma: no-cache\r\n";
+        headers += "Cookie: " + cookie + "\r\n";
+        headers += "Referer: " + baseUrl + "/settings/usage\r\n";
+        headers += "Origin: " + baseUrl + "\r\n";
+        headers += "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Claude/1.25927.0\r\n";
+
+        return Network::get_instance()->RequestUrl(
+            baseUrl + "/api/account",
+            "GET",
+            Network::get_instance()->Utf8ToWide(headers)
+        );
+    }
+
+    // organization_type is the upstream value Claude Desktop switches on; the
+    // web account payload exposes the same fact through rate_limit_tier, so
+    // accept either spelling.
+    static std::string SubscriptionFromOrganizationType(const std::string& raw) {
+        const std::string lower = ToLowerAscii(raw);
+
+        if (lower.find("max") != std::string::npos) return "max";
+        if (lower.find("pro") != std::string::npos) return "pro";
+        if (lower.find("enterprise") != std::string::npos) return "enterprise";
+        if (lower.find("team") != std::string::npos) return "team";
+        if (lower.find("ultra") != std::string::npos) return "ultra";
+        if (lower.find("free") != std::string::npos) return "free";
+
+        return {};
+    }
+
+    // Fills subscriptionType/rateLimitTier from an /api/account body. Returns
+    // false when the payload has nothing usable, leaving the plan unresolved
+    // rather than inventing one.
+    static bool ApplyAccountPlan(
+        const std::string& body,
+        const std::string& organizationId,
+        ClaudeOAuth& plan
+    ) {
+        json parsed = JsonUtils::get_instance()->ParseOrNull(body);
+
+        if (!parsed.is_object()) {
+            return false;
+        }
+
+        const json* memberships = parsed.contains("memberships") && parsed.at("memberships").is_array()
+            ? &parsed.at("memberships")
+            : nullptr;
+
+        if (!memberships) {
+            return false;
+        }
+
+        const json* chosen = nullptr;
+
+        // Prefer the membership for the organization the usage call used; a
+        // machine can be signed into several.
+        for (const json& membership : *memberships) {
+            if (!membership.is_object()) continue;
+
+            const json* org = membership.contains("organization") && membership.at("organization").is_object()
+                ? &membership.at("organization")
+                : nullptr;
+
+            if (org && !organizationId.empty() &&
+                JsonUtils::get_instance()->String(*org, "uuid") == organizationId) {
+                chosen = &membership;
+                break;
+            }
+            if (!chosen && org) {
+                chosen = &membership;
+            }
+        }
+
+        if (!chosen) {
+            return false;
+        }
+
+        const json& org = chosen->at("organization");
+
+        std::string tier = JsonUtils::get_instance()->String(org, "rate_limit_tier");
+        if (tier.empty()) tier = JsonUtils::get_instance()->String(org, "rateLimitTier");
+
+        std::string subscription = SubscriptionFromOrganizationType(
+            JsonUtils::get_instance()->String(org, "organization_type"));
+
+        if (subscription.empty()) {
+            subscription = SubscriptionFromOrganizationType(tier);
+        }
+
+        // A team seat refines to Standard/Premium, which is a real distinction
+        // in the reference tools rather than cosmetic.
+        const std::string seat = ToLowerAscii(
+            JsonUtils::get_instance()->String(*chosen, "seat_tier"));
+
+        if (subscription == "team" && !seat.empty() && seat != "unassigned") {
+            if (seat.find("tier_1") != std::string::npos || seat.find("premium") != std::string::npos) {
+                subscription = "team premium";
+            }
+            else if (seat.find("standard") != std::string::npos) {
+                subscription = "team standard";
+            }
+        }
+
+        if (subscription.empty() && tier.empty()) {
+            return false;
+        }
+
+        if (plan.subscriptionType.empty()) plan.subscriptionType = subscription;
+        if (plan.rateLimitTier.empty()) plan.rateLimitTier = tier;
+
+        return !plan.subscriptionType.empty() || !plan.rateLimitTier.empty();
     }
 
     static Network::HttpResponse FetchDesktopUsage(const ClaudeDesktopAuth::Result& desktop) {
@@ -3702,6 +3843,22 @@ namespace Claude {
                 response.statusCode,
                 response.body
             );
+        }
+
+        // The plan is not in the usage payload, so ask for it separately - but
+        // only when the OAuth cache did not already supply it, since that is a
+        // free answer and this is an extra round trip.
+        if (desktopPlan.subscriptionType.empty() && desktopPlan.rateLimitTier.empty()) {
+            const std::string accountBase = desktop.baseUrl.empty()
+                ? "https://claude.ai"
+                : desktop.baseUrl;
+
+            const Network::HttpResponse account = FetchDesktopAccount(desktop, accountBase);
+
+            if (account.statusCode >= 200 && account.statusCode < 300) {
+                // Best effort: a failure here costs the plan label, nothing else.
+                ApplyAccountPlan(account.body, desktop.organizationId, desktopPlan);
+            }
         }
 
         Snapshot snapshot = ParseSnapshot(

@@ -21,6 +21,12 @@ namespace Renderer
         bool* minimizeRequest = nullptr;
         bool* widgetMode = nullptr;
         bool* widgetPinned = nullptr;
+        // AppSettings::WidgetAnchor: which edge the panel parks against.
+        int* widgetAnchor = nullptr;
+        // Which monitor it parks on, plus the picker's labels.
+        int* widgetMonitor = nullptr;
+        const char* const* widgetMonitorNames = nullptr;
+        int widgetMonitorCount = 0;
         std::string* widgetOrder = nullptr;
         int* uiFontSize = nullptr;
         int* widgetSections = nullptr;
@@ -82,6 +88,8 @@ namespace Renderer
         void (*refreshGrokAsync)() = nullptr;
         bool (*saveAppSettings)() = nullptr;
         void (*applySettingsToRuntime)() = nullptr;
+        // Re-park the widget after a monitor/anchor change.
+        void (*repositionWidget)() = nullptr;
     };
 
     void ApplyStyle();
@@ -93,7 +101,16 @@ namespace Renderer
     // Rebuild the interface font atlas at the configured size. The caller
     // must invalidate/recreate backend device objects around this.
     void ReloadFonts();
+    // Install the interface font as the current context's default. For the
+    // settings window, which has its own atlas.
+    void LoadSettingsFont(int size);
     bool ConsumeFontReloadRequest();
     void ReleaseTabImages();
     void RenderMainUi(State& state);
+    // Height in pixels the widget's content wants, measured during the last
+    // DrawWidgetUi. Zero until the widget has drawn at least one frame.
+    int WidgetDesiredHeight();
+    // Height of the bottom summary strip. The widget retracts to exactly this,
+    // so the selected host's quota stays readable while rolled up.
+    int WidgetPeekHeight();
 }

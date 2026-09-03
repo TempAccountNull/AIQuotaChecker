@@ -881,10 +881,55 @@ namespace {
         return JsonUtils::get_instance()->ParseRequired(text);
     }
 
+    // The subscription is an account fact, not a session one: every cache entry
+    // for an organization carries it, and it stays true after the token itself
+    // expires. Harvested separately from token selection so that a session
+    // authenticated by cookies - which happens precisely BECAUSE no live token
+    // is left - still knows which plan it is on.
+    struct OAuthPlanHint
+    {
+        std::string subscriptionType;
+        std::string rateLimitTier;
+
+        bool empty() const { return subscriptionType.empty() && rateLimitTier.empty(); }
+    };
+
+    static OAuthPlanHint HarvestPlanHint(
+        const std::vector<OAuthCandidate>& candidates,
+        const std::string& preferredOrganizationId
+    ) {
+        OAuthPlanHint hint;
+
+        // Two passes: an entry for the organization we actually selected wins
+        // over any other account signed in on this machine.
+        for (bool matchingOrgOnly : { true, false }) {
+            if (matchingOrgOnly && preferredOrganizationId.empty()) {
+                continue;
+            }
+
+            for (const OAuthCandidate& candidate : candidates) {
+                if (matchingOrgOnly && candidate.organizationId != preferredOrganizationId) {
+                    continue;
+                }
+                if (hint.subscriptionType.empty()) {
+                    hint.subscriptionType = candidate.subscriptionType;
+                }
+                if (hint.rateLimitTier.empty()) {
+                    hint.rateLimitTier = candidate.rateLimitTier;
+                }
+            }
+
+            if (!hint.empty()) break;
+        }
+
+        return hint;
+    }
+
     static std::optional<OAuthCandidate> ReadOAuthCache(
         const std::filesystem::path& userDataPath,
         const std::string& preferredOrganizationId,
-        bool& cacheEntriesFound
+        bool& cacheEntriesFound,
+        OAuthPlanHint& planHint
     ) {
         cacheEntriesFound = false;
         const std::filesystem::path configPath = userDataPath / "config.json";
@@ -917,6 +962,10 @@ namespace {
         if (candidates.empty()) {
             return std::nullopt;
         }
+
+        // Before any filtering: expiry and organization filters can leave
+        // nothing behind, and the plan is still knowable in that case.
+        planHint = HarvestPlanHint(candidates, preferredOrganizationId);
 
         using namespace std::chrono;
         const double nowMs = static_cast<double>(duration_cast<milliseconds>(
@@ -1139,10 +1188,11 @@ Result AcquireCurrentSession() {
 
     bool cacheEntriesFound = false;
     std::optional<OAuthCandidate> oauth;
+    OAuthPlanHint planHint;
     std::string cacheError;
 
     try {
-        oauth = ReadOAuthCache(userDataPath, identity.organizationId, cacheEntriesFound);
+        oauth = ReadOAuthCache(userDataPath, identity.organizationId, cacheEntriesFound, planHint);
     }
     catch (const std::exception& e) {
         cacheError = e.what();
@@ -1152,7 +1202,9 @@ Result AcquireCurrentSession() {
     // just-switched account) must not hide a usable token.
     if (!oauth && !identity.organizationId.empty()) {
         try {
-            oauth = ReadOAuthCache(userDataPath, std::string{}, cacheEntriesFound);
+            OAuthPlanHint fallbackHint;
+            oauth = ReadOAuthCache(userDataPath, std::string{}, cacheEntriesFound, fallbackHint);
+            if (planHint.empty()) planHint = fallbackHint;
         }
         catch (const std::exception& e) {
             if (cacheError.empty()) {
@@ -1200,6 +1252,9 @@ Result AcquireCurrentSession() {
             result.rateLimitTier = oauth->rateLimitTier;
         }
 
+        if (result.subscriptionType.empty()) result.subscriptionType = planHint.subscriptionType;
+        if (result.rateLimitTier.empty()) result.rateLimitTier = planHint.rateLimitTier;
+
         return result;
     }
 
@@ -1210,8 +1265,10 @@ Result AcquireCurrentSession() {
         result.organizationId = oauth->organizationId;
         result.baseUrl = "https://claude.ai";
         result.accessToken = oauth->accessToken;
-        result.subscriptionType = oauth->subscriptionType;
-        result.rateLimitTier = oauth->rateLimitTier;
+        result.subscriptionType = oauth->subscriptionType.empty()
+            ? planHint.subscriptionType : oauth->subscriptionType;
+        result.rateLimitTier = oauth->rateLimitTier.empty()
+            ? planHint.rateLimitTier : oauth->rateLimitTier;
         return result;
     }
 

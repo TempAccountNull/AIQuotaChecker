@@ -1,6 +1,8 @@
 #include "Global.hpp"
 #include "Grok.hpp"
 
+#include <cctype>
+
 #include "JsonUtils.hpp"
 #include "Math.hpp"
 #include "Network.hpp"
@@ -30,7 +32,32 @@ namespace Grok
         {
             std::string key;
             std::string userId;
+            // xAI already stores a human-readable tier here ("SuperGrok",
+            // "SuperGrok Heavy"); authMode is the fallback when it is absent.
+            std::string subscriptionTier;
+            std::string authMode;
         };
+
+        // Raw tiers arrive in several shapes (supergrok_heavy, SuperGrok Heavy,
+        // heavy). Normalise on letters only, the way the reference tools do.
+        static std::string FormatGrokPlan(const std::string& tier, const std::string& authMode)
+        {
+            std::string letters;
+            for (unsigned char c : tier) {
+                if (std::isalpha(c)) letters.push_back(static_cast<char>(std::tolower(c)));
+            }
+
+            if (letters == "supergrokheavy" || letters == "heavy") return "SuperGrok Heavy";
+            if (letters == "supergroklite") return "SuperGrok Lite";
+            if (letters == "supergrok") return "SuperGrok";
+
+            if (!letters.empty()) return tier;
+
+            // No billing tier: an OIDC login is a paid SuperGrok account, a
+            // session cookie tells us nothing more than that it is signed in.
+            if (authMode == "oidc") return "SuperGrok";
+            return {};
+        }
 
         static std::string FormatMoneyFromCents(double cents)
         {
@@ -111,6 +138,13 @@ namespace Grok
                 JsonUtils::get_instance()->String(*entry, "user_id"),
                 JsonUtils::get_instance()->String(*entry, "principal_id")
             });
+
+            auth.subscriptionTier = Text::get_instance()->FirstNonEmpty({
+                JsonUtils::get_instance()->String(*entry, "subscriptionTier"),
+                JsonUtils::get_instance()->String(*entry, "subscription_tier"),
+                JsonUtils::get_instance()->String(*entry, "subscription_tier_display")
+            });
+            auth.authMode = JsonUtils::get_instance()->String(*entry, "authMode");
 
             if (auth.key.empty()) {
                 throw std::runtime_error("Grok auth token missing from %USERPROFILE%\\.grok\\auth.json");
@@ -328,7 +362,14 @@ namespace Grok
             }
 
             Json root = JsonUtils::get_instance()->ParseRequired(response.body);
-            return ParseBillingResponse(root);
+            Snapshot parsed = ParseBillingResponse(root);
+
+            const std::string plan = FormatGrokPlan(auth.subscriptionTier, auth.authMode);
+            if (!plan.empty()) {
+                parsed.plan = plan;
+            }
+
+            return parsed;
         }
         catch (const std::exception& e) {
             snapshot.statusText = std::string("Grok error: ") + e.what();

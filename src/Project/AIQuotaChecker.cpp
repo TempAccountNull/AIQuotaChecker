@@ -6,6 +6,7 @@
 #include <shellapi.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <atomic>
 #include <cctype>
 #include <cstring>
@@ -71,9 +72,22 @@ namespace
     static constexpr int kWidgetWidth = 360;
     static constexpr int kWidgetHeight = 620;
     static constexpr int kWidgetMargin = 12;
-    // How much of the widget stays on screen once it retracts. Wide enough to
-    // grab with the pointer without hunting for it.
-    static constexpr int kWidgetSliver = 10;
+    // Fallback for how much of the widget stays on screen once it retracts,
+    // used only before the first frame has been measured. Normally the sliver
+    // is exactly the renderer's summary strip so the selected host's quota and
+    // reset stay readable while rolled up.
+    static constexpr int kWidgetSliver = 30;
+
+    static int WidgetSliverHeight()
+    {
+        const int measured = Renderer::WidgetPeekHeight();
+        return measured > 0 ? measured : kWidgetSliver;
+    }
+    // Auto-sizing bounds. The floor keeps the header, tab strip and footer
+    // usable even when every data card is switched off.
+    static constexpr int kWidgetMinHeight = 190;
+    static constexpr int kWidgetResizeDeadband = 3;
+
     // Keep in sync with the pill row drawn by Renderer::DrawWidgetUi.
     static constexpr int kWidgetButtonStrip = 136;
     static constexpr double kWidgetRetractAfterSeconds = 1.2;
@@ -87,9 +101,123 @@ namespace
     // Pinned keeps the panel down: no auto-retract, only the hover slide is
     // suppressed - the pill still toggles it back.
     static bool g_widgetPinned = false;
+    // True once the slide has reached its target, so a later position change
+    // can be attributed to the user dragging the panel rather than to us.
+    static bool g_widgetSettled = false;
+    static int g_widgetAnchor = AppSettings::WidgetAnchorTopRight;
+    // Resting top-left for the current anchor, and where the slide is heading.
+    // Panel height when fully out; the retracted rect is derived from it.
+    static int g_widgetFullHeight = kWidgetHeight;
+    // Work area of the monitor the panel lives on, captured while it is still
+    // on screen. Re-deriving it from the window each frame walks the panel onto
+    // a neighbouring monitor as it slides off the edge of this one.
+    static RECT g_widgetWork{};
+
+    // ---- monitors -------------------------------------------------------
+    //
+    // The panel parks on one chosen monitor. Snapping is always relative to
+    // that monitor's work area, never the virtual desktop: on a multi-monitor
+    // desktop the latter rolls the panel off one screen and onto the next.
+
+    struct MonitorEntry
+    {
+        RECT work{};
+        std::string label;
+    };
+
+    static std::vector<MonitorEntry> g_monitors;
+    static int g_widgetMonitor = 0;
+    static std::vector<std::string> g_monitorLabels;
+    static std::vector<const char*> g_monitorLabelPtrs;
+
+    static BOOL CALLBACK CollectMonitor(HMONITOR monitor, HDC, LPRECT, LPARAM param)
+    {
+        MONITORINFOEXW info{};
+        info.cbSize = sizeof(info);
+        if (!GetMonitorInfoW(monitor, &info)) {
+            return TRUE;
+        }
+
+        MonitorEntry entry;
+        entry.work = info.rcWork;
+
+        char label[128]{};
+        std::snprintf(label, sizeof(label), "%dx%d%s",
+            static_cast<int>(info.rcMonitor.right - info.rcMonitor.left),
+            static_cast<int>(info.rcMonitor.bottom - info.rcMonitor.top),
+            (info.dwFlags & MONITORINFOF_PRIMARY) ? "  (primary)" : "");
+        entry.label = label;
+
+        auto* out = reinterpret_cast<std::vector<MonitorEntry>*>(param);
+        if (info.dwFlags & MONITORINFOF_PRIMARY) {
+            out->insert(out->begin(), std::move(entry));
+        }
+        else {
+            out->push_back(std::move(entry));
+        }
+        return TRUE;
+    }
+
+    static void RefreshMonitors()
+    {
+        std::vector<MonitorEntry> found;
+        EnumDisplayMonitors(nullptr, nullptr, CollectMonitor,
+            reinterpret_cast<LPARAM>(&found));
+
+        if (found.empty()) {
+            RECT primary{ 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
+            found.push_back({ primary, "Primary" });
+        }
+
+        // Primary first (CollectMonitor front-inserts it), then left to right so
+        // the picker order matches how the screens are actually arranged.
+        std::stable_sort(found.begin() + 1, found.end(),
+            [](const MonitorEntry& a, const MonitorEntry& b) { return a.work.left < b.work.left; });
+
+        g_monitors = std::move(found);
+
+        g_monitorLabels.clear();
+        g_monitorLabelPtrs.clear();
+        for (size_t i = 0; i < g_monitors.size(); ++i) {
+            g_monitorLabels.push_back(
+                "Monitor " + std::to_string(i + 1) + " - " + g_monitors[i].label);
+        }
+        for (const std::string& label : g_monitorLabels) {
+            g_monitorLabelPtrs.push_back(label.c_str());
+        }
+    }
+
+    static int ClampWidgetMonitor(int index)
+    {
+        if (g_monitors.empty()) RefreshMonitors();
+        if (index < 0 || index >= static_cast<int>(g_monitors.size())) return 0;
+        return index;
+    }
+
+    static RECT WidgetMonitorWork()
+    {
+        if (g_monitors.empty()) RefreshMonitors();
+        return g_monitors[static_cast<size_t>(ClampWidgetMonitor(g_widgetMonitor))].work;
+    }
+
+    // Which monitor a dropped window landed on, by its centre point.
+    static int MonitorIndexForRect(const RECT& rect)
+    {
+        if (g_monitors.empty()) RefreshMonitors();
+
+        const POINT center{
+            static_cast<int>((rect.left + rect.right) / 2),
+            static_cast<int>((rect.top + rect.bottom) / 2)
+        };
+
+        for (size_t i = 0; i < g_monitors.size(); ++i) {
+            if (PtInRect(&g_monitors[i].work, center)) return static_cast<int>(i);
+        }
+        return ClampWidgetMonitor(g_widgetMonitor);
+    }
     static std::string g_widgetOrder = "codex,claude,zai,grok";
     static int g_uiFontSize = 14;
-    static int g_widgetSections = 0x7F;
+    static int g_widgetSections = AppSettings::kWidgetSectionAll;
 
     static bool g_showRemaining = false;
     static bool g_showResetDateDetails = false;
@@ -239,6 +367,8 @@ namespace
         g_widgetMode = true;
 #endif
         g_widgetPinned = settings.widgetPinned;
+        g_widgetAnchor = AppSettings::ClampWidgetAnchor(settings.widgetAnchor);
+        g_widgetMonitor = ClampWidgetMonitor(settings.widgetMonitor);
         g_widgetOrder = settings.widgetOrder;
         g_uiFontSize = AppSettings::ClampUiFontSize(settings.uiFontSize);
         g_widgetSections = settings.widgetSections;
@@ -273,6 +403,8 @@ namespace
         settings.showRemaining = g_showRemaining;
         settings.widgetMode = g_widgetMode;
         settings.widgetPinned = g_widgetPinned;
+        settings.widgetAnchor = AppSettings::ClampWidgetAnchor(g_widgetAnchor);
+        settings.widgetMonitor = g_widgetMonitor;
         settings.widgetOrder = g_widgetOrder;
         settings.uiFontSize = AppSettings::ClampUiFontSize(g_uiFontSize);
         settings.widgetSections = g_widgetSections;
@@ -411,6 +543,8 @@ namespace
     }
 
     static void DestroySettingsWindow();
+    static void RepositionWidget();
+    static RECT WidgetRestRect(bool retracted, int fullHeight);
 
     static LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
     {
@@ -530,6 +664,16 @@ namespace
             }
             break;
 
+        case WM_DISPLAYCHANGE:
+            // Monitors added, removed or rearranged: the stored index and the
+            // cached work area both go stale, so rebuild and re-park.
+            RefreshMonitors();
+            g_widgetMonitor = ClampWidgetMonitor(g_widgetMonitor);
+            g_rendererState.widgetMonitorNames = g_monitorLabelPtrs.data();
+            g_rendererState.widgetMonitorCount = static_cast<int>(g_monitorLabelPtrs.size());
+            RepositionWidget();
+            return 0;
+
         case WM_DESTROY:
             // Only the widget closing ends the app; destroying the settings
             // window must not post WM_QUIT.
@@ -554,8 +698,6 @@ namespace
     static bool g_widgetRestoreValid = false;
     static bool g_widgetApplied = false;
     static bool g_widgetRetracted = false;
-    static int g_widgetExpandedY = 0;
-    static int g_widgetTargetY = 0;
     static double g_widgetLastHoverSeconds = 0.0;
     static double g_widgetLastAnimationSeconds = 0.0;
 
@@ -585,6 +727,37 @@ namespace
         return fallback;
     }
 
+    // Top-left corner for a given anchor, inset by the margin. Centre columns
+    // and the middle row centre on the work area rather than an edge.
+    static POINT AnchorOrigin(int anchor, const RECT& work, int width, int height)
+    {
+        const int row = AppSettings::WidgetAnchorRow(anchor);
+        const int col = AppSettings::WidgetAnchorCol(anchor);
+        const int spanX = static_cast<int>(work.right - work.left);
+
+        POINT p{};
+        p.x = col == 0 ? static_cast<int>(work.left) + kWidgetMargin
+            : col == 1 ? static_cast<int>(work.left) + (spanX - width) / 2
+                       : static_cast<int>(work.right) - width - kWidgetMargin;
+        p.y = row == 0 ? static_cast<int>(work.top) + kWidgetMargin
+                       : static_cast<int>(work.bottom) - height - kWidgetMargin;
+        return p;
+    }
+
+    // Nearest parking spot for a dropped window, from where its centre landed.
+    static int AnchorForRect(const RECT& rect, const RECT& work)
+    {
+        const int spanX = (std::max)(1, static_cast<int>(work.right - work.left));
+        const int spanY = (std::max)(1, static_cast<int>(work.bottom - work.top));
+        const int cx = static_cast<int>((rect.left + rect.right) / 2 - work.left);
+        const int cy = static_cast<int>((rect.top + rect.bottom) / 2 - work.top);
+
+        const int col = cx < spanX / 3 ? 0 : (cx < spanX * 2 / 3 ? 1 : 2);
+        const int row = cy < spanY / 2 ? 0 : 1;
+
+        return AppSettings::WidgetAnchorFrom(row, col);
+    }
+
     static void EnterWidgetMode()
     {
         if (GetWindowRect(g_hwnd, &g_widgetRestoreRect)) {
@@ -597,31 +770,24 @@ namespace
             GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE) | WS_EX_TOOLWINDOW | WS_EX_TOPMOST
         );
 
-        // Hang off the top edge like a macOS drop-down: snapped to the nearer
-        // top corner, sliding up out of view and dropping back down on hover.
-        const RECT work = WorkAreaForWindow(g_hwnd);
-        const int centerX = static_cast<int>(
-            (g_widgetRestoreRect.left + g_widgetRestoreRect.right) / 2
-        );
-
-        const bool snapLeft = centerX < (work.left + work.right) / 2;
-
-        const int x = snapLeft
-            ? work.left + kWidgetMargin
-            : work.right - kWidgetWidth - kWidgetMargin;
-
-        g_widgetExpandedY = work.top + kWidgetMargin;
+        // Park at the stored anchor and roll into whichever edge it sits on,
+        // macOS drop-down style for the top row and the mirror of that for the
+        // bottom row and the sides.
+        g_widgetWork = WidgetMonitorWork();
+        g_widgetFullHeight = kWidgetHeight;
         g_widgetRetracted = false;
-        g_widgetTargetY = g_widgetExpandedY;
+        g_widgetSettled = false;
         g_widgetLastHoverSeconds = MonotonicSeconds();
+
+        const RECT rest = WidgetRestRect(false, g_widgetFullHeight);
 
         SetWindowPos(
             g_hwnd,
             HWND_TOPMOST,
-            x,
-            g_widgetExpandedY,
-            kWidgetWidth,
-            kWidgetHeight,
+            rest.left,
+            rest.top,
+            rest.right - rest.left,
+            rest.bottom - rest.top,
             SWP_SHOWWINDOW | SWP_FRAMECHANGED
         );
     }
@@ -651,13 +817,73 @@ namespace
         g_widgetRetracted = false;
     }
 
-    // Use the window's ACTUAL height, not the constant: DPI virtualisation and
-    // any future resize mean the two can differ, and using the constant left
-    // the panel hanging half on-screen instead of retracting fully.
-    static int RetractedY(const RECT& rect)
+    // Where the panel goes when it rolls away.
+    //
+    // It COLLAPSES into its anchor edge rather than sliding off the screen.
+    // Sliding hides nothing when another monitor borders that edge - the part
+    // meant to be off-screen simply appears on the neighbour - and this user
+    // has a second display hard against the left edge of the primary. Shrinking
+    // to the peek strip works on every edge regardless of what is next to it.
+    static RECT WidgetRestRect(bool retracted, int fullHeight)
     {
-        const int height = (std::max)(1L, rect.bottom - rect.top);
-        return WorkAreaForWindow(g_hwnd).top - (height - kWidgetSliver);
+        const RECT work = g_widgetWork;
+        const int height = (std::max)(1, fullHeight);
+        POINT origin = AnchorOrigin(g_widgetAnchor, work, kWidgetWidth, height);
+
+        RECT out{ origin.x, origin.y, origin.x + kWidgetWidth, origin.y + height };
+        if (!retracted) {
+            return out;
+        }
+
+        const int strip = (std::min)(height, WidgetSliverHeight());
+
+        if (AppSettings::WidgetAnchorRow(g_widgetAnchor) == 0) {
+            out.bottom = out.top + strip;
+        }
+        else {
+            out.top = out.bottom - strip;
+        }
+
+        return out;
+    }
+
+    // Track the content height the renderer measured, so turning cards off in
+    // Settings actually shortens the panel instead of leaving dead space.
+    static void UpdateWidgetContentHeight()
+    {
+        const int measured = Renderer::WidgetDesiredHeight();
+        if (measured <= 0) {
+            return;
+        }
+
+        const int maxHeight = (std::max)(kWidgetMinHeight,
+            static_cast<int>(g_widgetWork.bottom - g_widgetWork.top) - kWidgetMargin * 2);
+        const int wanted = std::clamp(measured, kWidgetMinHeight, maxHeight);
+
+        // Deadband: sub-pixel text metrics jitter by a pixel or two between
+        // frames, and resizing every frame would flicker the swapchain.
+        if (std::abs(wanted - g_widgetFullHeight) > kWidgetResizeDeadband) {
+            g_widgetFullHeight = wanted;
+        }
+    }
+
+    // Move the panel to the current monitor/anchor now, rather than waiting for
+    // the user to drag it. Called when the Settings pickers change and when the
+    // display layout does.
+    static void RepositionWidget()
+    {
+        if (!g_widgetMode || !g_hwnd) {
+            return;
+        }
+
+        g_widgetWork = WidgetMonitorWork();
+        g_widgetRetracted = false;
+        g_widgetSettled = false;
+        g_widgetLastHoverSeconds = MonotonicSeconds();
+
+        const RECT rest = WidgetRestRect(false, g_widgetFullHeight);
+        SetWindowPos(g_hwnd, HWND_TOPMOST, rest.left, rest.top,
+            rest.right - rest.left, rest.bottom - rest.top, SWP_NOACTIVATE);
     }
 
     static void PollWidgetWindow()
@@ -683,15 +909,10 @@ namespace
             return;
         }
 
-        // While retracted most of the window is above the screen, so also treat
-        // the hoverable sliver band as the trigger area. Without this the
-        // drop-down could never be pulled back into view.
-        RECT trigger = rect;
-        trigger.top = (std::max)(rect.top, WorkAreaForWindow(g_hwnd).top);
-        trigger.bottom = (std::max)(trigger.bottom, trigger.top + kWidgetSliver);
+        g_widgetWork = WidgetMonitorWork();
 
         POINT cursor{};
-        const bool hovered = GetCursorPos(&cursor) && PtInRect(&trigger, cursor);
+        const bool hovered = GetCursorPos(&cursor) && PtInRect(&rect, cursor);
         const double now = MonotonicSeconds();
 
         if (hovered || g_widgetPinned) {
@@ -703,16 +924,42 @@ namespace
             g_widgetRetracted = true;
         }
 
-        g_widgetTargetY = g_widgetRetracted ? RetractedY(rect) : g_widgetExpandedY;
+        // Dragging the panel by its header moves the window out from under us.
+        // Re-snap to whichever spot - and monitor - it was dropped nearest,
+        // instead of yanking it back to the old one. Only trusted once the
+        // slide has settled, otherwise mid-animation frames look like drags.
+        if (!g_widgetRetracted && g_widgetSettled) {
+            const RECT settledRest = WidgetRestRect(false, g_widgetFullHeight);
+            if (rect.left != settledRest.left || rect.top != settledRest.top) {
+                const int monitor = MonitorIndexForRect(rect);
+                const RECT dropWork = g_monitors[static_cast<size_t>(monitor)].work;
+                const int dropped = AnchorForRect(rect, dropWork);
 
-        const int currentY = static_cast<int>(rect.top);
+                if (dropped != g_widgetAnchor || monitor != g_widgetMonitor) {
+                    g_widgetAnchor = dropped;
+                    g_widgetMonitor = monitor;
+                    SaveAppSettings();
+                }
+                g_widgetWork = dropWork;
+            }
+        }
 
-        if (currentY == g_widgetTargetY) {
+        if (!g_widgetRetracted) {
+            UpdateWidgetContentHeight();
+        }
+
+        const RECT target = WidgetRestRect(g_widgetRetracted, g_widgetFullHeight);
+
+        if (rect.left == target.left && rect.top == target.top &&
+            rect.right == target.right && rect.bottom == target.bottom) {
             g_widgetLastAnimationSeconds = now;
+            g_widgetSettled = true;
             return;
         }
 
-        // Time-scaled so the slide runs at a real speed rather than a fraction
+        g_widgetSettled = false;
+
+        // Time-scaled so the roll runs at a real speed rather than a fraction
         // of the remaining distance - a proportional step is fast at the start
         // and crawls at the end, which is the opposite of what reads well here.
         const double elapsed = g_widgetLastAnimationSeconds > 0.0
@@ -724,20 +971,27 @@ namespace
             ? kWidgetRetractPixelsPerSecond
             : kWidgetExpandPixelsPerSecond;
 
-        const int delta = g_widgetTargetY - currentY;
         const int travel = (std::max)(1, static_cast<int>(speed * elapsed + 0.5));
-        const int step = std::abs(delta) <= travel
-            ? delta
-            : (delta > 0 ? travel : -travel);
+
+        const auto step = [travel](LONG from, LONG to) {
+            const LONG delta = to - from;
+            if (std::abs(delta) <= travel) return to;
+            return from + (delta > 0 ? travel : -travel);
+        };
+
+        const LONG left = step(rect.left, target.left);
+        const LONG top = step(rect.top, target.top);
+        const LONG right = step(rect.right, target.right);
+        const LONG bottom = step(rect.bottom, target.bottom);
 
         SetWindowPos(
             g_hwnd,
             HWND_TOPMOST,
-            static_cast<int>(rect.left),
-            currentY + step,
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOACTIVATE
+            static_cast<int>(left),
+            static_cast<int>(top),
+            static_cast<int>((std::max)(1L, right - left)),
+            static_cast<int>((std::max)(1L, bottom - top)),
+            SWP_NOACTIVATE
         );
     }
 
@@ -833,6 +1087,7 @@ namespace
         ImGui::SetCurrentContext(g_settingsImGuiContext);
         ImGui::GetIO().IniFilename = nullptr;
         Renderer::ApplyStyleColorsOnly();
+        Renderer::LoadSettingsFont(g_uiFontSize);
         ImGui_ImplWin32_Init(g_settingsHwnd);
         ImGui_ImplDX11_Init(g_device, g_context);
         // ShowWindow/UpdateWindow/SetForegroundWindow dispatch messages
@@ -1027,10 +1282,19 @@ namespace
         ZAiProvider* zai = ZAiProvider::get_instance();
         GrokProvider* grok = GrokProvider::get_instance();
 
+        // Enumerate before handing the label pointers over: the renderer keeps
+        // the vector's data() pointer, so it has to be populated first.
+        RefreshMonitors();
+
         g_rendererState.shouldClose = &g_shouldClose;
         g_rendererState.minimizeRequest = &g_minimizeRequest;
         g_rendererState.widgetMode = &g_widgetMode;
         g_rendererState.widgetPinned = &g_widgetPinned;
+        g_rendererState.widgetAnchor = &g_widgetAnchor;
+        g_rendererState.widgetMonitor = &g_widgetMonitor;
+        g_rendererState.widgetMonitorNames = g_monitorLabelPtrs.data();
+        g_rendererState.widgetMonitorCount = static_cast<int>(g_monitorLabelPtrs.size());
+        g_rendererState.repositionWidget = RepositionWidget;
         g_rendererState.widgetOrder = &g_widgetOrder;
         g_rendererState.uiFontSize = &g_uiFontSize;
         g_rendererState.widgetSections = &g_widgetSections;

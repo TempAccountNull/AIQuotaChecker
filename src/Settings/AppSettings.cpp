@@ -304,7 +304,15 @@ namespace AppSettings
         settings.widgetMode = ReadBool(L"UI", L"WidgetMode", settings.widgetMode, path);
         settings.widgetPinned = ReadBool(L"UI", L"WidgetPinned", settings.widgetPinned, path);
         settings.uiFontSize = ClampUiFontSize(ReadInt(L"UI", L"FontSize", settings.uiFontSize, path));
-        settings.widgetSections = ReadInt(L"UI", L"WidgetSections", settings.widgetSections, path);
+        // V2 key: the section list grew past the original 7 bits, so a stored
+        // 0x7F would silently hide every new section. A new key lets existing
+        // installs pick up the new default once instead.
+        settings.widgetSections =
+            ReadInt(L"UI", L"WidgetSectionsV2", settings.widgetSections, path) & kWidgetSectionAll;
+        settings.widgetAnchor = ClampWidgetAnchor(
+            ReadInt(L"UI", L"WidgetAnchor", settings.widgetAnchor, path));
+        settings.widgetMonitor = (std::max)(0,
+            ReadInt(L"UI", L"WidgetMonitor", settings.widgetMonitor, path));
         settings.widgetOrder = ReadUtf8(L"UI", L"WidgetOrder", settings.widgetOrder, path);
         settings.showResetDateDetails = ReadBool(L"UI", L"ShowResetDateDetails", settings.showResetDateDetails, path);
         settings.resetDisplayMode = ClampResetDisplayMode(ReadInt(L"UI", L"ResetDisplayMode", settings.resetDisplayMode, path));
@@ -375,7 +383,9 @@ namespace AppSettings
         ok = WriteBool(L"UI", L"WidgetMode", settings.widgetMode, path) && ok;
         ok = WriteBool(L"UI", L"WidgetPinned", settings.widgetPinned, path) && ok;
         ok = WriteInt(L"UI", L"FontSize", ClampUiFontSize(settings.uiFontSize), path) && ok;
-        ok = WriteInt(L"UI", L"WidgetSections", settings.widgetSections, path) && ok;
+        ok = WriteInt(L"UI", L"WidgetSectionsV2", settings.widgetSections & kWidgetSectionAll, path) && ok;
+        ok = WriteInt(L"UI", L"WidgetAnchor", ClampWidgetAnchor(settings.widgetAnchor), path) && ok;
+        ok = WriteInt(L"UI", L"WidgetMonitor", (std::max)(0, settings.widgetMonitor), path) && ok;
         ok = WriteUtf8(L"UI", L"WidgetOrder", settings.widgetOrder, path) && ok;
         ok = WriteBool(L"UI", L"ShowResetDateDetails", settings.showResetDateDetails, path) && ok;
         ok = WriteInt(L"UI", L"ResetDisplayMode", ClampResetDisplayMode(settings.resetDisplayMode), path) && ok;
