@@ -1123,6 +1123,20 @@ Result AcquireCurrentSession() {
         cookieError = e.what();
     }
 
+    // Claude Desktop keeps its Cookies database open, and recent builds deny
+    // shared reads outright (Win32 32). That is not a signed-out state: the
+    // OAuth cache in config.json is still readable, it just needs to know which
+    // organization is active. plan-usage-history.json is plain JSON that
+    // Desktop rewrites every few minutes, so its newest sample supplies exactly
+    // that - and it tracks an account switch immediately.
+    if (identity.organizationId.empty()) {
+        const PlanUsageSample planUsage = ReadLatestPlanUsage();
+
+        if (planUsage.valid && !planUsage.organizationId.empty()) {
+            identity.organizationId = planUsage.organizationId;
+        }
+    }
+
     bool cacheEntriesFound = false;
     std::optional<OAuthCandidate> oauth;
     std::string cacheError;
@@ -1132,6 +1146,19 @@ Result AcquireCurrentSession() {
     }
     catch (const std::exception& e) {
         cacheError = e.what();
+    }
+
+    // An organization that no longer has a matching cache entry (stale sample,
+    // just-switched account) must not hide a usable token.
+    if (!oauth && !identity.organizationId.empty()) {
+        try {
+            oauth = ReadOAuthCache(userDataPath, std::string{}, cacheEntriesFound);
+        }
+        catch (const std::exception& e) {
+            if (cacheError.empty()) {
+                cacheError = e.what();
+            }
+        }
     }
 
     if (!identity.organizationId.empty() && !identity.sessionCookies.empty()) {
@@ -1212,6 +1239,232 @@ Result AcquireCurrentSession() {
     result.kind = ResultKind::NoDesktopSession;
     result.detail = identity.detail.empty() ? "Claude Desktop is not signed in" : identity.detail;
     return result;
+}
+
+PlanUsageSample ReadLatestPlanUsage() {
+    PlanUsageSample sample;
+
+    std::filesystem::path userDataPath;
+
+    try {
+        userDataPath = ClaudeDesktopUserDataPath();
+    }
+    catch (const std::exception&) {
+        return sample;
+    }
+
+    const std::filesystem::path historyPath = userDataPath / "plan-usage-history.json";
+    std::error_code ec;
+
+    if (!std::filesystem::exists(historyPath, ec) || ec) {
+        return sample;
+    }
+
+    json root;
+
+    try {
+        root = JsonUtils::get_instance()->ParseRequired(
+            ReadTextFileWithSharedRead(historyPath, 64ULL * 1024ULL * 1024ULL)
+        );
+    }
+    catch (const std::exception&) {
+        return sample;
+    }
+
+    if (!root.is_object() || !root.contains("samples") || !root.at("samples").is_array()) {
+        return sample;
+    }
+
+    const json& samples = root.at("samples");
+
+    if (samples.empty()) {
+        return sample;
+    }
+
+    // Short code -> the usage-window key the API (and ParseSnapshot) uses.
+    // Taken verbatim from the ASAR's own mapping table.
+    static const std::pair<const char*, const char*> kWindowCodes[] = {
+        { "fh", "five_hour" },
+        { "sd", "seven_day" },
+        { "so", "seven_day_opus" },
+        { "oa", "seven_day_oauth_apps" },
+        { "cw", "seven_day_cowork" },
+        { "om", "seven_day_omelette" },
+        { "op", "omelette_promotional" },
+        { "sn", "seven_day_sonnet" }
+    };
+    static const char* kExtraUsageCode = "xu";
+
+    // Newest first; the writer appends, but do not assume ordering.
+    const json* newest = nullptr;
+    double newestTime = 0.0;
+
+    for (const json& entry : samples) {
+        if (!entry.is_object()) {
+            continue;
+        }
+
+        const auto t = entry.find("t");
+
+        if (t == entry.end() || !t->is_number()) {
+            continue;
+        }
+
+        const double value = t->get<double>();
+
+        if (!newest || value > newestTime) {
+            newest = &entry;
+            newestTime = value;
+        }
+    }
+
+    if (!newest) {
+        return sample;
+    }
+
+    sample.sampledAtUnixMs = static_cast<long long>(newestTime);
+
+    const auto org = newest->find("org");
+
+    if (org != newest->end() && org->is_string()) {
+        sample.organizationId = org->get<std::string>();
+    }
+
+    const auto usage = newest->find("u");
+
+    // Ordered series for the active organization, so a window boundary can be
+    // located by where its own value falls.
+    std::vector<std::pair<long long, const json*>> series;
+
+    for (const json& entry : samples) {
+        if (!entry.is_object()) {
+            continue;
+        }
+
+        const auto t = entry.find("t");
+
+        if (t == entry.end() || !t->is_number()) {
+            continue;
+        }
+
+        if (!sample.organizationId.empty()) {
+            const auto org = entry.find("org");
+
+            if (org == entry.end() || !org->is_string() ||
+                org->get<std::string>() != sample.organizationId) {
+                continue;
+            }
+        }
+
+        series.emplace_back(static_cast<long long>(t->get<double>()), &entry);
+    }
+
+    std::sort(series.begin(), series.end(), [](const auto& a, const auto& b) {
+        return a.first < b.first;
+    });
+
+    // A usage window opens on the first request after the previous one lapsed,
+    // so the series rises monotonically inside a window and falls at the
+    // boundary. Walking back to the last fall (or the last zero) finds when the
+    // current window opened; the window length then gives the reset instant.
+    // Claude publishes no reset timestamp anywhere on disk, so this is the only
+    // way to show one without a live request.
+    const auto windowStartMs = [&](const char* code) -> long long {
+        const auto valueAt = [&](size_t index) -> std::optional<double> {
+            const auto u = series[index].second->find("u");
+            const json* holder = (u != series[index].second->end() && u->is_object())
+                ? &*u
+                : series[index].second;
+            const auto it = holder->find(code);
+
+            if (it == holder->end() || !it->is_number()) {
+                return std::nullopt;
+            }
+
+            return it->get<double>();
+        };
+
+        if (series.empty()) {
+            return 0;
+        }
+
+        size_t i = series.size() - 1;
+        const auto current = valueAt(i);
+
+        if (!current || *current <= 0.0) {
+            return 0;
+        }
+
+        while (i > 0) {
+            const auto here = valueAt(i);
+            const auto before = valueAt(i - 1);
+
+            if (!here || !before) {
+                break;
+            }
+
+            // A fall means the window reset between these two samples; a zero
+            // means usage started here. Either way this sample opens it.
+            if (*before > *here || *before <= 0.0) {
+                break;
+            }
+
+            --i;
+        }
+
+        return series[i].first;
+    };
+
+    if (usage != newest->end() && usage->is_object()) {
+        for (const auto& [code, key] : kWindowCodes) {
+            const auto it = usage->find(code);
+
+            if (it == usage->end() || !it->is_number()) {
+                continue;
+            }
+
+            PlanUsageWindow window;
+            window.key = key;
+            window.usedPercent = it->get<double>();
+
+            const long long startMs = windowStartMs(code);
+
+            if (startMs > 0) {
+                // five_hour is a 5h window; every seven_day_* variant is 7d.
+                const long long lengthSeconds =
+                    std::string(code) == "fh" ? 5 * 60 * 60 : 7 * 24 * 60 * 60;
+                window.resetAtUnixSeconds = startMs / 1000 + lengthSeconds;
+            }
+
+            sample.windows.push_back(std::move(window));
+        }
+
+        const auto extra = usage->find(kExtraUsageCode);
+
+        if (extra != usage->end() && extra->is_number()) {
+            sample.hasExtraUsage = true;
+            sample.extraUsagePercent = extra->get<double>();
+        }
+    }
+    else {
+        // Schema v1 kept fh/sd directly on the sample.
+        for (const auto& [code, key] : { std::pair<const char*, const char*>{ "fh", "five_hour" },
+                                         std::pair<const char*, const char*>{ "sd", "seven_day" } }) {
+            const auto it = newest->find(code);
+
+            if (it == newest->end() || !it->is_number()) {
+                continue;
+            }
+
+            PlanUsageWindow window;
+            window.key = key;
+            window.usedPercent = it->get<double>();
+            sample.windows.push_back(std::move(window));
+        }
+    }
+
+    sample.valid = !sample.windows.empty() || !sample.organizationId.empty();
+    return sample;
 }
 
 } // namespace ClaudeDesktopAuth

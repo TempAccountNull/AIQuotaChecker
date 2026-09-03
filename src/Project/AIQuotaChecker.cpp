@@ -3,10 +3,13 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <windowsx.h>
+#include <shellapi.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <string>
 
@@ -50,6 +53,31 @@ namespace
 
     static constexpr int kTitleBarHeight = 38;
     static constexpr int kResizeBorder = 6;
+    // Width of the [-][widget][X] strip drawn by Renderer::DrawCustomTitleBar.
+    // Everything else in the title bar is HTCAPTION, and Windows consumes those
+    // clicks for dragging before ImGui can see them.
+    static constexpr int kTitleBarButtonStrip = 120;
+
+    static constexpr int kWidgetWidth = 340;
+    static constexpr int kWidgetHeight = 560;
+    static constexpr int kWidgetMargin = 12;
+    // How much of the widget stays on screen once it retracts. Wide enough to
+    // grab with the pointer without hunting for it.
+    static constexpr int kWidgetSliver = 10;
+    // Keep in sync with the pill row drawn by Renderer::DrawWidgetUi.
+    static constexpr int kWidgetButtonStrip = 136;
+    static constexpr double kWidgetRetractAfterSeconds = 1.2;
+    // Retracting is a deliberate, watchable slide; dropping back down has to
+    // feel immediate because the pointer is already reaching for the panel.
+    static constexpr double kWidgetRetractPixelsPerSecond = 170.0;
+    static constexpr double kWidgetExpandPixelsPerSecond = 2600.0;
+
+    static bool g_minimizeRequest = false;
+    static bool g_widgetMode = false;
+    // Pinned keeps the panel down: no auto-retract, only the hover slide is
+    // suppressed - the pill still toggles it back.
+    static bool g_widgetPinned = false;
+    static std::string g_widgetOrder = "codex,claude,zai,grok";
 
     static bool g_showRemaining = false;
     static bool g_showResetDateDetails = false;
@@ -191,6 +219,9 @@ namespace
         AppSettings::Load(settings);
 
         g_showRemaining = settings.showRemaining;
+        g_widgetMode = settings.widgetMode;
+        g_widgetPinned = settings.widgetPinned;
+        g_widgetOrder = settings.widgetOrder;
         g_showResetDateDetails = settings.showResetDateDetails;
         g_resetDisplayMode = AppSettings::ClampResetDisplayMode(settings.resetDisplayMode);
         g_showNotificationsInsideWindow = settings.notificationsInsideWindow;
@@ -220,6 +251,9 @@ namespace
     {
         AppSettings::Settings settings;
         settings.showRemaining = g_showRemaining;
+        settings.widgetMode = g_widgetMode;
+        settings.widgetPinned = g_widgetPinned;
+        settings.widgetOrder = g_widgetOrder;
         settings.showResetDateDetails = g_showResetDateDetails;
         settings.resetDisplayMode = AppSettings::ClampResetDisplayMode(g_resetDisplayMode);
         settings.notificationsInsideWindow = g_showNotificationsInsideWindow;
@@ -388,9 +422,15 @@ namespace
             if (top) return HTTOP;
             if (bottom) return HTBOTTOM;
 
-            bool inCloseButtonArea = y >= 0 && y < kTitleBarHeight && x >= w - 52 && x < w;
+            const int captionHeight = g_widgetMode ? 34 : kTitleBarHeight;
+            // The widget header carries four pills (pin / refresh / restore /
+            // close) spanning ~114px from the right edge. Anything narrower
+            // reports HTCAPTION over them and Windows consumes the click as a
+            // window drag before ImGui ever sees a button press.
+            const int buttonStrip = g_widgetMode ? kWidgetButtonStrip : kTitleBarButtonStrip;
+            bool inButtonArea = y >= 0 && y < captionHeight && x >= w - buttonStrip && x < w;
 
-            if (!inCloseButtonArea && y >= 0 && y < kTitleBarHeight) {
+            if (!inButtonArea && y >= 0 && y < captionHeight) {
                 return HTCAPTION;
             }
 
@@ -417,6 +457,211 @@ namespace
         }
 
         return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+
+    // -----------------------------------------------------------------------
+    // Widget mode
+    //
+    // Snap to the nearest work-area corner, float above other windows, and
+    // slide off the nearest horizontal screen edge when the pointer leaves,
+    // leaving a hoverable sliver behind. Hover is polled from the cursor
+    // position rather than WM_MOUSELEAVE so it also works unfocused.
+    // -----------------------------------------------------------------------
+    static RECT g_widgetRestoreRect{};
+    static bool g_widgetRestoreValid = false;
+    static bool g_widgetApplied = false;
+    static bool g_widgetRetracted = false;
+    static int g_widgetExpandedY = 0;
+    static int g_widgetTargetY = 0;
+    static double g_widgetLastHoverSeconds = 0.0;
+    static double g_widgetLastAnimationSeconds = 0.0;
+
+    static double MonotonicSeconds()
+    {
+        static LARGE_INTEGER frequency{};
+
+        if (frequency.QuadPart == 0) {
+            QueryPerformanceFrequency(&frequency);
+        }
+
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        return static_cast<double>(now.QuadPart) / static_cast<double>(frequency.QuadPart);
+    }
+
+    static RECT WorkAreaForWindow(HWND hwnd)
+    {
+        MONITORINFO info{};
+        info.cbSize = sizeof(info);
+
+        if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &info)) {
+            return info.rcWork;
+        }
+
+        RECT fallback{ 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
+        return fallback;
+    }
+
+    static void EnterWidgetMode()
+    {
+        if (GetWindowRect(g_hwnd, &g_widgetRestoreRect)) {
+            g_widgetRestoreValid = true;
+        }
+
+        SetWindowLongPtrW(
+            g_hwnd,
+            GWL_EXSTYLE,
+            GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE) | WS_EX_TOOLWINDOW | WS_EX_TOPMOST
+        );
+
+        // Hang off the top edge like a macOS drop-down: snapped to the nearer
+        // top corner, sliding up out of view and dropping back down on hover.
+        const RECT work = WorkAreaForWindow(g_hwnd);
+        const int centerX = static_cast<int>(
+            (g_widgetRestoreRect.left + g_widgetRestoreRect.right) / 2
+        );
+
+        const bool snapLeft = centerX < (work.left + work.right) / 2;
+
+        const int x = snapLeft
+            ? work.left + kWidgetMargin
+            : work.right - kWidgetWidth - kWidgetMargin;
+
+        g_widgetExpandedY = work.top + kWidgetMargin;
+        g_widgetRetracted = false;
+        g_widgetTargetY = g_widgetExpandedY;
+        g_widgetLastHoverSeconds = MonotonicSeconds();
+
+        SetWindowPos(
+            g_hwnd,
+            HWND_TOPMOST,
+            x,
+            g_widgetExpandedY,
+            kWidgetWidth,
+            kWidgetHeight,
+            SWP_SHOWWINDOW | SWP_FRAMECHANGED
+        );
+    }
+
+    static void LeaveWidgetMode()
+    {
+        SetWindowLongPtrW(
+            g_hwnd,
+            GWL_EXSTYLE,
+            GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE) & ~(WS_EX_TOOLWINDOW | WS_EX_TOPMOST)
+        );
+
+        const RECT r = g_widgetRestoreValid
+            ? g_widgetRestoreRect
+            : RECT{ 100, 100, 1140, 860 };
+
+        SetWindowPos(
+            g_hwnd,
+            HWND_NOTOPMOST,
+            r.left,
+            r.top,
+            r.right - r.left,
+            r.bottom - r.top,
+            SWP_SHOWWINDOW | SWP_FRAMECHANGED
+        );
+
+        g_widgetRetracted = false;
+    }
+
+    static int RetractedY()
+    {
+        return WorkAreaForWindow(g_hwnd).top - (kWidgetHeight - kWidgetSliver);
+    }
+
+    static void PollWidgetWindow()
+    {
+        if (g_widgetMode != g_widgetApplied) {
+            g_widgetApplied = g_widgetMode;
+
+            if (g_widgetMode) {
+                EnterWidgetMode();
+            }
+            else {
+                LeaveWidgetMode();
+            }
+            return;
+        }
+
+        if (!g_widgetMode || IsIconic(g_hwnd)) {
+            return;
+        }
+
+        RECT rect{};
+        if (!GetWindowRect(g_hwnd, &rect)) {
+            return;
+        }
+
+        // While retracted most of the window is above the screen, so also treat
+        // the hoverable sliver band as the trigger area. Without this the
+        // drop-down could never be pulled back into view.
+        RECT trigger = rect;
+        trigger.top = (std::max)(rect.top, WorkAreaForWindow(g_hwnd).top);
+        trigger.bottom = (std::max)(trigger.bottom, trigger.top + kWidgetSliver);
+
+        POINT cursor{};
+        const bool hovered = GetCursorPos(&cursor) && PtInRect(&trigger, cursor);
+        const double now = MonotonicSeconds();
+
+        if (hovered || g_widgetPinned) {
+            g_widgetLastHoverSeconds = now;
+            g_widgetRetracted = false;
+        }
+        else if (!g_widgetRetracted &&
+            now - g_widgetLastHoverSeconds >= kWidgetRetractAfterSeconds) {
+            g_widgetRetracted = true;
+        }
+
+        g_widgetTargetY = g_widgetRetracted ? RetractedY() : g_widgetExpandedY;
+
+        const int currentY = static_cast<int>(rect.top);
+
+        if (currentY == g_widgetTargetY) {
+            g_widgetLastAnimationSeconds = now;
+            return;
+        }
+
+        // Time-scaled so the slide runs at a real speed rather than a fraction
+        // of the remaining distance - a proportional step is fast at the start
+        // and crawls at the end, which is the opposite of what reads well here.
+        const double elapsed = g_widgetLastAnimationSeconds > 0.0
+            ? std::min(0.1, now - g_widgetLastAnimationSeconds)
+            : 1.0 / 60.0;
+        g_widgetLastAnimationSeconds = now;
+
+        const double speed = g_widgetRetracted
+            ? kWidgetRetractPixelsPerSecond
+            : kWidgetExpandPixelsPerSecond;
+
+        const int delta = g_widgetTargetY - currentY;
+        const int travel = (std::max)(1, static_cast<int>(speed * elapsed + 0.5));
+        const int step = std::abs(delta) <= travel
+            ? delta
+            : (delta > 0 ? travel : -travel);
+
+        SetWindowPos(
+            g_hwnd,
+            HWND_TOPMOST,
+            static_cast<int>(rect.left),
+            currentY + step,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOACTIVATE
+        );
+    }
+
+    static void PollMinimizeRequest()
+    {
+        if (!g_minimizeRequest) {
+            return;
+        }
+
+        g_minimizeRequest = false;
+        ShowWindow(g_hwnd, SW_MINIMIZE);
     }
 
     static void PollAutoRefresh()
@@ -530,6 +775,8 @@ namespace
     static void PollAppNotifications()
     {
         ApplyPendingAutoRefreshDisable();
+        PollMinimizeRequest();
+        PollWidgetWindow();
         PollAutoRefresh();
         PollLocalContextTelemetry();
 
@@ -565,6 +812,10 @@ namespace
         GrokProvider* grok = GrokProvider::get_instance();
 
         g_rendererState.shouldClose = &g_shouldClose;
+        g_rendererState.minimizeRequest = &g_minimizeRequest;
+        g_rendererState.widgetMode = &g_widgetMode;
+        g_rendererState.widgetPinned = &g_widgetPinned;
+        g_rendererState.widgetOrder = &g_widgetOrder;
         g_rendererState.device = g_device;
 
         g_rendererState.codexMutex = codex->StateMutex();
@@ -622,8 +873,122 @@ namespace
     }
 }
 
+namespace
+{
+    // `AIQuotaChecker.exe --statusline` used as Claude Code's statusLine
+    // command. Claude Code pipes its status JSON on stdin - the only place it
+    // publishes the exact context window and the five-hour / seven-day rate
+    // limits - so park it on disk for the running AQC to read. Nothing here
+    // touches Claude's settings; wiring the command up stays the user's call.
+    static std::filesystem::path StatusLineCapturePath()
+    {
+        wchar_t buffer[MAX_PATH]{};
+        DWORD length = GetEnvironmentVariableW(L"AQC_CLAUDE_STATUSLINE_FILE", buffer, MAX_PATH);
+
+        if (length > 0 && length < MAX_PATH) {
+            return std::filesystem::path(buffer);
+        }
+
+        length = GetEnvironmentVariableW(L"LOCALAPPDATA", buffer, MAX_PATH);
+
+        if (length == 0 || length >= MAX_PATH) {
+            return {};
+        }
+
+        return std::filesystem::path(buffer) / "AIQuotaChecker" / "claude-statusline.json";
+    }
+
+    static int RunStatusLineCapture()
+    {
+        const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+
+        if (input == INVALID_HANDLE_VALUE || input == nullptr) {
+            return 0;
+        }
+
+        std::string payload;
+        char chunk[4096];
+        DWORD read = 0;
+
+        while (ReadFile(input, chunk, sizeof(chunk), &read, nullptr) && read > 0) {
+            payload.append(chunk, read);
+
+            if (payload.size() > 4u * 1024u * 1024u) {
+                break;
+            }
+        }
+
+        if (payload.empty()) {
+            return 0;
+        }
+
+        const std::filesystem::path path = StatusLineCapturePath();
+
+        if (path.empty()) {
+            return 0;
+        }
+
+        std::error_code ec;
+        std::filesystem::create_directories(path.parent_path(), ec);
+
+        // Write beside the target and rename, so a reader never sees a
+        // half-written document.
+        const std::filesystem::path temporary = path.string() + ".tmp";
+
+        {
+            std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+
+            if (!file) {
+                return 0;
+            }
+
+            file << payload;
+        }
+
+        std::filesystem::rename(temporary, path, ec);
+
+        if (ec) {
+            std::filesystem::copy_file(
+                temporary,
+                path,
+                std::filesystem::copy_options::overwrite_existing,
+                ec
+            );
+            std::filesystem::remove(temporary, ec);
+        }
+
+        return 0;
+    }
+
+    static bool WantsStatusLineCapture()
+    {
+        int count = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &count);
+
+        if (!argv) {
+            return false;
+        }
+
+        bool wants = false;
+
+        for (int i = 1; i < count; ++i) {
+            if (_wcsicmp(argv[i], L"--statusline") == 0) {
+                wants = true;
+                break;
+            }
+        }
+
+        LocalFree(argv);
+        return wants;
+    }
+}
+
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 {
+    if (WantsStatusLineCapture()) {
+        return RunStatusLineCapture();
+    }
+
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(WNDCLASSEXW);
     wc.style = CS_CLASSDC;
@@ -643,7 +1008,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 
     RegisterClassExW(&wc);
 
-    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"AI Quota Checker", WS_POPUP, 100, 100, 1040, 760, nullptr, nullptr, wc.hInstance, nullptr);
+    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"AI Quota Checker", WS_POPUP | WS_MINIMIZEBOX, 100, 100, 1040, 760, nullptr, nullptr, wc.hInstance, nullptr);
 
     if (!CreateDeviceD3D(g_hwnd)) {
         CleanupDeviceD3D();

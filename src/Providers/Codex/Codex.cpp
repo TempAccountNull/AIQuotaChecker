@@ -1943,6 +1943,174 @@ namespace Codex {
         return snapshot;
     }
 
+    // Codex's OAuth contract, taken from the Desktop bundle and OpenUsage:
+    // POST auth.openai.com/oauth/token, form-encoded, with the CLI's client id.
+    // The refresh token ROTATES - replaying a spent one is rejected as
+    // refresh_token_reused - so a refresh must be persisted, and auth.json must
+    // be re-read first in case the Codex CLI already rotated it for us.
+    static constexpr const char* kCodexOAuthClientId = "app_EMoamEEZ73f0CkXaXp7hrann";
+    static constexpr const char* kCodexTokenUrl = "https://auth.openai.com/oauth/token";
+
+    static std::string UrlFormEncode(const std::string& value) {
+        static const char* kHex = "0123456789ABCDEF";
+        std::string out;
+        out.reserve(value.size() * 3);
+
+        for (unsigned char c : value) {
+            if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+                out.push_back(static_cast<char>(c));
+            }
+            else {
+                out.push_back('%');
+                out.push_back(kHex[c >> 4]);
+                out.push_back(kHex[c & 0x0F]);
+            }
+        }
+
+        return out;
+    }
+
+    static std::string CodexRefreshErrorCode(const std::string& body) {
+        const json parsed = json::parse(body, nullptr, false);
+
+        if (parsed.is_discarded() || !parsed.is_object()) {
+            return {};
+        }
+
+        const auto error = parsed.find("error");
+
+        if (error != parsed.end()) {
+            if (error->is_string()) {
+                return error->get<std::string>();
+            }
+
+            if (error->is_object()) {
+                for (const char* key : { "code", "error" }) {
+                    const auto nested = error->find(key);
+
+                    if (nested != error->end() && nested->is_string()) {
+                        return nested->get<std::string>();
+                    }
+                }
+            }
+        }
+
+        const auto code = parsed.find("code");
+        return code != parsed.end() && code->is_string() ? code->get<std::string>() : std::string{};
+    }
+
+    // Rotates the Codex access token in place. Returns false when the stored
+    // refresh token cannot produce a new one; `detail` then explains why.
+    static bool RefreshCodexTokens(
+        const std::filesystem::path& authPath,
+        json& auth,
+        std::string& accessToken,
+        std::string& detail
+    ) {
+        if (!auth.contains("tokens") || !auth.at("tokens").is_object()) {
+            detail = "Codex auth.json does not contain tokens";
+            return false;
+        }
+
+        const std::string refreshToken = ReadStringFlexible(
+            auth.at("tokens"),
+            { "refresh_token", "refreshToken" }
+        );
+
+        if (refreshToken.empty()) {
+            detail = "Codex auth.json has no refresh_token; run `codex login` again";
+            return false;
+        }
+
+        const std::string body =
+            "grant_type=refresh_token"
+            "&client_id=" + UrlFormEncode(kCodexOAuthClientId) +
+            "&refresh_token=" + UrlFormEncode(refreshToken);
+
+        const Network::HttpResponse response = Network::get_instance()->RequestUrl(
+            kCodexTokenUrl,
+            "POST",
+            L"Content-Type: application/x-www-form-urlencoded\r\nAccept: application/json\r\n",
+            body
+        );
+
+        if (response.statusCode == 400 || response.statusCode == 401) {
+            const std::string code = CodexRefreshErrorCode(response.body);
+
+            if (code == "refresh_token_expired") {
+                detail = "the Codex session expired; run `codex login` again";
+            }
+            else if (code == "refresh_token_reused") {
+                detail = "the Codex refresh token was already rotated by another client";
+            }
+            else if (code == "refresh_token_invalidated") {
+                detail = "the Codex refresh token was revoked; run `codex login` again";
+            }
+            else {
+                detail = "Codex token refresh failed: HTTP " + std::to_string(response.statusCode);
+            }
+
+            return false;
+        }
+
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+            detail = "Codex token refresh failed: HTTP " + std::to_string(response.statusCode);
+            return false;
+        }
+
+        const json decoded = json::parse(response.body, nullptr, false);
+
+        if (decoded.is_discarded() || !decoded.is_object()) {
+            detail = "Codex token refresh returned an unreadable response";
+            return false;
+        }
+
+        const std::string refreshed = ReadStringFlexible(decoded, { "access_token" });
+
+        if (refreshed.empty()) {
+            detail = "Codex token refresh returned no access_token; run `codex login` again";
+            return false;
+        }
+
+        accessToken = refreshed;
+        auth["tokens"]["access_token"] = refreshed;
+
+        for (const char* key : { "refresh_token", "id_token" }) {
+            const std::string value = ReadStringFlexible(decoded, { key });
+
+            if (!value.empty()) {
+                auth["tokens"][key] = value;
+            }
+        }
+
+        // Codex writes last_refresh as an ISO-8601 UTC instant.
+        const std::time_t now = std::time(nullptr);
+        std::tm utc{};
+
+        if (gmtime_s(&utc, &now) == 0) {
+            char stamp[32]{};
+
+            if (std::strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%SZ", &utc) > 0) {
+                auth["last_refresh"] = std::string(stamp);
+            }
+        }
+
+        // Persisting is best effort: a read-only or externally-locked auth.json
+        // still leaves the in-memory token usable for this refresh cycle.
+        try {
+            std::ofstream file(authPath, std::ios::binary | std::ios::trunc);
+
+            if (file) {
+                file << auth.dump(2);
+            }
+        }
+        catch (const std::exception&) {
+        }
+
+        detail.clear();
+        return true;
+    }
+
     static Snapshot FetchSnapshotFromAuthFile(
         const std::filesystem::path& authPath,
         bool enforceCredentialStoreSafety,
@@ -1976,23 +2144,73 @@ namespace Codex {
         const std::string safeAccountId =
             Network::get_instance()->StripHeaderValue(accountId);
 
-        std::wstring headers =
-            std::wstring(L"Authorization: Bearer ") +
-            Network::get_instance()->Utf8ToWide(Network::get_instance()->StripHeaderValue(accessToken)) +
-            L"\r\n"
-            L"ChatGPT-Account-ID: " +
-            Network::get_instance()->Utf8ToWide(safeAccountId) +
-            L"\r\n"
-            L"Accept: application/json\r\n"
-            L"Origin: https://chatgpt.com\r\n"
-            L"Referer: https://chatgpt.com/codex\r\n"
-            L"originator: Codex Desktop\r\n";
+        auto buildHeaders = [&](const std::string& token) {
+            return std::wstring(L"Authorization: Bearer ") +
+                Network::get_instance()->Utf8ToWide(Network::get_instance()->StripHeaderValue(token)) +
+                L"\r\n"
+                L"ChatGPT-Account-ID: " +
+                Network::get_instance()->Utf8ToWide(safeAccountId) +
+                L"\r\n"
+                L"Accept: application/json\r\n"
+                L"Origin: https://chatgpt.com\r\n"
+                L"Referer: https://chatgpt.com/codex\r\n"
+                L"originator: Codex Desktop\r\n";
+        };
+
+        std::wstring headers = buildHeaders(accessToken);
 
         Network::HttpResponse usage = Network::get_instance()->RequestUrl(
             "https://chatgpt.com/backend-api/wham/usage",
             "GET",
             headers
         );
+
+        // The stored access token expires in about an hour, which is why an
+        // idle AQC reports token_expired. Recover the way Codex itself does -
+        // but re-read auth.json first: if the CLI already rotated the token,
+        // replaying our copy of the refresh token is rejected as
+        // refresh_token_reused and would break the CLI's session too.
+        if (usage.statusCode == 401) {
+            try {
+                const json current = ReadAuthJson(authPath, false);
+
+                if (current.contains("tokens") && current.at("tokens").is_object()) {
+                    const std::string currentToken = ReadStringFlexible(
+                        current.at("tokens"),
+                        { "access_token", "accessToken" }
+                    );
+
+                    if (!currentToken.empty() && currentToken != accessToken) {
+                        auth = current;
+                        accessToken = currentToken;
+                        headers = buildHeaders(accessToken);
+                        usage = Network::get_instance()->RequestUrl(
+                            "https://chatgpt.com/backend-api/wham/usage",
+                            "GET",
+                            headers
+                        );
+                    }
+                }
+            }
+            catch (const std::exception&) {
+            }
+
+            if (usage.statusCode == 401) {
+                std::string refreshDetail;
+
+                if (RefreshCodexTokens(authPath, auth, accessToken, refreshDetail)) {
+                    headers = buildHeaders(accessToken);
+                    usage = Network::get_instance()->RequestUrl(
+                        "https://chatgpt.com/backend-api/wham/usage",
+                        "GET",
+                        headers
+                    );
+                }
+                else if (!refreshDetail.empty()) {
+                    throw std::runtime_error("Codex usage failed: " + refreshDetail);
+                }
+            }
+        }
 
         if (usage.statusCode < 200 || usage.statusCode >= 300) {
             throw std::runtime_error("Codex usage failed: HTTP " + std::to_string(usage.statusCode));

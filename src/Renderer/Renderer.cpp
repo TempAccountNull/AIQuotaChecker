@@ -310,6 +310,9 @@ namespace Renderer
     }
 
 #define g_shouldClose (*R().shouldClose)
+#define g_minimizeRequest (*R().minimizeRequest)
+#define g_widgetMode (*R().widgetMode)
+#define g_widgetPinned (*R().widgetPinned)
 #define g_codexMutex (*R().codexMutex)
 #define g_claudeMutex (*R().claudeMutex)
 #define g_zaiMutex (*R().zaiMutex)
@@ -408,8 +411,37 @@ static ImVec4 AccessStateColor(UsageTelemetry::AccessState state)
     }
 }
 
+// Right-aligned telemetry rows leave the cursor at the far right edge, so a
+// following SameLine()+TextWrapped() gets ~2px of wrap width and renders one
+// glyph per line down the edge. Always wrap the trailing detail against the
+// full row instead: continue on the status line only when it actually fits.
+static void DrawStatusDetailText(
+    const char* detail,
+    float contentStartX,
+    float contentRightX
+)
+{
+    const float sameLineX = ImGui::GetCursorPosX() + ImGui::GetStyle().ItemSpacing.x;
+
+    if (sameLineX + ImGui::CalcTextSize(detail).x <= contentRightX) {
+        ImGui::SameLine();
+    }
+    else {
+        ImGui::SetCursorPosX(contentStartX);
+    }
+
+    ImGui::PushTextWrapPos(contentRightX);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
+    ImGui::TextWrapped("%s", detail);
+    ImGui::PopStyleColor();
+    ImGui::PopTextWrapPos();
+}
+
 static void DrawProviderAccessStatus(const UsageTelemetry::AccessStatus& access)
 {
+    const float contentStartX = ImGui::GetCursorPosX();
+    const float contentRightX = contentStartX + ImGui::GetContentRegionAvail().x;
+
     const char* label = AccessStateLabel(access.state);
 
     if (!label || !*label) {
@@ -425,10 +457,7 @@ static void DrawProviderAccessStatus(const UsageTelemetry::AccessStatus& access)
     ImGui::PopStyleColor();
 
     if (!access.detail.empty()) {
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
-        ImGui::TextWrapped("%s", access.detail.c_str());
-        ImGui::PopStyleColor();
+        DrawStatusDetailText(access.detail.c_str(), contentStartX, contentRightX);
     }
 }
 
@@ -905,7 +934,48 @@ static std::string FormatResetDateTime(long long unixSeconds)
 }
 
 
+// Widget-only sans fonts (Segoe UI), loaded in ApplyStyle before the DX11 atlas
+// is built. Null when unavailable, in which case the widget uses the default.
+static ImFont* g_widgetFont = nullptr;
+static ImFont* g_widgetBigFont = nullptr;
+
+#ifndef IM_PI
+#define IM_PI 3.14159265358979323846f
+#endif
+
 void ApplyStyle() {
+    // Keep the default bitmap font for the main window, but load Segoe UI as a
+    // secondary font used only by the redesigned widget so its gauges and big
+    // numbers render cleanly. This runs before the DX11 backend builds the font
+    // atlas, so the extra faces are included automatically.
+    {
+        ImGuiIO& io = ImGui::GetIO();
+        if (io.Fonts->Fonts.Size == 0) {
+            io.Fonts->AddFontDefault();
+        }
+
+        const char* candidates[] = {
+            "C:\Windows\Fonts\segoeui.ttf",
+            "C:\Windows\Fonts\seguisb.ttf",
+            "C:\Windows\Fonts\tahoma.ttf"
+        };
+        const char* body = nullptr;
+        for (const char* path : candidates) {
+            if (std::filesystem::exists(path)) { body = path; break; }
+        }
+
+        if (body && !g_widgetFont) {
+            g_widgetFont = io.Fonts->AddFontFromFileTTF(body, 15.0f);
+        }
+
+        const char* semibold = std::filesystem::exists("C:\Windows\Fonts\seguisb.ttf")
+            ? "C:\Windows\Fonts\seguisb.ttf"
+            : body;
+        if (semibold && !g_widgetBigFont) {
+            g_widgetBigFont = io.Fonts->AddFontFromFileTTF(semibold, 30.0f);
+        }
+    }
+
     ImGuiStyle& style = ImGui::GetStyle();
 
     style.WindowRounding = 10.0f;
@@ -1017,7 +1087,35 @@ static void DrawCustomTitleBar() {
     // ImGui::TextUnformatted("Made with Love");
     ImGui::PopStyleColor();
 
-    ImGui::SetCursorPos(ImVec2(titleSize.x - 42.0f, 6.0f));
+    // Keep this strip in sync with kTitleBarButtonStrip in AIQuotaChecker.cpp.
+    // WM_NCHITTEST reports HTCAPTION for the rest of the bar, and Windows eats
+    // those clicks for window dragging before ImGui ever sees them.
+    ImGui::SetCursorPos(ImVec2(titleSize.x - 114.0f, 6.0f));
+
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.16f, 0.16f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.28f, 0.28f, 0.28f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.38f, 0.38f, 0.38f, 1.0f));
+
+    if (ImGui::Button("-", ImVec2(30.0f, 24.0f))) {
+        g_minimizeRequest = true;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Minimize");
+    }
+
+    ImGui::SameLine(0.0f, 6.0f);
+
+    if (ImGui::Button(g_widgetMode ? "[]" : "[.]", ImVec2(30.0f, 24.0f))) {
+        g_widgetMode = !g_widgetMode;
+        if (R().saveAppSettings) R().saveAppSettings();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(g_widgetMode ? "Leave widget mode" : "Dock as desktop widget");
+    }
+
+    ImGui::PopStyleColor(3);
+
+    ImGui::SameLine(0.0f, 6.0f);
 
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.16f, 0.16f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.62f, 0.12f, 0.12f, 1.0f));
@@ -1731,6 +1829,11 @@ static void DrawClaudeAccessStatus(
     const UsageTelemetry::RunUsage& run
 )
 {
+    // Capture the full row bounds before any right-aligned telemetry shrinks
+    // GetContentRegionAvail(). See DrawStatusDetailText.
+    const float contentStartX = ImGui::GetCursorPosX();
+    const float contentRightX = contentStartX + ImGui::GetContentRegionAvail().x;
+
     const bool canOverride =
         access.state == UsageTelemetry::AccessState::Available ||
         access.state == UsageTelemetry::AccessState::Unknown;
@@ -1835,10 +1938,7 @@ static void DrawClaudeAccessStatus(
     }
 
     if (!transientState && !access.detail.empty()) {
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
-        ImGui::TextWrapped("%s", access.detail.c_str());
-        ImGui::PopStyleColor();
+        DrawStatusDetailText(access.detail.c_str(), contentStartX, contentRightX);
     }
 }
 
@@ -1988,10 +2088,7 @@ static void DrawCodexAccessStatus(
     // underlying quota detail for detection/debugging, but do not clutter the
     // status row with redundant text such as "Usage exhausted: Weekly".
     if (!transientState && access.state != UsageTelemetry::AccessState::OutOfUsage && !access.detail.empty()) {
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
-        ImGui::TextWrapped("%s", access.detail.c_str());
-        ImGui::PopStyleColor();
+        DrawStatusDetailText(access.detail.c_str(), contentStartX, contentRightX);
     }
 }
 
@@ -2101,10 +2198,7 @@ static void DrawZAiAccessStatus(
 
     if (!activeRun && !compacting && !access.detail.empty() &&
         access.state != UsageTelemetry::AccessState::OutOfUsage) {
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
-        ImGui::TextWrapped("%s", access.detail.c_str());
-        ImGui::PopStyleColor();
+        DrawStatusDetailText(access.detail.c_str(), contentStartX, contentRightX);
     }
 }
 
@@ -2688,16 +2782,6 @@ static bool HasCodexWindow(const Codex::Snapshot& snapshot, const char* label)
     return false;
 }
 
-static bool HasZAiModelWindow(const ZAi::Snapshot& snapshot, const char* compactModel)
-{
-    for (const ZAi::UsageBar& bar : snapshot.bars) {
-        if (bar.valid && Text::get_instance()->CompactLower(bar.label) == compactModel) {
-            return true;
-        }
-    }
-
-    return false;
-}
 
 static void DrawCodexQuotaCard()
 {
@@ -3064,46 +3148,24 @@ static void DrawCleanProviderNotifications(AppSettings::ProviderNotifications& s
 
 static void DrawCleanQuotaWarnings(bool codex)
 {
-    bool codexSession = false;
-    bool codexWeekly = false;
-    Claude::Snapshot claudeSnapshot;
-
-    if (codex) {
-        Codex::Snapshot snapshot = CopyCodexSnapshotForSettings();
-        codexSession = HasCodexWindow(snapshot, "Session");
-        codexWeekly = HasCodexWindow(snapshot, "Weekly");
-
-        if (!codexSession && !codexWeekly) {
-            DrawSettingsMutedText("No quota windows are currently available.");
-            return;
-        }
-    }
-    else {
-        claudeSnapshot = CopyClaudeSnapshotForSettings();
-        bool any = claudeSnapshot.currentSession.valid || claudeSnapshot.weeklyAllModels.valid ||
-            claudeSnapshot.weeklySonnet.valid || claudeSnapshot.weeklyFable.valid ||
-            (claudeSnapshot.credits.valid && claudeSnapshot.credits.enabled && claudeSnapshot.credits.hasUsedPercent);
-
-        if (!any) {
-            DrawSettingsMutedText("No quota windows are currently available.");
-            return;
-        }
-    }
-
+    // Every rule this provider defines is always listed. A warning threshold is
+    // a saved preference: gating the row on the window being present in the
+    // current snapshot made it impossible to configure warnings for exactly the
+    // account that is rate limited, signed out, or on a local fallback.
     if (ImGui::BeginTable("##provider_quota_table", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
         ImGui::TableSetupColumn("Quota", ImGuiTableColumnFlags_WidthStretch, 0.48f);
         ImGui::TableSetupColumn("Threshold", ImGuiTableColumnFlags_WidthStretch, 0.52f);
 
         if (codex) {
-            if (codexSession) DrawQuotaRuleSettings("5-hour limit", g_codexQuotaWarnings.fiveHour);
-            if (codexWeekly) DrawQuotaRuleSettings("Weekly - all models", g_codexQuotaWarnings.weekly);
+            DrawQuotaRuleSettings("5-hour limit", g_codexQuotaWarnings.fiveHour);
+            DrawQuotaRuleSettings("Weekly - all models", g_codexQuotaWarnings.weekly);
         }
         else {
-            if (claudeSnapshot.currentSession.valid) DrawQuotaRuleSettings("Current session", g_claudeQuotaWarnings.currentSession);
-            if (claudeSnapshot.weeklyAllModels.valid) DrawQuotaRuleSettings("All models", g_claudeQuotaWarnings.allModels);
-            if (claudeSnapshot.weeklySonnet.valid) DrawQuotaRuleSettings("Sonnet", g_claudeQuotaWarnings.sonnet);
-            if (claudeSnapshot.weeklyFable.valid) DrawQuotaRuleSettings("Fable", g_claudeQuotaWarnings.fable);
-            if (claudeSnapshot.credits.valid && claudeSnapshot.credits.enabled && claudeSnapshot.credits.hasUsedPercent) DrawQuotaRuleSettings("Usage credits", g_claudeQuotaWarnings.credits);
+            DrawQuotaRuleSettings("Current session", g_claudeQuotaWarnings.currentSession);
+            DrawQuotaRuleSettings("All models", g_claudeQuotaWarnings.allModels);
+            DrawQuotaRuleSettings("Sonnet", g_claudeQuotaWarnings.sonnet);
+            DrawQuotaRuleSettings("Fable", g_claudeQuotaWarnings.fable);
+            DrawQuotaRuleSettings("Usage credits", g_claudeQuotaWarnings.credits);
         }
 
         ImGui::EndTable();
@@ -3127,21 +3189,12 @@ static void DrawCleanZAiNotifications()
 
 static void DrawCleanZAiQuotaWarnings()
 {
-    ZAi::Snapshot snapshot = CopyZAiSnapshotForSettings();
-    bool hasGlm52 = HasZAiModelWindow(snapshot, "glm5.2");
-    bool hasTurbo = HasZAiModelWindow(snapshot, "glm5turbo");
-
-    if (!hasGlm52 && !hasTurbo) {
-        DrawSettingsMutedText("No quota windows are currently available.");
-        return;
-    }
-
     if (ImGui::BeginTable("##zai_quota_table", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
         ImGui::TableSetupColumn("Quota", ImGuiTableColumnFlags_WidthStretch, 0.48f);
         ImGui::TableSetupColumn("Threshold", ImGuiTableColumnFlags_WidthStretch, 0.52f);
 
-        if (hasGlm52) DrawQuotaRuleSettings("GLM-5.2", g_zaiQuotaWarnings.glm52);
-        if (hasTurbo) DrawQuotaRuleSettings("GLM-5-Turbo", g_zaiQuotaWarnings.turbo);
+        DrawQuotaRuleSettings("GLM-5.2", g_zaiQuotaWarnings.glm52);
+        DrawQuotaRuleSettings("GLM-5-Turbo", g_zaiQuotaWarnings.turbo);
 
         ImGui::EndTable();
     }
@@ -3164,13 +3217,6 @@ static void DrawCleanGrokNotifications()
 
 static void DrawCleanGrokQuotaWarnings()
 {
-    Grok::Snapshot snapshot = CopyGrokSnapshotForSettings();
-
-    if (!snapshot.weeklyLimit.valid) {
-        DrawSettingsMutedText("No quota windows are currently available.");
-        return;
-    }
-
     if (ImGui::BeginTable("##grok_quota_table", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
         ImGui::TableSetupColumn("Quota", ImGuiTableColumnFlags_WidthStretch, 0.48f);
         ImGui::TableSetupColumn("Threshold", ImGuiTableColumnFlags_WidthStretch, 0.52f);
@@ -3841,6 +3887,1079 @@ static void DrawActiveMainTab()
     }
 }
 
+// ---------------------------------------------------------------------------
+// Widget mode
+//
+// Same information density as the main panel, in a docked column: a section per
+// host, then every quota window that host reports as label / capsule meter /
+// reading, followed by the live context meter. The meter is DrawThinBar - the
+// exact bar the main window uses - so the two views never disagree.
+//
+// The chrome (slab, rail, pills) is drawn straight into the draw list; only the
+// bars are shared. AIQuotaChecker.cpp owns snapping and the drop-down slide.
+// ---------------------------------------------------------------------------
+
+namespace WidgetSkin
+{
+    static const ImU32 kPanelTop    = Color(24, 26, 34, 252);
+    static const ImU32 kPanelBottom = Color(15, 16, 22, 252);
+    static const ImU32 kBorder      = Color(54, 58, 72, 220);
+    static const ImU32 kCardTop     = Color(33, 36, 46, 255);
+    static const ImU32 kCardBottom  = Color(23, 25, 33, 255);
+    static const ImU32 kCardBorder  = Color(58, 63, 80, 210);
+    static const ImU32 kHeading     = Color(150, 158, 178);
+    static const ImU32 kHost        = Color(236, 240, 248);
+    static const ImU32 kLabel       = Color(196, 203, 217);
+    static const ImU32 kCaption     = Color(128, 136, 156);
+    static const ImU32 kGaugeTrack  = Color(46, 50, 62);
+    static const ImU32 kGood        = Color(64, 206, 140);
+    static const ImU32 kWarn        = Color(240, 178, 64);
+    static const ImU32 kBad         = Color(240, 82, 82);
+
+    static ImU32 Fade(ImU32 color, float alpha)
+    {
+        ImVec4 v = ImGui::ColorConvertU32ToFloat4(color);
+        v.w *= alpha;
+        return ImGui::ColorConvertFloat4ToU32(v);
+    }
+
+    static ImU32 Mix(ImU32 a, ImU32 b, float t)
+    {
+        ImVec4 x = ImGui::ColorConvertU32ToFloat4(a);
+        ImVec4 y = ImGui::ColorConvertU32ToFloat4(b);
+        return ImGui::ColorConvertFloat4ToU32(ImVec4(
+            x.x + (y.x - x.x) * t,
+            x.y + (y.y - x.y) * t,
+            x.z + (y.z - x.z) * t,
+            x.w + (y.w - x.w) * t
+        ));
+    }
+
+    // Rounded slab with a vertical gradient and a hairline border.
+    static void Slab(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 top, ImU32 bottom, ImU32 border, float rounding)
+    {
+        dl->AddRectFilledMultiColor(a, b, top, top, bottom, bottom);
+        // The multi-color fill has square corners; overlay a rounded border and
+        // clip the corners with the panel colour so the rounding still reads.
+        dl->AddRect(a, b, border, rounding, 0, 1.0f);
+    }
+
+    static ImU32 ProviderAccent(const std::string& key)
+    {
+        if (key == "codex") return Color(30, 200, 130);
+        if (key == "claude") return Color(216, 122, 85);
+        if (key == "zai") return Color(74, 134, 246);
+        return Color(170, 178, 192);
+    }
+
+    struct Verdict { const char* label; ImU32 color; };
+
+    static Verdict Severity(float usedPercent)
+    {
+        if (usedPercent >= 100.0f) return { "LIMIT", kBad };
+        if (usedPercent >= 90.0f)  return { "CRITICAL", kBad };
+        if (usedPercent >= 75.0f)  return { "LOW", kWarn };
+        return { "HEALTHY", kGood };
+    }
+}
+
+struct WidgetMetric
+{
+    std::string label;
+    std::string reading;
+    std::string reset;
+    float usedPercent = 0.0f;
+    long long resetAtUnixSeconds = 0;
+    bool valid = false;
+    bool bounded = true;
+    bool isContext = false;
+    ImU32 fill = Color(38, 132, 255);
+};
+
+static WidgetMetric WidgetTextMetric(
+    const std::string& label,
+    const std::string& value,
+    const std::string& sub = {}
+)
+{
+    WidgetMetric metric;
+    metric.label = label;
+    metric.reading = value;
+    metric.reset = sub;
+    metric.valid = true;
+    metric.bounded = false;
+    return metric;
+}
+
+// Where each card landed this frame, so a drag can be resolved to a target
+// slot. Cleared and refilled every frame.
+struct WidgetSectionHit
+{
+    std::string key;
+    float top = 0.0f;
+    float bottom = 0.0f;
+    bool active = false;
+};
+
+static std::vector<WidgetSectionHit> g_widgetSectionHits;
+static bool g_widgetOrderDirty = false;
+
+struct WidgetSection
+{
+    const char* key = "";
+    const char* host = "";
+    std::string plan;
+    std::string state;
+    std::string footer;
+    ImU32 stateColor = Color(126, 134, 152);
+    std::vector<WidgetMetric> metrics;
+};
+
+static std::string WidgetSectionFooter(
+    const UsageTelemetry::RunUsage& run,
+    const std::string& lastUpdated
+)
+{
+    std::string footer;
+
+    if (run.valid && run.running) {
+        const long long now = static_cast<long long>(std::time(nullptr));
+        const long long elapsed = run.startedAtUnixSeconds > 0 && now >= run.startedAtUnixSeconds
+            ? now - run.startedAtUnixSeconds
+            : 0;
+
+        footer = FormatRunDuration(elapsed);
+
+        if (run.tokenStatsValid && run.currentTokens > 0) {
+            footer += " · " + FormatCompactTokenCount(run.currentTokens) + " out";
+        }
+
+        if (run.tokens > 0) {
+            footer += " · " + FormatCompactTokenCount(run.tokens) + " total";
+        }
+
+        return footer;
+    }
+
+    if (!lastUpdated.empty() && lastUpdated != "never") {
+        return "Updated " + lastUpdated;
+    }
+
+    return {};
+}
+
+static std::string WidgetPercentReading(float usedPercent)
+{
+    const float shown = g_showRemaining ? 100.0f - usedPercent : usedPercent;
+    return Format::get_instance()->Percent(shown) +
+        (g_showRemaining ? " left" : " used");
+}
+
+// The pacing line the other usage tools lead with. Window length is never
+// reported, so this divides the quota actually left by the time actually left.
+static std::string WidgetPaceHint(float usedPercent, long long resetAtUnixSeconds)
+{
+    if (resetAtUnixSeconds <= 0) {
+        return {};
+    }
+
+    const long long now = static_cast<long long>(std::time(nullptr));
+    const long long secondsLeft = resetAtUnixSeconds - now;
+
+    if (secondsLeft <= 60) {
+        return {};
+    }
+
+    const float remaining = Math::get_instance()->ClampPercentFloat(100.0f - usedPercent);
+
+    if (remaining <= 0.0f) {
+        return "Exhausted until reset";
+    }
+
+    const double hoursLeft = static_cast<double>(secondsLeft) / 3600.0;
+    const double perHour = remaining / hoursLeft;
+
+    char buffer[64]{};
+
+    if (perHour >= 10.0) {
+        std::snprintf(buffer, sizeof(buffer), "%.0f%%/h left", perHour);
+    }
+    else if (perHour >= 1.0) {
+        std::snprintf(buffer, sizeof(buffer), "%.1f%%/h left", perHour);
+    }
+    else {
+        std::snprintf(buffer, sizeof(buffer), "%.2f%%/h left", perHour);
+    }
+
+    return buffer;
+}
+
+static WidgetMetric WidgetMetricFromWindow(
+    const std::string& label,
+    float usedPercent,
+    const std::string& resetText,
+    bool valid,
+    long long resetAtUnixSeconds = 0,
+    ImU32 fill = Color(38, 132, 255)
+)
+{
+    WidgetMetric metric;
+    metric.label = label;
+    metric.valid = valid;
+    metric.usedPercent = usedPercent;
+    metric.resetAtUnixSeconds = resetAtUnixSeconds;
+    metric.fill = fill;
+
+    if (valid) {
+        metric.reading = WidgetPercentReading(usedPercent);
+
+        metric.reset = resetAtUnixSeconds > 0
+            ? ResetTime::get_instance()->Format(
+                resetAtUnixSeconds,
+                g_resetDisplayMode,
+                g_showResetDateDetails
+            )
+            : resetText;
+
+        if (metric.reset.empty()) {
+            metric.reset = resetText;
+        }
+    }
+    else {
+        metric.reading = "--";
+    }
+
+    return metric;
+}
+
+static void AppendWidgetContextMetric(
+    WidgetSection& section,
+    const UsageTelemetry::ContextUsage& context
+)
+{
+    if (!context.valid || context.contextWindowTokens <= 0) {
+        return;
+    }
+
+    const float usedPercent = Math::get_instance()->PercentUsed(
+        static_cast<double>(context.usedTokens),
+        static_cast<double>(context.contextWindowTokens)
+    );
+
+    WidgetMetric metric;
+    metric.label = "Context";
+    metric.valid = true;
+    metric.isContext = true;
+    metric.usedPercent = usedPercent;
+    metric.fill = context.compacting ? WidgetSkin::kWarn : Color(88, 176, 255);
+    metric.reading = FormatCompactTokenCount(context.usedTokens) + " / " +
+        FormatCompactTokenCount(context.contextWindowTokens);
+
+    if (context.compacting) {
+        metric.reset = "compacting...";
+    }
+    else if (context.autoCompactPercentValid) {
+        metric.reset = "compact @ " + std::to_string(context.autoCompactPercentLeft) + "%";
+    }
+
+    section.metrics.push_back(std::move(metric));
+}
+
+static void SetWidgetSectionState(
+    WidgetSection& section,
+    const UsageTelemetry::AccessStatus& access,
+    const UsageTelemetry::RunUsage& run,
+    const UsageTelemetry::ContextUsage& context,
+    bool loading
+)
+{
+    if (context.compacting) {
+        section.state = "COMPACTING";
+        section.stateColor = WidgetSkin::kWarn;
+        return;
+    }
+
+    if (run.valid && run.running) {
+        section.state = "THINKING";
+        section.stateColor = WidgetSkin::kGood;
+        return;
+    }
+
+    if (loading) {
+        section.state = "SYNC";
+        section.stateColor = WidgetSkin::kCaption;
+        return;
+    }
+
+    const char* label = AccessStateLabel(access.state);
+    section.state = label && *label ? label : "";
+
+    const ImVec4 color = AccessStateColor(access.state);
+    section.stateColor = Color(
+        static_cast<int>(color.x * 255.0f),
+        static_cast<int>(color.y * 255.0f),
+        static_cast<int>(color.z * 255.0f)
+    );
+}
+
+static constexpr float kWidgetEdgeInset = 6.0f;
+
+// A 270-degree arc gauge, opening at the bottom. Draws the muted track then the
+// value arc with rounded end caps - the signature look of the reference apps.
+static void DrawGaugeArc(
+    ImDrawList* dl,
+    ImVec2 center,
+    float radius,
+    float thickness,
+    float fraction,
+    ImU32 color
+)
+{
+    const float start = IM_PI * 0.75f;
+    const float sweep = IM_PI * 1.5f;
+    fraction = std::clamp(fraction, 0.0f, 1.0f);
+
+    dl->PathArcTo(center, radius, start, start + sweep, 64);
+    dl->PathStroke(WidgetSkin::kGaugeTrack, 0, thickness);
+
+    if (fraction <= 0.001f) {
+        return;
+    }
+
+    const float end = start + sweep * fraction;
+    dl->PathArcTo(center, radius, start, end, std::max(4, static_cast<int>(64 * fraction)));
+    dl->PathStroke(color, 0, thickness);
+
+    dl->AddCircleFilled(
+        ImVec2(center.x + std::cos(start) * radius, center.y + std::sin(start) * radius),
+        thickness * 0.5f, color);
+    dl->AddCircleFilled(
+        ImVec2(center.x + std::cos(end) * radius, center.y + std::sin(end) * radius),
+        thickness * 0.5f, color);
+}
+
+// A small rounded status pill: HEALTHY / LOW / THINKING / UNAVAILABLE, etc.
+static void DrawStatusBadge(ImDrawList* dl, ImVec2 rightTop, const char* text, ImU32 color)
+{
+    if (!text || !*text) {
+        return;
+    }
+
+    const ImVec2 size = ImGui::CalcTextSize(text);
+    const float padX = 7.0f;
+    const float padY = 3.0f;
+    const ImVec2 b(rightTop.x, rightTop.y + size.y + padY * 2.0f);
+    const ImVec2 a(rightTop.x - size.x - padX * 2.0f, rightTop.y);
+
+    dl->AddRectFilled(a, b, WidgetSkin::Fade(color, 0.18f), (b.y - a.y) * 0.5f);
+    dl->AddRect(a, b, WidgetSkin::Fade(color, 0.75f), (b.y - a.y) * 0.5f, 0, 1.0f);
+    dl->AddText(ImVec2(a.x + padX, a.y + padY), color, text);
+}
+
+// Custom icon button drawn entirely from primitives - no stock ImGui frame, no
+// font glyphs. `icon`: 0 pin, 1 refresh, 2 restore, 3 close.
+static bool WidgetIconButton(const char* id, int icon, ImVec2 size, ImU32 accent, bool activeState)
+{
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const bool pressed = ImGui::InvisibleButton(id, size);
+    const bool hovered = ImGui::IsItemHovered();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    const ImU32 base = activeState ? WidgetSkin::Fade(accent, 0.85f)
+        : (hovered ? WidgetSkin::Fade(accent, 0.30f) : Color(38, 41, 52, 235));
+    dl->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y), base, 6.0f);
+    dl->AddRect(pos, ImVec2(pos.x + size.x, pos.y + size.y),
+        hovered ? WidgetSkin::Fade(accent, 0.9f) : WidgetSkin::kBorder, 6.0f, 0, 1.0f);
+
+    const ImVec2 c(pos.x + size.x * 0.5f, pos.y + size.y * 0.5f);
+    const ImU32 ink = WidgetSkin::kHost;
+    const float r = 5.0f;
+
+    switch (icon) {
+    case 0: // pin: three dots
+        for (int i = -1; i <= 1; ++i) {
+            dl->AddCircleFilled(ImVec2(c.x + i * 4.0f, c.y), 1.6f, ink);
+        }
+        break;
+    case 1: // refresh: open ring with an arrow head
+        dl->PathArcTo(c, r, IM_PI * 0.35f, IM_PI * 1.9f, 20);
+        dl->PathStroke(ink, 0, 1.6f);
+        dl->AddTriangleFilled(
+            ImVec2(c.x + r * 0.9f, c.y - r * 0.9f),
+            ImVec2(c.x + r * 1.7f, c.y - r * 0.5f),
+            ImVec2(c.x + r * 0.7f, c.y - r * 0.1f), ink);
+        break;
+    case 2: // restore: small square
+        dl->AddRect(ImVec2(c.x - r, c.y - r), ImVec2(c.x + r, c.y + r), ink, 1.5f, 0, 1.6f);
+        break;
+    default: // close: X
+        dl->AddLine(ImVec2(c.x - r, c.y - r), ImVec2(c.x + r, c.y + r), ink, 1.8f);
+        dl->AddLine(ImVec2(c.x - r, c.y + r), ImVec2(c.x + r, c.y - r), ink, 1.8f);
+        break;
+    }
+
+    return pressed;
+}
+
+// One provider, rendered as a card: radial gauge on the left, status + details
+// on the right, a reset strip along the bottom. This is the whole redesign -
+// every pixel is drawn here rather than composed from stock widgets.
+static void DrawWidgetSectionCard(const std::string& key, const WidgetSection& section)
+{
+    // Split the metrics into the gauge windows, the context meter, and text.
+    std::vector<const WidgetMetric*> windows;
+    const WidgetMetric* context = nullptr;
+    std::vector<const WidgetMetric*> texts;
+
+    for (const WidgetMetric& metric : section.metrics) {
+        if (metric.isContext) context = &metric;
+        else if (metric.bounded && metric.valid) windows.push_back(&metric);
+        else texts.push_back(&metric);
+    }
+
+    const WidgetMetric* primary = !windows.empty() ? windows[0] : nullptr;
+    const WidgetMetric* secondary = windows.size() > 1 ? windows[1] : context;
+
+    // Build the right-hand detail lines.
+    std::vector<std::string> details;
+    if (primary) {
+        const float shown = g_showRemaining ? 100.0f - primary->usedPercent : primary->usedPercent;
+        details.push_back(primary->label + "  " +
+            Format::get_instance()->Percent(shown) + (g_showRemaining ? " left" : " used"));
+    }
+    if (windows.size() > 1) {
+        const WidgetMetric* w = windows[1];
+        const float shown = g_showRemaining ? 100.0f - w->usedPercent : w->usedPercent;
+        details.push_back(w->label + "  " +
+            Format::get_instance()->Percent(shown) + (g_showRemaining ? " left" : " used"));
+    }
+    for (size_t i = 2; i < windows.size(); ++i) {
+        const WidgetMetric* w = windows[i];
+        const float shown = g_showRemaining ? 100.0f - w->usedPercent : w->usedPercent;
+        details.push_back(w->label + "  " + Format::get_instance()->Percent(shown));
+    }
+    for (const WidgetMetric* t : texts) {
+        std::string line = t->label + ": " + t->reading;
+        details.push_back(line);
+    }
+    if (context) {
+        std::string line = "Context  " + context->reading;
+        if (!context->reset.empty()) line += "  (" + context->reset + ")";
+        details.push_back(line);
+    }
+    if (details.size() > 4) details.resize(4);
+
+    const float lineH = ImGui::GetTextLineHeight();
+    const float pad = 12.0f;
+    const float gaugeR = 38.0f;
+    const float gaugeThick = 8.0f;
+
+    const float headerH = lineH + 6.0f;
+    const float detailBlockH = headerH + static_cast<float>(details.size()) * (lineH + 3.0f);
+    const float gaugeBlockH = gaugeR * 2.0f + 6.0f;
+    const bool hasReset = primary && !primary->reset.empty();
+    const float footerH = hasReset ? lineH + 10.0f : 4.0f;
+    const float cardH = pad + std::max(gaugeBlockH, detailBlockH) + footerH + pad;
+
+    const float width = ImGui::GetContentRegionAvail().x - kWidgetEdgeInset;
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const ImVec2 cardMin(origin.x, origin.y);
+    const ImVec2 cardMax(origin.x + width, origin.y + cardH);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImU32 accent = WidgetSkin::ProviderAccent(key);
+
+    WidgetSkin::Slab(dl, cardMin, cardMax, WidgetSkin::kCardTop, WidgetSkin::kCardBottom,
+        WidgetSkin::kCardBorder, 10.0f);
+    // Accent bar down the left edge.
+    dl->AddRectFilled(ImVec2(cardMin.x + 1.0f, cardMin.y + 8.0f),
+        ImVec2(cardMin.x + 3.5f, cardMax.y - 8.0f), accent, 2.0f);
+
+    // Drag handle: the top-left grip. Only this area starts a reorder, so the
+    // rest of the card stays inert.
+    ImGui::PushID(key.c_str());
+    ImGui::SetCursorScreenPos(ImVec2(cardMin.x + 8.0f, cardMin.y + 6.0f));
+    ImGui::InvisibleButton("##grip", ImVec2(width - 16.0f, headerH));
+    const bool active = ImGui::IsItemActive();
+    if (ImGui::IsItemHovered() || active) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    }
+    ImGui::PopID();
+    g_widgetSectionHits.push_back({ section.key, cardMin.y, cardMax.y, active });
+
+    // ---- gauge ----
+    const ImVec2 gaugeCenter(cardMin.x + pad + gaugeR, cardMin.y + pad + gaugeR);
+
+    float primaryFrac = 0.0f;
+    float primaryShown = 0.0f;
+    ImU32 gaugeColor = WidgetSkin::kGaugeTrack;
+
+    if (primary) {
+        primaryShown = g_showRemaining ? 100.0f - primary->usedPercent : primary->usedPercent;
+        primaryFrac = primaryShown / 100.0f;
+        gaugeColor = WidgetSkin::Severity(primary->usedPercent).color;
+    }
+    else if (context) {
+        // Honour the global Used/Remaining toggle here too, matching the main
+        // window's context bar and the quota cards.
+        primaryShown = g_showRemaining ? 100.0f - context->usedPercent : context->usedPercent;
+        primaryFrac = primaryShown / 100.0f;
+        gaugeColor = WidgetSkin::Severity(context->usedPercent).color;
+    }
+
+    DrawGaugeArc(dl, gaugeCenter, gaugeR, gaugeThick, primaryFrac, gaugeColor);
+
+    if (secondary && secondary != primary) {
+        const float shown = g_showRemaining ? 100.0f - secondary->usedPercent : secondary->usedPercent;
+        DrawGaugeArc(dl, gaugeCenter, gaugeR - gaugeThick - 4.0f, 4.0f, shown / 100.0f,
+            WidgetSkin::Fade(gaugeColor, 0.55f));
+    }
+
+    // big number in the center
+    {
+        char big[16];
+        std::snprintf(big, sizeof(big), "%d", static_cast<int>(primaryShown + 0.5f));
+        ImFont* font = g_widgetBigFont ? g_widgetBigFont : ImGui::GetFont();
+        const float bigSize = 26.0f;
+        const ImVec2 sz = font->CalcTextSizeA(bigSize, FLT_MAX, 0.0f, big);
+        dl->AddText(font, bigSize, ImVec2(gaugeCenter.x - sz.x * 0.5f, gaugeCenter.y - sz.y * 0.6f),
+            WidgetSkin::kHost, big);
+
+        const char* pctSuffix = "%";
+        const ImVec2 psz = ImGui::CalcTextSize(pctSuffix);
+        dl->AddText(ImVec2(gaugeCenter.x - psz.x * 0.5f, gaugeCenter.y + sz.y * 0.4f - 2.0f),
+            WidgetSkin::kCaption, pctSuffix);
+    }
+
+    // ---- right block ----
+    const float rightX = cardMin.x + pad + gaugeR * 2.0f + 22.0f;
+    float y = cardMin.y + pad;
+
+    // provider name + badge
+    {
+        ImFont* font = g_widgetBigFont ? g_widgetBigFont : ImGui::GetFont();
+        const float nameSize = 17.0f;
+        dl->AddText(font, nameSize, ImVec2(rightX, y - 1.0f), accent, section.host);
+    }
+
+    // status badge, right-aligned at the top edge. A transient state (THINKING,
+    // COMPACTING, SYNC, RATE LIMITED, ...) wins; otherwise the badge is the
+    // severity of the primary window, or the context meter for context-only
+    // hosts, so every card carries a verdict.
+    {
+        const char* badgeText = section.state.c_str();
+        ImU32 badgeColor = section.stateColor;
+
+        const bool severityState = section.state.empty() || section.state == "AVAILABLE";
+        const WidgetMetric* ref = primary ? primary : context;
+
+        if (severityState && ref) {
+            const WidgetSkin::Verdict verdict = WidgetSkin::Severity(ref->usedPercent);
+            badgeText = verdict.label;
+            badgeColor = verdict.color;
+        }
+
+        DrawStatusBadge(dl, ImVec2(cardMax.x - pad, y), badgeText, badgeColor);
+    }
+
+    y += headerH + 2.0f;
+
+    for (const std::string& line : details) {
+        dl->AddText(ImVec2(rightX, y), WidgetSkin::kLabel, line.c_str());
+        y += lineH + 3.0f;
+    }
+
+    // ---- reset strip ----
+    if (hasReset) {
+        const float stripY = cardMax.y - footerH + 2.0f;
+        dl->AddLine(ImVec2(cardMin.x + pad, stripY), ImVec2(cardMax.x - pad, stripY),
+            WidgetSkin::Fade(WidgetSkin::kBorder, 0.6f), 1.0f);
+
+        std::string resetLine = primary->reset;
+        const std::string pace = WidgetPaceHint(primary->usedPercent, primary->resetAtUnixSeconds);
+        if (!pace.empty()) resetLine += "  ·  " + pace;
+
+        dl->AddText(ImVec2(cardMin.x + pad, stripY + 4.0f), WidgetSkin::kCaption, resetLine.c_str());
+    }
+
+    ImGui::SetCursorScreenPos(ImVec2(cardMin.x, cardMax.y));
+    ImGui::Dummy(ImVec2(width, 10.0f));
+}
+
+
+static WidgetSection BuildCodexWidgetSection()
+{
+    const Codex::Snapshot snapshot = CopyCodexSnapshotForSettings();
+
+    WidgetSection section;
+    section.key = "codex";
+    section.host = "CODEX";
+    section.plan = snapshot.plan;
+    SetWidgetSectionState(
+        section,
+        snapshot.access,
+        snapshot.run,
+        snapshot.context,
+        g_codexLoading.load()
+    );
+
+    for (const Codex::UsageBar& bar : snapshot.bars) {
+        if (!bar.valid) {
+            continue;
+        }
+
+        section.metrics.push_back(WidgetMetricFromWindow(
+            bar.label.empty() ? bar.sublabel : bar.label,
+            bar.usedPercent,
+            bar.rightText,
+            true,
+            bar.resetAtUnixSeconds
+        ));
+    }
+
+    if (snapshot.extraUsage.valid && snapshot.extraUsage.hasUsedPercent) {
+        section.metrics.push_back(WidgetMetricFromWindow(
+            snapshot.extraUsage.label,
+            snapshot.extraUsage.usedPercent,
+            snapshot.extraUsage.resetText,
+            true,
+            snapshot.extraUsage.resetAtUnixSeconds,
+            Color(160, 132, 240)
+        ));
+    }
+
+    if (snapshot.creditBalance.valid && !snapshot.creditBalance.balanceText.empty()) {
+        section.metrics.push_back(WidgetTextMetric(
+            "Credits",
+            snapshot.creditBalance.unlimited ? "Unlimited" : snapshot.creditBalance.balanceText
+        ));
+    }
+
+    if (snapshot.resetCreditsAvailableCount >= 0) {
+        section.metrics.push_back(WidgetTextMetric(
+            "Reset credits",
+            std::to_string(snapshot.resetCreditsAvailableCount) + " banked"
+        ));
+    }
+
+    if (!snapshot.usageNotice.empty()) {
+        section.metrics.push_back(WidgetTextMetric("Notice", std::string{}, snapshot.usageNotice));
+    }
+
+    AppendWidgetContextMetric(section, snapshot.context);
+    section.footer = WidgetSectionFooter(snapshot.run, snapshot.lastUpdated);
+    return section;
+}
+
+static WidgetSection BuildClaudeWidgetSection()
+{
+    const Claude::Snapshot snapshot = CopyClaudeSnapshotForSettings();
+
+    WidgetSection section;
+    section.key = "claude";
+    section.host = "CLAUDE";
+    section.plan = snapshot.plan;
+    SetWidgetSectionState(
+        section,
+        snapshot.access,
+        snapshot.run,
+        snapshot.context,
+        g_claudeLoading.load()
+    );
+
+    const Claude::UsageWindow* windows[] = {
+        &snapshot.currentSession,
+        &snapshot.weeklyAllModels,
+        &snapshot.weeklySonnet,
+        &snapshot.weeklyFable
+    };
+
+    for (const Claude::UsageWindow* window : windows) {
+        if (!window->valid) {
+            continue;
+        }
+
+        section.metrics.push_back(WidgetMetricFromWindow(
+            window->title,
+            window->usedPercent,
+            window->resetText,
+            true,
+            window->resetAtUnixSeconds
+        ));
+    }
+
+    for (const Claude::UsageWindow& window : snapshot.additionalLimits) {
+        if (!window.valid) {
+            continue;
+        }
+
+        section.metrics.push_back(WidgetMetricFromWindow(
+            window.title,
+            window.usedPercent,
+            window.resetText,
+            true,
+            window.resetAtUnixSeconds
+        ));
+    }
+
+    if (snapshot.credits.valid && snapshot.credits.hasUsedPercent) {
+        section.metrics.push_back(WidgetMetricFromWindow(
+            snapshot.credits.label,
+            snapshot.credits.usedPercent,
+            snapshot.credits.resetText,
+            true,
+            snapshot.credits.resetAtUnixSeconds,
+            Color(160, 132, 240)
+        ));
+    }
+
+    if (snapshot.credits.valid && !snapshot.credits.hasUsedPercent &&
+        !snapshot.credits.spentText.empty()) {
+        section.metrics.push_back(WidgetTextMetric(
+            snapshot.credits.label,
+            snapshot.credits.spentText,
+            snapshot.credits.monthlyLimitText.empty()
+                ? snapshot.credits.limitText
+                : "of " + snapshot.credits.monthlyLimitText
+        ));
+    }
+
+    if (snapshot.run.costValid) {
+        char spend[48]{};
+        std::snprintf(spend, sizeof(spend), "$%.2f", snapshot.run.sessionCostUsd);
+
+        std::string detail;
+
+        if (snapshot.run.sessionLinesAdded > 0 || snapshot.run.sessionLinesRemoved > 0) {
+            detail = "+" + std::to_string(snapshot.run.sessionLinesAdded) +
+                " / -" + std::to_string(snapshot.run.sessionLinesRemoved) + " lines";
+        }
+
+        if (snapshot.run.sessionApiDurationMs > 0) {
+            if (!detail.empty()) {
+                detail += "  ·  ";
+            }
+
+            detail += FormatRunDuration(snapshot.run.sessionApiDurationMs / 1000) + " API";
+        }
+
+        section.metrics.push_back(WidgetTextMetric("Session cost", spend, detail));
+    }
+
+    AppendWidgetContextMetric(section, snapshot.context);
+    section.footer = WidgetSectionFooter(snapshot.run, snapshot.lastUpdated);
+    return section;
+}
+
+static WidgetSection BuildZAiWidgetSection()
+{
+    const ZAi::Snapshot snapshot = CopyZAiSnapshotForSettings();
+
+    WidgetSection section;
+    section.key = "zai";
+    section.host = "Z.AI";
+    section.plan = snapshot.plan;
+    SetWidgetSectionState(
+        section,
+        snapshot.access,
+        snapshot.run,
+        snapshot.context,
+        g_zaiLoading.load()
+    );
+
+    for (const ZAi::UsageBar& bar : snapshot.bars) {
+        if (!bar.valid) {
+            continue;
+        }
+
+        ImU32 fill = Color(38, 132, 255);
+
+        if (bar.red) fill = Color(238, 65, 65);
+        else if (bar.green) fill = Color(68, 215, 128);
+        else if (bar.white) fill = Color(235, 235, 235);
+        else if (bar.spendBalance) fill = Color(160, 132, 240);
+
+        section.metrics.push_back(WidgetMetricFromWindow(
+            bar.label.empty() ? bar.sublabel : bar.label,
+            bar.usedPercent,
+            bar.resetText,
+            true,
+            bar.resetAtUnixSeconds,
+            fill
+        ));
+    }
+
+    for (const ZAi::DetailRow& detail : snapshot.details) {
+        if (!detail.leftLabel.empty() && !detail.leftValue.empty()) {
+            section.metrics.push_back(WidgetTextMetric(detail.leftLabel, detail.leftValue));
+        }
+
+        if (!detail.rightLabel.empty() && !detail.rightValue.empty()) {
+            section.metrics.push_back(WidgetTextMetric(detail.rightLabel, detail.rightValue));
+        }
+    }
+
+    if (snapshot.context.latestCacheHitPercentValid) {
+        section.metrics.push_back(WidgetTextMetric(
+            "Cache hit",
+            Format::get_instance()->Percent(snapshot.context.latestCacheHitPercent),
+            snapshot.context.averageCacheHitPercentValid
+                ? "avg " + Format::get_instance()->Percent(snapshot.context.averageCacheHitPercent)
+                : std::string{}
+        ));
+    }
+
+    AppendWidgetContextMetric(section, snapshot.context);
+    section.footer = WidgetSectionFooter(snapshot.run, snapshot.lastUpdated);
+    return section;
+}
+
+static WidgetSection BuildGrokWidgetSection()
+{
+    const Grok::Snapshot snapshot = CopyGrokSnapshotForSettings();
+
+    WidgetSection section;
+    section.key = "grok";
+    section.host = "GROK";
+    section.plan = snapshot.plan;
+
+    UsageTelemetry::RunUsage idle;
+    SetWidgetSectionState(
+        section,
+        snapshot.access,
+        idle,
+        snapshot.context,
+        g_grokLoading.load()
+    );
+
+    if (snapshot.weeklyLimit.valid) {
+        section.metrics.push_back(WidgetMetricFromWindow(
+            snapshot.weeklyLimit.title,
+            snapshot.weeklyLimit.usedPercent,
+            snapshot.weeklyLimit.resetText,
+            true,
+            snapshot.weeklyLimit.resetAtUnixSeconds
+        ));
+    }
+
+    for (const Grok::ProductUsage& product : snapshot.products) {
+        section.metrics.push_back(WidgetMetricFromWindow(
+            product.product,
+            product.usagePercent,
+            std::string{},
+            true
+        ));
+    }
+
+    if (snapshot.extraCredits.valid) {
+        WidgetMetric credits = WidgetMetricFromWindow(
+            "Credits",
+            snapshot.extraCredits.usedPercent,
+            std::string{},
+            true,
+            0,
+            Color(160, 132, 240)
+        );
+        credits.reading = snapshot.extraCredits.balanceText + " left";
+        section.metrics.push_back(std::move(credits));
+    }
+
+    AppendWidgetContextMetric(section, snapshot.context);
+
+    UsageTelemetry::RunUsage idleRun;
+    section.footer = WidgetSectionFooter(idleRun, snapshot.lastUpdated);
+    return section;
+}
+
+static void DrawWidgetUi()
+{
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImVec2 panelMin = ImGui::GetWindowPos();
+    const ImVec2 panelSize = ImGui::GetWindowSize();
+    const ImVec2 panelMax(panelMin.x + panelSize.x, panelMin.y + panelSize.y);
+
+    draw->AddRectFilledMultiColor(panelMin, panelMax,
+        WidgetSkin::kPanelTop, WidgetSkin::kPanelTop,
+        WidgetSkin::kPanelBottom, WidgetSkin::kPanelBottom);
+    draw->AddRect(panelMin, panelMax, WidgetSkin::kBorder, 8.0f, 0, 1.0f);
+
+    // Everything in the widget renders in Segoe UI (falls back to default).
+    if (g_widgetFont) {
+        ImGui::PushFont(g_widgetFont);
+    }
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 12.0f));
+    ImGui::BeginChild("##widget_panel", ImVec2(0.0f, 0.0f), false,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+    ImDrawList* inner = ImGui::GetWindowDrawList();
+    const float contentWidth = ImGui::GetContentRegionAvail().x;
+    const ImVec2 headerOrigin = ImGui::GetCursorScreenPos();
+
+    // ---- header ----
+    {
+        // A little app badge: a filled rounded square with a spark.
+        const ImVec2 badgeA(headerOrigin.x, headerOrigin.y - 1.0f);
+        const ImVec2 badgeB(badgeA.x + 26.0f, badgeA.y + 26.0f);
+        inner->AddRectFilledMultiColor(badgeA, badgeB,
+            Color(88, 176, 255), Color(150, 110, 240),
+            Color(120, 90, 220), Color(60, 140, 220));
+        inner->AddRect(badgeA, badgeB, WidgetSkin::Fade(Color(255, 255, 255), 0.25f), 6.0f, 0, 1.0f);
+        DrawGenericQuotaIcon(ImVec2((badgeA.x + badgeB.x) * 0.5f, (badgeA.y + badgeB.y) * 0.5f), 13.0f);
+
+        ImFont* titleFont = g_widgetBigFont ? g_widgetBigFont : ImGui::GetFont();
+        inner->AddText(titleFont, 17.0f, ImVec2(headerOrigin.x + 34.0f, headerOrigin.y - 3.0f),
+            WidgetSkin::kHost, "AI Quota");
+        inner->AddText(ImVec2(headerOrigin.x + 34.0f, headerOrigin.y + 15.0f),
+            WidgetSkin::kCaption, g_widgetPinned ? "pinned monitor" : "usage monitor");
+    }
+
+    // right-aligned icon buttons: pin / refresh / restore / close
+    const float btnW = 26.0f;
+    const float btnH = 22.0f;
+    const float gap = 6.0f;
+    ImGui::SetCursorScreenPos(ImVec2(
+        headerOrigin.x + contentWidth - (btnW * 4.0f + gap * 3.0f),
+        headerOrigin.y));
+
+    const bool pin = WidgetIconButton("##w_pin", 0, ImVec2(btnW, btnH),
+        Color(214, 162, 48), g_widgetPinned);
+    ImGui::SameLine(0.0f, gap);
+    const bool refresh = WidgetIconButton("##w_refresh", 1, ImVec2(btnW, btnH), Color(60, 130, 210), false);
+    ImGui::SameLine(0.0f, gap);
+    const bool restore = WidgetIconButton("##w_restore", 2, ImVec2(btnW, btnH), Color(60, 130, 210), false);
+    ImGui::SameLine(0.0f, gap);
+    const bool close = WidgetIconButton("##w_close", 3, ImVec2(btnW, btnH), Color(200, 64, 64), false);
+
+    if (pin) {
+        g_widgetPinned = !g_widgetPinned;
+        if (R().saveAppSettings) R().saveAppSettings();
+    }
+    if (refresh) {
+        if (R().refreshCodexAsync) R().refreshCodexAsync();
+        if (R().refreshClaudeAsync) R().refreshClaudeAsync();
+        if (R().refreshZAiAsync) R().refreshZAiAsync();
+        if (R().refreshGrokAsync) R().refreshGrokAsync();
+    }
+    if (restore) {
+        g_widgetMode = false;
+        if (R().saveAppSettings) R().saveAppSettings();
+    }
+    if (close) {
+        g_shouldClose = true;
+    }
+
+    ImGui::SetCursorScreenPos(ImVec2(headerOrigin.x, headerOrigin.y + 30.0f));
+
+    // gradient rule
+    const ImVec2 ruleAt = ImGui::GetCursorScreenPos();
+    inner->AddRectFilledMultiColor(ruleAt, ImVec2(ruleAt.x + contentWidth, ruleAt.y + 1.0f),
+        WidgetSkin::Fade(Color(120, 150, 255), 0.0f), Color(120, 150, 255),
+        Color(120, 150, 255), WidgetSkin::Fade(Color(120, 150, 255), 0.0f));
+
+    ImGui::Dummy(ImVec2(contentWidth, 10.0f));
+
+    // ---- ordered / filtered provider cards ----
+    static const char* const kKnownHosts[] = { "codex", "claude", "zai", "grok" };
+
+    std::vector<std::string> order;
+    {
+        std::stringstream stream(R().widgetOrder ? *R().widgetOrder : std::string{});
+        std::string token;
+        while (std::getline(stream, token, ',')) {
+            while (!token.empty() && (token.front() == ' ' || token.front() == '\t')) token.erase(token.begin());
+            while (!token.empty() && (token.back() == ' ' || token.back() == '\t')) token.pop_back();
+            if (token.empty()) continue;
+            bool known = false;
+            for (const char* host : kKnownHosts) if (token == host) known = true;
+            if (!known) continue;
+            if (std::find(order.begin(), order.end(), token) == order.end()) order.push_back(token);
+        }
+    }
+    for (const char* host : kKnownHosts) {
+        if (std::find(order.begin(), order.end(), host) == order.end()) order.emplace_back(host);
+    }
+
+    const auto buildSection = [](const std::string& key) -> WidgetSection {
+        if (key == "codex") return BuildCodexWidgetSection();
+        if (key == "claude") return BuildClaudeWidgetSection();
+        if (key == "zai") return BuildZAiWidgetSection();
+        return BuildGrokWidgetSection();
+    };
+
+    std::vector<std::pair<std::string, WidgetSection>> visible;
+    for (const std::string& key : order) {
+        WidgetSection section = buildSection(key);
+        if (section.metrics.empty() && section.state != "SYNC") continue;
+        visible.emplace_back(key, std::move(section));
+    }
+
+    ImGui::BeginChild("##widget_body", ImVec2(0.0f, 0.0f), false,
+        ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
+
+    g_widgetSectionHits.clear();
+
+    if (visible.empty()) {
+        ImGui::Dummy(ImVec2(contentWidth, 6.0f));
+        ImGui::GetWindowDrawList()->AddText(ImGui::GetCursorScreenPos(),
+            WidgetSkin::kCaption, "No usage available yet");
+    }
+    else {
+        for (const auto& entry : visible) {
+            DrawWidgetSectionCard(entry.first, entry.second);
+        }
+    }
+
+    // drag-to-reorder resolution
+    std::string draggedKey;
+    for (const WidgetSectionHit& hit : g_widgetSectionHits) {
+        if (hit.active) { draggedKey = hit.key; break; }
+    }
+
+    if (!draggedKey.empty()) {
+        const float mouseY = ImGui::GetMousePos().y;
+        std::string overKey;
+        for (const WidgetSectionHit& hit : g_widgetSectionHits) {
+            if (mouseY >= hit.top && mouseY <= hit.bottom) { overKey = hit.key; break; }
+        }
+        if (overKey.empty() && !g_widgetSectionHits.empty()) {
+            if (mouseY < g_widgetSectionHits.front().top) overKey = g_widgetSectionHits.front().key;
+            else if (mouseY > g_widgetSectionHits.back().bottom) overKey = g_widgetSectionHits.back().key;
+        }
+        if (!overKey.empty() && overKey != draggedKey) {
+            const auto from = std::find(order.begin(), order.end(), draggedKey);
+            const auto to = std::find(order.begin(), order.end(), overKey);
+            if (from != order.end() && to != order.end()) {
+                const std::string moved = *from;
+                const size_t target = static_cast<size_t>(std::distance(order.begin(), to));
+                order.erase(from);
+                order.insert(order.begin() + std::min(target, order.size()), moved);
+                std::string joined;
+                for (const std::string& key : order) {
+                    if (!joined.empty()) joined.push_back(',');
+                    joined += key;
+                }
+                if (R().widgetOrder) *R().widgetOrder = joined;
+                g_widgetOrderDirty = true;
+            }
+        }
+    }
+
+    if (g_widgetOrderDirty && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+        g_widgetOrderDirty = false;
+        if (R().saveAppSettings) R().saveAppSettings();
+    }
+
+    ImGui::EndChild();
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+
+    if (g_widgetFont) {
+        ImGui::PopFont();
+    }
+}
+
+
 void RenderMainUi(State& state)
 {
     g_state = &state;
@@ -3856,11 +4975,28 @@ void RenderMainUi(State& state)
         ImGuiWindowFlags_NoSavedSettings |
         ImGuiWindowFlags_NoCollapse;
 
+    // The root window is the app frame itself - there is no OS chrome behind it.
+    // Its default padding was letterboxing the whole UI in a band of WindowBg,
+    // which reads as black bars down every edge. Let the panel reach the glass.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+
     ImGui::Begin("AI Quota Checker Root", nullptr, flags);
+
+    ImGui::PopStyleVar(2);
+
+    if (g_widgetMode) {
+        DrawWidgetUi();
+        ImGui::End();
+        return;
+    }
 
     DrawCustomTitleBar();
 
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
     ImGui::BeginChild("##main_panel", ImVec2(0.0f, 0.0f), true, ImGuiWindowFlags_NoScrollbar);
+    ImGui::PopStyleVar(2);
 
     DrawProviderTabStrip();
     DrawActiveMainTab();

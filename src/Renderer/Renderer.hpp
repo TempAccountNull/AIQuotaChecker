@@ -18,6 +18,10 @@ namespace Renderer
     struct State
     {
         bool* shouldClose = nullptr;
+        bool* minimizeRequest = nullptr;
+        bool* widgetMode = nullptr;
+        bool* widgetPinned = nullptr;
+        std::string* widgetOrder = nullptr;
         ID3D11Device* device = nullptr;
 
         std::mutex* codexMutex = nullptr;

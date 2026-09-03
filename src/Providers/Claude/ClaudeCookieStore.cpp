@@ -19,6 +19,10 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#include <tlhelp32.h>
+#endif
+
 #ifndef _WIN32
 #include <cerrno>
 #include <fcntl.h>
@@ -189,6 +193,217 @@ namespace {
     };
 #endif
 
+#ifdef _WIN32
+    // -----------------------------------------------------------------------
+    // Locked-file fallback: borrow Claude Desktop's own open handle
+    //
+    // Recent Claude Desktop builds open Network\Cookies with a share mode that
+    // denies concurrent readers (CreateFileW then fails with Win32 32,
+    // ERROR_SHARING_VIOLATION). The file cannot be opened or copied while
+    // Desktop runs. But Desktop is a process we own, so we can duplicate the
+    // handle it already holds and read through that.
+    //
+    // Reading through a shared handle is safe here for one specific reason: the
+    // only other user of this handle is Chromium's SQLite, whose Win32 VFS
+    // always reads and writes at absolute offsets (OVERLAPPED.Offset) and never
+    // relies on the file's current position. SharedReadFile does the same, so
+    // neither side disturbs the other. This is strictly read-only.
+    // -----------------------------------------------------------------------
+
+    typedef LONG(NTAPI* NtQuerySystemInformationFn)(
+        ULONG SystemInformationClass,
+        PVOID SystemInformation,
+        ULONG SystemInformationLength,
+        PULONG ReturnLength
+    );
+
+    struct SystemHandleEntry {
+        PVOID Object;
+        ULONG_PTR UniqueProcessId;
+        ULONG_PTR HandleValue;
+        ULONG GrantedAccess;
+        USHORT CreatorBackTraceIndex;
+        USHORT ObjectTypeIndex;
+        ULONG HandleAttributes;
+        ULONG Reserved;
+    };
+
+    struct SystemHandleInformationEx {
+        ULONG_PTR NumberOfHandles;
+        ULONG_PTR Reserved;
+        SystemHandleEntry Handles[1];
+    };
+
+    static std::wstring FinalPathForHandle(HANDLE handle) {
+        // FILE_TYPE_DISK gates out pipes/sockets, whose metadata queries can
+        // block; a real file never hangs GetFinalPathNameByHandleW.
+        if (GetFileType(handle) != FILE_TYPE_DISK) {
+            return {};
+        }
+
+        DWORD needed = GetFinalPathNameByHandleW(handle, nullptr, 0, FILE_NAME_NORMALIZED);
+        if (needed == 0 || needed > 4096) {
+            return {};
+        }
+
+        std::wstring path(needed, L'\0');
+        DWORD written = GetFinalPathNameByHandleW(
+            handle,
+            path.data(),
+            static_cast<DWORD>(path.size()),
+            FILE_NAME_NORMALIZED
+        );
+        if (written == 0 || written >= path.size()) {
+            return {};
+        }
+        path.resize(written);
+        return path;
+    }
+
+    static std::wstring NormalizeFilePath(std::wstring path) {
+        // Strip the \\?\ prefix GetFinalPathNameByHandleW adds and lowercase for
+        // a case-insensitive compare against a plain absolute path.
+        if (path.rfind(L"\\\\?\\", 0) == 0) {
+            path.erase(0, 4);
+        }
+        for (wchar_t& c : path) {
+            c = static_cast<wchar_t>(towlower(c));
+        }
+        return path;
+    }
+
+    static std::vector<DWORD> ClaudeDesktopProcessIds() {
+        std::vector<DWORD> pids;
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snapshot == INVALID_HANDLE_VALUE) {
+            return pids;
+        }
+
+        PROCESSENTRY32W entry{};
+        entry.dwSize = sizeof(entry);
+
+        if (Process32FirstW(snapshot, &entry)) {
+            do {
+                if (_wcsicmp(entry.szExeFile, L"claude.exe") == 0) {
+                    pids.push_back(entry.th32ProcessID);
+                }
+            } while (Process32NextW(snapshot, &entry));
+        }
+
+        CloseHandle(snapshot);
+        return pids;
+    }
+
+    // Returns a duplicated, readable handle to targetPath borrowed from a Claude
+    // Desktop process, or INVALID_HANDLE_VALUE. The caller owns the handle.
+    static HANDLE DuplicateLockedFileHandle(const std::wstring& targetPath) {
+        static NtQuerySystemInformationFn queryFn = []() -> NtQuerySystemInformationFn {
+            HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+            return ntdll
+                ? reinterpret_cast<NtQuerySystemInformationFn>(
+                    GetProcAddress(ntdll, "NtQuerySystemInformation"))
+                : nullptr;
+        }();
+
+        if (!queryFn) {
+            return INVALID_HANDLE_VALUE;
+        }
+
+        const std::vector<DWORD> pids = ClaudeDesktopProcessIds();
+        if (pids.empty()) {
+            return INVALID_HANDLE_VALUE;
+        }
+
+        const std::wstring wanted = NormalizeFilePath(targetPath);
+
+        constexpr ULONG kSystemExtendedHandleInformation = 64;
+        constexpr LONG kStatusInfoLengthMismatch = static_cast<LONG>(0xC0000004);
+
+        std::vector<unsigned char> buffer(1u << 20);
+        ULONG returnLength = 0;
+        LONG status = 0;
+
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            status = queryFn(
+                kSystemExtendedHandleInformation,
+                buffer.data(),
+                static_cast<ULONG>(buffer.size()),
+                &returnLength
+            );
+
+            if (status == kStatusInfoLengthMismatch) {
+                buffer.resize(buffer.size() * 2);
+                continue;
+            }
+            break;
+        }
+
+        if (status < 0) {
+            return INVALID_HANDLE_VALUE;
+        }
+
+        const auto* infoBlock = reinterpret_cast<const SystemHandleInformationEx*>(buffer.data());
+        const ULONG_PTR count = infoBlock->NumberOfHandles;
+
+        // Open each source process at most once.
+        std::unordered_map<DWORD, HANDLE> processHandles;
+        HANDLE result = INVALID_HANDLE_VALUE;
+
+        for (ULONG_PTR i = 0; i < count && result == INVALID_HANDLE_VALUE; ++i) {
+            const SystemHandleEntry& entry = infoBlock->Handles[i];
+            const DWORD ownerPid = static_cast<DWORD>(entry.UniqueProcessId);
+
+            if (std::find(pids.begin(), pids.end(), ownerPid) == pids.end()) {
+                continue;
+            }
+
+            HANDLE sourceProcess = nullptr;
+            auto cached = processHandles.find(ownerPid);
+            if (cached != processHandles.end()) {
+                sourceProcess = cached->second;
+            }
+            else {
+                sourceProcess = OpenProcess(PROCESS_DUP_HANDLE, FALSE, ownerPid);
+                processHandles.emplace(ownerPid, sourceProcess);
+            }
+
+            if (!sourceProcess) {
+                continue;
+            }
+
+            HANDLE duplicated = nullptr;
+            if (!DuplicateHandle(
+                    sourceProcess,
+                    reinterpret_cast<HANDLE>(entry.HandleValue),
+                    GetCurrentProcess(),
+                    &duplicated,
+                    0,
+                    FALSE,
+                    DUPLICATE_SAME_ACCESS) ||
+                !duplicated) {
+                continue;
+            }
+
+            const std::wstring path = FinalPathForHandle(duplicated);
+
+            if (!path.empty() && NormalizeFilePath(path) == wanted) {
+                result = duplicated;
+                break;
+            }
+
+            CloseHandle(duplicated);
+        }
+
+        for (const auto& pair : processHandles) {
+            if (pair.second) {
+                CloseHandle(pair.second);
+            }
+        }
+
+        return result;
+    }
+#endif
+
     class SharedReadFile final {
     public:
         SharedReadFile() = default;
@@ -325,6 +540,25 @@ namespace {
 
             if (handle == INVALID_HANDLE_VALUE) {
                 const DWORD error = GetLastError();
+
+                // Claude Desktop opens Cookies with no read sharing, so a normal
+                // open fails with a sharing violation. Borrow the handle Desktop
+                // already holds instead of giving up. This is what lets Auto and
+                // Desktop modes read live usage while Desktop is running.
+                if (error == ERROR_SHARING_VIOLATION) {
+                    HANDLE borrowed = DuplicateLockedFileHandle(m_path.wstring());
+                    if (borrowed != INVALID_HANDLE_VALUE) {
+                        // m_handle now OWNS the duplicated handle. UniqueHandle
+                        // closes it via CloseHandle in its destructor, and this
+                        // SharedReadFile lives only for the duration of one
+                        // ReadOnce call, so the borrowed handle is always closed
+                        // as soon as the read finishes - it never leaks to app
+                        // shutdown, and no duplicated handle is ever left open.
+                        m_handle.Reset(borrowed);
+                        return;
+                    }
+                }
+
                 if (optional &&
                     (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)) {
                     return;
@@ -1296,9 +1530,20 @@ namespace {
         if (liveHeader.size() < kDatabaseHeaderSize) {
             throw std::runtime_error("Claude Desktop Cookies database header is truncated");
         }
-        if (liveHeader[18] != 2 || liveHeader[19] != 2) {
+        // Bytes 18/19 are SQLite's file write/read format versions: 1 =
+        // rollback journal, 2 = WAL. Both are readable here. In WAL mode recent
+        // frames overlay the DB (LivePager handles that); in rollback-journal
+        // mode the main DB file is itself the committed state and the journal
+        // only holds pages to undo, so reading the DB directly is correct. A
+        // hot journal or a bumped change counter forces a consistency retry, so
+        // a mid-commit torn read is never returned. Claude Desktop currently
+        // ships the Cookies DB in rollback-journal mode.
+        const unsigned char writeVersion = liveHeader[18];
+        const unsigned char readVersion = liveHeader[19];
+        if ((writeVersion != 1 && writeVersion != 2) ||
+            (readVersion != 1 && readVersion != 2)) {
             throw std::runtime_error(
-                "Claude Desktop Cookies database is not in WAL mode; direct live reading was refused"
+                "Claude Desktop Cookies database uses an unsupported SQLite journal format"
             );
         }
 

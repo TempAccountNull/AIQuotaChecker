@@ -15,6 +15,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <functional>
@@ -27,6 +28,7 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -41,7 +43,31 @@ namespace Claude {
         double expiresAtMs = 0.0;
         std::string subscriptionType;
         std::string rateLimitTier;
+        // Granted scopes as stored by `claude login`. Older credentials predate
+        // the field, so an empty list means "unknown", not "none".
+        std::vector<std::string> scopes;
+        // A `claude setup-token` / CLAUDE_CODE_OAUTH_TOKEN credential can run
+        // inference but is rejected by the usage endpoint.
+        bool inferenceOnly = false;
     };
+
+    // /api/oauth/usage requires user:profile. A token without it authenticates
+    // fine for inference and then 403s here, which is otherwise indistinguishable
+    // from a server-side failure.
+    static constexpr const char* kClaudeUsageScope = "user:profile";
+
+    static bool ClaudeTokenCanReadUsage(const ClaudeOAuth& oauth) {
+        if (oauth.inferenceOnly) {
+            return false;
+        }
+
+        if (oauth.scopes.empty()) {
+            return true;
+        }
+
+        return std::find(oauth.scopes.begin(), oauth.scopes.end(), kClaudeUsageScope) !=
+            oauth.scopes.end();
+    }
 
     struct ClaudeCredentials {
         ClaudeOAuth oauth;
@@ -120,6 +146,34 @@ namespace Claude {
         oauth.subscriptionType = ClaudeStringAny(oauthJson, { "subscriptionType", "subscription_type" });
         oauth.rateLimitTier = ClaudeStringAny(oauthJson, { "rateLimitTier", "rate_limit_tier" });
 
+        for (const char* key : { "scopes", "scope" }) {
+            auto it = oauthJson.find(key);
+
+            if (it == oauthJson.end()) {
+                continue;
+            }
+
+            if (it->is_array()) {
+                for (const json& entry : *it) {
+                    if (entry.is_string()) {
+                        oauth.scopes.push_back(entry.get<std::string>());
+                    }
+                }
+            }
+            else if (it->is_string()) {
+                std::istringstream stream(it->get<std::string>());
+                std::string scope;
+
+                while (stream >> scope) {
+                    oauth.scopes.push_back(scope);
+                }
+            }
+
+            if (!oauth.scopes.empty()) {
+                break;
+            }
+        }
+
         if (oauth.accessToken.empty()) {
             throw std::runtime_error(
                 "Claude Code accessToken is missing from .credentials.json: " + path.string()
@@ -143,6 +197,9 @@ namespace Claude {
 
         ClaudeCredentials creds;
         creds.oauth.accessToken = envToken;
+        // CLAUDE_CODE_OAUTH_TOKEN is normally a `claude setup-token` token:
+        // inference-only by design, so the usage endpoint will 403 it.
+        creds.oauth.inferenceOnly = true;
         creds.canSave = false;
         return creds;
     }
@@ -181,8 +238,26 @@ namespace Claude {
         WriteTextFile(creds.path, creds.root.dump(2));
     }
 
-    static std::string RefreshScope() {
-        return "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+    // Requesting scopes the original grant never included can come back
+    // downscoped, which then 403s on the usage endpoint. Re-request exactly
+    // what the credential already carries, and otherwise ask only for the
+    // scopes that are reliably granted to a Claude Code login.
+    static std::string RefreshScope(const ClaudeOAuth& oauth) {
+        if (!oauth.scopes.empty()) {
+            std::string joined;
+
+            for (const std::string& scope : oauth.scopes) {
+                if (!joined.empty()) {
+                    joined.push_back(' ');
+                }
+
+                joined += scope;
+            }
+
+            return joined;
+        }
+
+        return "user:profile user:inference user:sessions:claude_code";
     }
 
     static bool RefreshToken(ClaudeCredentials& creds) {
@@ -194,7 +269,7 @@ namespace Claude {
         body["grant_type"] = "refresh_token";
         body["refresh_token"] = creds.oauth.refreshToken;
         body["client_id"] = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-        body["scope"] = RefreshScope();
+        body["scope"] = RefreshScope(creds.oauth);
 
         std::wstring headers =
             std::wstring(L"Content-Type: application/json\r\n") +
@@ -212,6 +287,20 @@ namespace Claude {
         }
 
         json decoded = JsonUtils::get_instance()->ParseRequired(response.body);
+
+        if (decoded.contains("scope") && decoded.at("scope").is_string()) {
+            std::vector<std::string> refreshed;
+            std::istringstream stream(decoded.at("scope").get<std::string>());
+            std::string scope;
+
+            while (stream >> scope) {
+                refreshed.push_back(scope);
+            }
+
+            if (!refreshed.empty()) {
+                creds.oauth.scopes = std::move(refreshed);
+            }
+        }
 
         std::string accessToken = JsonUtils::get_instance()->String(decoded, "access_token");
         std::string refreshToken = JsonUtils::get_instance()->String(decoded, "refresh_token");
@@ -1943,32 +2032,291 @@ namespace Claude {
         }
     }
 
-    static long long KnownClaudeContextWindowForModel(const std::string& model) {
+    // Mirrors Claude Code's own context-window resolution (KT()/esc() in the
+    // CLI bundle), verified against the model registry embedded in
+    // claude.exe 2.1.220:
+    //
+    //   1. a "[1m]" model-id suffix               -> 1,000,000
+    //   2. registry entry with context.native_1m  -> 1,000,000
+    //   3. registry entry context.window          -> that value
+    //   4. any other recognizable Claude model    -> 200,000 (the CLI's default)
+    //
+    // Entries are longest-prefix matched so dated ids (claude-opus-4-8-20260101)
+    // and vendor-prefixed ids resolve to their base model.
+    struct ClaudeContextWindow {
+        long long tokens = 0;
+        // False only for the last-resort 200K default, where the model was not
+        // in the registry. A registry hit is as authoritative as persisted
+        // metadata and must not suppress auto-compact telemetry.
+        bool fromRegistry = false;
+    };
+
+    // ---------------------------------------------------------------------
+    // Claude Code statusLine payload
+    //
+    // Claude Code hands its statusLine command a JSON document on stdin that
+    // contains the values AQC otherwise has to infer:
+    //
+    //   context_window: { context_window_size, current_usage,
+    //                     total_input_tokens, used_percentage, ... }
+    //   rate_limits:    { five_hour:  { used_percentage, resets_at },
+    //                     seven_day: { used_percentage, resets_at } }
+    //   model: { id, display_name }, exceeds_200k_tokens, cost, session_id
+    //
+    // Running `AIQuotaChecker.exe --statusline` as that command parks the
+    // document in AQC_CLAUDE_STATUSLINE_FILE (default
+    // %LOCALAPPDATA%\AIQuotaChecker\claude-statusline.json). Everything below
+    // is a plain read of that file - no request, no token, so no 401/403 - and
+    // it is authoritative because Claude Code computed it itself.
+    // ---------------------------------------------------------------------
+    struct ClaudeStatusLinePayload {
+        bool valid = false;
+        long long writtenAtUnixSeconds = 0;
+        std::string sessionId;
+        std::string model;
+        long long contextWindowTokens = 0;
+        long long usedTokens = 0;
+        bool hasFiveHour = false;
+        double fiveHourUsedPercent = 0.0;
+        std::string fiveHourResetsAt;
+        bool hasSevenDay = false;
+        double sevenDayUsedPercent = 0.0;
+        std::string sevenDayResetsAt;
+        bool hasCost = false;
+        double totalCostUsd = 0.0;
+        long long linesAdded = 0;
+        long long linesRemoved = 0;
+        long long durationMs = 0;
+        long long apiDurationMs = 0;
+    };
+
+    static std::filesystem::path ClaudeStatusLineFilePath() {
+        const std::string configured =
+            Network::get_instance()->GetEnvText("AQC_CLAUDE_STATUSLINE_FILE");
+
+        if (!configured.empty()) {
+            return std::filesystem::path(configured);
+        }
+
+        const std::string localAppData = Network::get_instance()->GetEnvText("LOCALAPPDATA");
+
+        if (localAppData.empty()) {
+            return {};
+        }
+
+        return std::filesystem::path(localAppData) / "AIQuotaChecker" / "claude-statusline.json";
+    }
+
+    static ClaudeStatusLinePayload ReadClaudeStatusLinePayload() {
+        ClaudeStatusLinePayload payload;
+
+        const std::filesystem::path path = ClaudeStatusLineFilePath();
+        std::error_code ec;
+
+        if (path.empty() || !std::filesystem::exists(path, ec) || ec) {
+            return payload;
+        }
+
+        const std::string raw = ReadClaudeTailSharedReadOnly(path, 4ULL * 1024ULL * 1024ULL);
+
+        if (raw.empty()) {
+            return payload;
+        }
+
+        const json root = json::parse(raw, nullptr, false);
+
+        if (root.is_discarded() || !root.is_object()) {
+            return payload;
+        }
+
+        const auto writeTime = std::filesystem::last_write_time(path, ec);
+
+        if (!ec) {
+            const auto age = std::filesystem::file_time_type::clock::now() - writeTime;
+            payload.writtenAtUnixSeconds = static_cast<long long>(std::time(nullptr)) -
+                std::chrono::duration_cast<std::chrono::seconds>(age).count();
+        }
+
+        payload.sessionId = root.value("session_id", std::string{});
+
+        const auto model = root.find("model");
+
+        if (model != root.end() && model->is_object()) {
+            payload.model = model->value("id", std::string{});
+        }
+
+        const auto context = root.find("context_window");
+
+        if (context != root.end() && context->is_object()) {
+            const auto size = ClaudeNumberAny(
+                *context,
+                { "context_window_size", "contextWindowSize" }
+            );
+
+            if (size && *size > 0.0) {
+                payload.contextWindowTokens = static_cast<long long>(*size);
+            }
+
+            const auto used = ClaudeNumberAny(
+                *context,
+                { "total_input_tokens", "totalInputTokens" }
+            );
+
+            if (used && *used > 0.0) {
+                payload.usedTokens = static_cast<long long>(*used);
+            }
+        }
+
+        const auto limits = root.find("rate_limits");
+
+        if (limits != root.end() && limits->is_object()) {
+            struct Target {
+                const char* key;
+                bool* has;
+                double* percent;
+                std::string* resetsAt;
+            };
+
+            const Target targets[] = {
+                { "five_hour", &payload.hasFiveHour, &payload.fiveHourUsedPercent, &payload.fiveHourResetsAt },
+                { "seven_day", &payload.hasSevenDay, &payload.sevenDayUsedPercent, &payload.sevenDayResetsAt }
+            };
+
+            for (const Target& target : targets) {
+                const auto window = limits->find(target.key);
+
+                if (window == limits->end() || !window->is_object()) {
+                    continue;
+                }
+
+                const auto percent = ClaudeNumberAny(
+                    *window,
+                    { "used_percentage", "usedPercentage" }
+                );
+
+                if (!percent) {
+                    continue;
+                }
+
+                *target.has = true;
+                *target.percent = *percent;
+
+                const auto resets = window->find("resets_at");
+
+                if (resets != window->end() && resets->is_string()) {
+                    *target.resetsAt = resets->get<std::string>();
+                }
+            }
+        }
+
+        const auto cost = root.find("cost");
+
+        if (cost != root.end() && cost->is_object()) {
+            const auto total = ClaudeNumberAny(*cost, { "total_cost_usd", "totalCostUsd" });
+
+            if (total) {
+                payload.hasCost = true;
+                payload.totalCostUsd = *total;
+            }
+
+            payload.linesAdded = static_cast<long long>(
+                ClaudeNumberAny(*cost, { "total_lines_added" }).value_or(0.0)
+            );
+            payload.linesRemoved = static_cast<long long>(
+                ClaudeNumberAny(*cost, { "total_lines_removed" }).value_or(0.0)
+            );
+            payload.durationMs = static_cast<long long>(
+                ClaudeNumberAny(*cost, { "total_duration_ms" }).value_or(0.0)
+            );
+            payload.apiDurationMs = static_cast<long long>(
+                ClaudeNumberAny(*cost, { "total_api_duration_ms" }).value_or(0.0)
+            );
+        }
+
+        payload.valid = payload.contextWindowTokens > 0 ||
+            payload.hasFiveHour || payload.hasSevenDay || payload.hasCost;
+        return payload;
+    }
+
+    static ClaudeContextWindow ResolveClaudeContextWindow(const std::string& model) {
         const std::string lower = ToLowerAscii(model);
 
         if (lower.empty()) {
-            return 0;
+            return {};
         }
 
         if (lower.find("[1m]") != std::string::npos ||
             lower.find("context-1m") != std::string::npos ||
             lower.find("context_1m") != std::string::npos) {
-            return 1000000;
+            return { 1000000, true };
         }
 
-        // Claude Code's current Claude 3.x and Claude 4.x model IDs use a
-        // 200k standard context window. Restrict the fallback to recognized
-        // Claude model IDs so an unknown future model is never guessed.
-        if (lower.rfind("claude-3", 0) == 0 || lower.rfind("claude-4", 0) == 0 ||
-            lower.find("claude-sonnet-4") != std::string::npos ||
-            lower.find("claude-opus-4") != std::string::npos ||
-            lower.find("claude-haiku-4") != std::string::npos ||
+        struct Entry { const char* id; long long window; };
+        static const Entry kRegistry[] = {
+            // Native 1M-context models.
+            { "claude-opus-5",     1000000 },
+            { "claude-sonnet-5",   1000000 },
+            { "claude-fable-5",    1000000 },
+            { "claude-mythos-5",   1000000 },
+            { "claude-opus-4-8",   1000000 },
+            { "claude-opus-4-7",   1000000 },
+            // 200K models. Listed explicitly so a sibling 1M model in the same
+            // family can never be matched by a shorter prefix.
+            { "claude-opus-4-6",    200000 },
+            { "claude-opus-4-5",    200000 },
+            { "claude-opus-4-1",    200000 },
+            { "claude-opus-4-0",    200000 },
+            { "claude-sonnet-4-6",  200000 },
+            { "claude-sonnet-4-5",  200000 },
+            { "claude-sonnet-4-0",  200000 },
+            { "claude-haiku-4-5",   200000 },
+            { "claude-3-7-sonnet",  200000 },
+            { "claude-3-5-sonnet",  200000 },
+            { "claude-3-5-haiku",   200000 },
+        };
+
+        const Entry* best = nullptr;
+        size_t bestLength = 0;
+
+        for (const Entry& entry : kRegistry) {
+            const size_t length = std::strlen(entry.id);
+
+            if (length > bestLength && lower.find(entry.id) != std::string::npos) {
+                best = &entry;
+                bestLength = length;
+            }
+        }
+
+        if (best) {
+            return { best->window, true };
+        }
+
+        // Claude Code honors CLAUDE_CODE_MAX_CONTEXT_TOKENS only for models it
+        // does not recognize as first-party, so apply it at the same point.
+        const std::string configured =
+            Network::get_instance()->GetEnvText("CLAUDE_CODE_MAX_CONTEXT_TOKENS");
+
+        if (!configured.empty()) {
+            char* end = nullptr;
+            const long long parsed = std::strtoll(configured.c_str(), &end, 10);
+
+            if (end != configured.c_str() && parsed > 0) {
+                return { parsed, true };
+            }
+        }
+
+        // The CLI's own fallback for anything still unresolved.
+        if (lower.rfind("claude-", 0) == 0 ||
             lower == "sonnet" || lower == "opus" || lower == "haiku" ||
-            lower == "default") {
-            return 200000;
+            lower == "fable" || lower == "default") {
+            return { 200000, false };
         }
 
-        return 0;
+        return {};
+    }
+
+    static long long KnownClaudeContextWindowForModel(const std::string& model) {
+        return ResolveClaudeContextWindow(model).tokens;
     }
 
     static bool ClaudeEnvTruthy(const std::string& value) {
@@ -2724,14 +3072,42 @@ namespace Claude {
             }
         }
 
+        // Claude Code's own statusLine payload beats every inference below it:
+        // it is the exact number the CLI is using, including a 1M beta session
+        // and any CLAUDE_CODE_MAX_CONTEXT_TOKENS override. It is also the only
+        // place the CLI publishes session spend. Trust it only for the session
+        // it was actually written for.
+        {
+            const ClaudeStatusLinePayload statusLine = ReadClaudeStatusLinePayload();
+            const bool matchesSession = statusLine.valid &&
+                (statusLine.sessionId.empty() ||
+                    statusLine.sessionId == session.stem().string());
+
+            if (matchesSession && contextWindowTokens <= 0 &&
+                statusLine.contextWindowTokens > 0) {
+                contextWindowTokens = statusLine.contextWindowTokens;
+                modelWindowFallback = false;
+            }
+
+            if (matchesSession && statusLine.hasCost) {
+                local.run.costValid = true;
+                local.run.sessionCostUsd = statusLine.totalCostUsd;
+                local.run.sessionLinesAdded = statusLine.linesAdded;
+                local.run.sessionLinesRemoved = statusLine.linesRemoved;
+                local.run.sessionDurationMs = statusLine.durationMs;
+                local.run.sessionApiDurationMs = statusLine.apiDurationMs;
+            }
+        }
+
         if (contextWindowTokens <= 0 && contextWindowHint > 0) {
             contextWindowTokens = contextWindowHint;
             modelWindowFallback = false;
         }
 
         if (contextWindowTokens <= 0) {
-            contextWindowTokens = KnownClaudeContextWindowForModel(model);
-            modelWindowFallback = contextWindowTokens > 0;
+            const ClaudeContextWindow resolved = ResolveClaudeContextWindow(model);
+            contextWindowTokens = resolved.tokens;
+            modelWindowFallback = contextWindowTokens > 0 && !resolved.fromRegistry;
         }
 
         if (usedTokens <= 0 || contextWindowTokens <= 0) {
@@ -3125,6 +3501,61 @@ namespace Claude {
         return snapshot;
     }
 
+    // Claude Desktop records its own plan usage to disk every few minutes. When
+    // the live request cannot be made (Cookies locked, token expired, offline)
+    // that file is still an honest, current reading, so surface it instead of
+    // showing empty bars. It carries percentages only - no reset timestamps -
+    // which is why it is a fallback and never preferred over a live response.
+    static std::optional<Snapshot> DesktopSnapshotFromPlanUsage(
+        const ClaudeOAuth& desktopPlan,
+        const std::string& failureDetail
+    ) {
+        const ClaudeDesktopAuth::PlanUsageSample sample =
+            ClaudeDesktopAuth::ReadLatestPlanUsage();
+
+        if (!sample.valid || sample.windows.empty()) {
+            return std::nullopt;
+        }
+
+        json root = json::object();
+
+        for (const ClaudeDesktopAuth::PlanUsageWindow& window : sample.windows) {
+            // used_percent, not utilization: the history file already stores
+            // 0-100 while the API reports a 0-1 utilization fraction.
+            json entry = json::object({ { "used_percent", window.usedPercent } });
+
+            if (window.resetAtUnixSeconds > 0) {
+                entry["resets_at"] = window.resetAtUnixSeconds;
+            }
+
+            root[window.key] = std::move(entry);
+        }
+
+        Snapshot snapshot = ParseSnapshot(root, desktopPlan, "Claude Desktop usage");
+
+        const long long ageSeconds = sample.sampledAtUnixMs > 0
+            ? static_cast<long long>(std::time(nullptr)) - sample.sampledAtUnixMs / 1000
+            : -1;
+
+        std::string age = "Claude Desktop's own recorded usage";
+
+        if (ageSeconds >= 0) {
+            const long long minutes = ageSeconds / 60;
+            age += minutes > 0
+                ? " (sampled " + std::to_string(minutes) + "m ago)"
+                : " (sampled just now)";
+        }
+
+        snapshot.lastUpdated = "from Desktop history";
+        snapshot.statusText = "Plan: " + snapshot.plan + " | Source: " + age;
+        snapshot.access.state = UsageTelemetry::AccessState::Available;
+        snapshot.access.detail = failureDetail.empty()
+            ? age + ". Reset times are derived from the recorded series."
+            : age + ". Live request unavailable: " + failureDetail;
+        snapshot.accountKey = "desktop:" + sample.organizationId;
+        return snapshot;
+    }
+
     static Snapshot FetchDesktopSnapshot(const ClaudeDesktopAuth::Result& initialDesktop) {
         ClaudeDesktopAuth::Result desktop = initialDesktop;
         ClaudeOAuth desktopPlan;
@@ -3161,6 +3592,12 @@ namespace Claude {
         }
 
         if (response.statusCode == 429) {
+            const std::string detail = "the usage request is rate limited";
+
+            if (auto local = DesktopSnapshotFromPlanUsage(desktopPlan, detail)) {
+                return *local;
+            }
+
             return FailedSnapshot(
                 "Claude Desktop usage",
                 "Claude Desktop usage request is rate limited",
@@ -3170,6 +3607,14 @@ namespace Claude {
         }
 
         if (response.statusCode < 200 || response.statusCode >= 300) {
+            const std::string detail = response.statusCode > 0
+                ? "HTTP " + std::to_string(response.statusCode)
+                : "the usage request could not be sent";
+
+            if (auto local = DesktopSnapshotFromPlanUsage(desktopPlan, detail)) {
+                return *local;
+            }
+
             return FailedSnapshot(
                 "Claude Desktop usage",
                 "Claude Desktop usage failed: HTTP " + std::to_string(response.statusCode),
@@ -3209,6 +3654,21 @@ namespace Claude {
             }
         }
 
+        // Fail fast with something the user can act on. Refreshing an
+        // inference-only or under-scoped token returns the same token class,
+        // so retrying it just turns one 403 into two.
+        if (!ClaudeTokenCanReadUsage(codeCredentials.oauth)) {
+            return FailedSnapshot(
+                usageHeading,
+                codeCredentials.oauth.inferenceOnly
+                    ? sourceName + " is an inference-only token (CLAUDE_CODE_OAUTH_TOKEN / "
+                      "`claude setup-token`). The usage endpoint requires a `claude login` "
+                      "session; unset the variable or pick a different Claude account source."
+                    : sourceName + " is missing the " + kClaudeUsageScope + " scope required "
+                      "to read usage. Run `claude` and sign in again."
+            );
+        }
+
         Network::HttpResponse response = FetchUsage(codeCredentials.oauth.accessToken);
 
         if ((response.statusCode == 401 || response.statusCode == 403) &&
@@ -3216,6 +3676,17 @@ namespace Claude {
             !codeCredentials.oauth.refreshToken.empty() &&
             RefreshToken(codeCredentials)) {
             response = FetchUsage(codeCredentials.oauth.accessToken);
+        }
+
+        if (response.statusCode == 403) {
+            return FailedSnapshot(
+                usageHeading,
+                sourceName + " usage was rejected (HTTP 403). The token authenticated but is "
+                "not allowed to read usage - it most likely lacks the " + kClaudeUsageScope +
+                " scope. Run `claude` and sign in again.",
+                response.statusCode,
+                response.body
+            );
         }
 
         if (response.statusCode == 429) {
@@ -3320,6 +3791,15 @@ namespace Claude {
                     ? "No signed-in Claude Desktop session was found"
                     : desktop.detail;
 
+                // The credential could not be read, but Desktop's own recorded
+                // usage still can be. Show the real numbers rather than an
+                // empty panel; the reason stays visible in the status detail.
+                ClaudeOAuth unknownPlan;
+
+                if (auto local = DesktopSnapshotFromPlanUsage(unknownPlan, detail)) {
+                    return *local;
+                }
+
                 return FailedSnapshot(
                     "Claude Desktop usage",
                     "Claude Desktop is selected, but the account could not be read: " + detail
@@ -3329,6 +3809,16 @@ namespace Claude {
             // A Desktop credential/decryption error must remain visible. Auto mode
             // only falls through when Desktop genuinely has no signed-in session.
             if (desktop.kind == ClaudeDesktopAuth::ResultKind::Error) {
+                // Auto is the mode that has to survive an account switch, and
+                // the credential is exactly what goes stale across one. Desktop
+                // records its own usage to disk either way, so prefer those real
+                // numbers over an error panel; the reason stays in the detail.
+                ClaudeOAuth unknownPlan;
+
+                if (auto local = DesktopSnapshotFromPlanUsage(unknownPlan, desktop.detail)) {
+                    return *local;
+                }
+
                 return FailedSnapshot(
                     "Claude Desktop usage",
                     "Claude Desktop account could not be read: " + desktop.detail

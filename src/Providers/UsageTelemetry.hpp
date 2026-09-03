@@ -122,6 +122,16 @@ namespace UsageTelemetry
         long long thinkingStartedAtUnixSeconds = 0;
         long long lastThoughtDurationSeconds = 0;
         long long lastThoughtCompletedAtUnixSeconds = 0;
+
+        // Session spend, as the CLI itself accounts for it. Claude Code only
+        // publishes this through its statusLine payload, so it is present only
+        // when that hook is wired up.
+        bool costValid = false;
+        double sessionCostUsd = 0.0;
+        long long sessionLinesAdded = 0;
+        long long sessionLinesRemoved = 0;
+        long long sessionDurationMs = 0;
+        long long sessionApiDurationMs = 0;
     };
 
     inline std::string LowerCopy(std::string text)

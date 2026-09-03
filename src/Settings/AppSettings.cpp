@@ -295,6 +295,9 @@ namespace AppSettings
         std::wstring path = GetSettingsIniPath();
 
         settings.showRemaining = ReadBool(L"UI", L"ShowRemaining", settings.showRemaining, path);
+        settings.widgetMode = ReadBool(L"UI", L"WidgetMode", settings.widgetMode, path);
+        settings.widgetPinned = ReadBool(L"UI", L"WidgetPinned", settings.widgetPinned, path);
+        settings.widgetOrder = ReadUtf8(L"UI", L"WidgetOrder", settings.widgetOrder, path);
         settings.showResetDateDetails = ReadBool(L"UI", L"ShowResetDateDetails", settings.showResetDateDetails, path);
         settings.resetDisplayMode = ClampResetDisplayMode(ReadInt(L"UI", L"ResetDisplayMode", settings.resetDisplayMode, path));
         settings.notificationsInsideWindow = ReadBool(L"Notifications", L"InsideWindow", settings.notificationsInsideWindow, path);
@@ -361,6 +364,9 @@ namespace AppSettings
         bool ok = true;
 
         ok = WriteBool(L"UI", L"ShowRemaining", settings.showRemaining, path) && ok;
+        ok = WriteBool(L"UI", L"WidgetMode", settings.widgetMode, path) && ok;
+        ok = WriteBool(L"UI", L"WidgetPinned", settings.widgetPinned, path) && ok;
+        ok = WriteUtf8(L"UI", L"WidgetOrder", settings.widgetOrder, path) && ok;
         ok = WriteBool(L"UI", L"ShowResetDateDetails", settings.showResetDateDetails, path) && ok;
         ok = WriteInt(L"UI", L"ResetDisplayMode", ClampResetDisplayMode(settings.resetDisplayMode), path) && ok;
         ok = WriteBool(L"Notifications", L"InsideWindow", settings.notificationsInsideWindow, path) && ok;
