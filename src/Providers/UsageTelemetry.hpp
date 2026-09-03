@@ -132,6 +132,11 @@ namespace UsageTelemetry
         long long sessionLinesRemoved = 0;
         long long sessionDurationMs = 0;
         long long sessionApiDurationMs = 0;
+
+        // Extra session facts Claude Code publishes only through its statusLine
+        // payload (output style, workspace, agent, PR, worktree, vim mode,
+        // whether the session exceeds the 200k tier). Rendered verbatim.
+        std::vector<std::string> sessionDetails;
     };
 
     inline std::string LowerCopy(std::string text)

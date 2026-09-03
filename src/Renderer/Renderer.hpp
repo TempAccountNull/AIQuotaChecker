@@ -22,6 +22,10 @@ namespace Renderer
         bool* widgetMode = nullptr;
         bool* widgetPinned = nullptr;
         std::string* widgetOrder = nullptr;
+        int* uiFontSize = nullptr;
+        int* widgetSections = nullptr;
+        // Raised by the widget footer; the app opens a separate settings window.
+        bool* settingsWindowOpen = nullptr;
         ID3D11Device* device = nullptr;
 
         std::mutex* codexMutex = nullptr;
@@ -81,6 +85,15 @@ namespace Renderer
     };
 
     void ApplyStyle();
+    // Style only (no font atlas work) - for a second ImGui context whose
+    // atlas is separate from the widget's.
+    void ApplyStyleColorsOnly();
+    // Full-window settings UI, rendered into its own window/context.
+    void RenderSettingsUi(State& state);
+    // Rebuild the interface font atlas at the configured size. The caller
+    // must invalidate/recreate backend device objects around this.
+    void ReloadFonts();
+    bool ConsumeFontReloadRequest();
     void ReleaseTabImages();
     void RenderMainUi(State& state);
 }

@@ -313,6 +313,7 @@ namespace Renderer
 #define g_minimizeRequest (*R().minimizeRequest)
 #define g_widgetMode (*R().widgetMode)
 #define g_widgetPinned (*R().widgetPinned)
+#define g_settingsWindowOpen (*R().settingsWindowOpen)
 #define g_codexMutex (*R().codexMutex)
 #define g_claudeMutex (*R().claudeMutex)
 #define g_zaiMutex (*R().zaiMutex)
@@ -943,39 +944,77 @@ static ImFont* g_widgetBigFont = nullptr;
 #define IM_PI 3.14159265358979323846f
 #endif
 
-void ApplyStyle() {
-    // Keep the default bitmap font for the main window, but load Segoe UI as a
-    // secondary font used only by the redesigned widget so its gauges and big
-    // numbers render cleanly. This runs before the DX11 backend builds the font
-    // atlas, so the extra faces are included automatically.
-    {
-        ImGuiIO& io = ImGui::GetIO();
-        if (io.Fonts->Fonts.Size == 0) {
-            io.Fonts->AddFontDefault();
-        }
+static int g_loadedFontSize = 0;
+static bool g_fontReloadRequested = false;
 
-        const char* candidates[] = {
-            "C:\Windows\Fonts\segoeui.ttf",
-            "C:\Windows\Fonts\seguisb.ttf",
-            "C:\Windows\Fonts\tahoma.ttf"
-        };
-        const char* body = nullptr;
-        for (const char* path : candidates) {
-            if (std::filesystem::exists(path)) { body = path; break; }
-        }
+// Load Segoe UI at `size` as the interface font used by the custom panels, plus
+// a semibold face for titles. The default bitmap font stays as ImGui's default
+// so nothing else shifts.
+static void LoadInterfaceFonts(int size)
+{
+    ImGuiIO& io = ImGui::GetIO();
 
-        if (body && !g_widgetFont) {
-            g_widgetFont = io.Fonts->AddFontFromFileTTF(body, 15.0f);
-        }
-
-        const char* semibold = std::filesystem::exists("C:\Windows\Fonts\seguisb.ttf")
-            ? "C:\Windows\Fonts\seguisb.ttf"
-            : body;
-        if (semibold && !g_widgetBigFont) {
-            g_widgetBigFont = io.Fonts->AddFontFromFileTTF(semibold, 30.0f);
-        }
+    if (io.Fonts->Fonts.Size == 0) {
+        io.Fonts->AddFontDefault();
     }
 
+    const char* candidates[] = {
+        "C:/Windows/Fonts/segoeui.ttf",
+        "C:/Windows/Fonts/tahoma.ttf",
+        "C:/Windows/Fonts/arial.ttf"
+    };
+    const char* body = nullptr;
+    for (const char* path : candidates) {
+        if (std::filesystem::exists(path)) { body = path; break; }
+    }
+
+    const char* semibold = std::filesystem::exists("C:/Windows/Fonts/seguisb.ttf")
+        ? "C:/Windows/Fonts/seguisb.ttf"
+        : body;
+
+    const float bodySize = static_cast<float>(size);
+
+    g_widgetFont = body ? io.Fonts->AddFontFromFileTTF(body, bodySize) : nullptr;
+    g_widgetBigFont = semibold
+        ? io.Fonts->AddFontFromFileTTF(semibold, bodySize + 4.0f)
+        : nullptr;
+
+    g_loadedFontSize = size;
+}
+
+void ReloadFonts()
+{
+    const int size = (g_state && R().uiFontSize)
+        ? AppSettings::ClampUiFontSize(*R().uiFontSize)
+        : 14;
+
+    ImGuiIO& io = ImGui::GetIO();
+    io.Fonts->Clear();
+    g_widgetFont = nullptr;
+    g_widgetBigFont = nullptr;
+    LoadInterfaceFonts(size);
+    io.Fonts->Build();
+}
+
+bool ConsumeFontReloadRequest()
+{
+    const bool requested = g_fontReloadRequested;
+    g_fontReloadRequested = false;
+    return requested;
+}
+
+static void ApplyStyleColorsInternal();
+
+void ApplyStyle() {
+    LoadInterfaceFonts(14);
+    ApplyStyleColorsInternal();
+}
+
+void ApplyStyleColorsOnly() {
+    ApplyStyleColorsInternal();
+}
+
+static void ApplyStyleColorsInternal() {
     ImGuiStyle& style = ImGui::GetStyle();
 
     style.WindowRounding = 10.0f;
@@ -1079,7 +1118,14 @@ static void DrawCustomTitleBar() {
     DrawGenericQuotaIcon(ImVec2(iconPos.x + 10.0f, iconPos.y + 10.0f), 18.0f);
 
     ImGui::SetCursorPosX(38.0f);
-    ImGui::TextUnformatted("AI Quota Checker");
+    if (g_widgetFont) {
+        ImGui::PushFont(g_widgetFont);
+        ImGui::TextUnformatted("AI Quota Checker");
+        ImGui::PopFont();
+    }
+    else {
+        ImGui::TextUnformatted("AI Quota Checker");
+    }
 
     ImGui::SameLine();
 
@@ -2410,219 +2456,556 @@ static bool ProviderAutoRefreshActive(bool providerEnabled)
     return g_autoRefreshEnabled && providerEnabled;
 }
 
-static void DrawProviderRefreshHeader(
-    const char* label,
+
+// ---------------------------------------------------------------------------
+// Provider panels (CodexBar-style, shared by the main window and the widget)
+//
+// A flat, sectioned layout: a section title, a thin severity-coloured bar, then
+// "X% used / left" on the left and the reset on the right, with an optional
+// muted sub-line. Rendered in Segoe UI (falls back to default). Every element
+// is drawn from primitives - no stock cards.
+// ---------------------------------------------------------------------------
+
+static ImU32 PanelSeverity(float usedPercent)
+{
+    // Deliberately desaturated: a wall of neon bars reads as noise. These sit
+    // closer to the reference popovers' muted accents.
+    if (usedPercent >= 90.0f) return Color(214, 96, 96);
+    if (usedPercent >= 75.0f) return Color(214, 160, 78);
+    return Color(94, 168, 132);
+}
+
+static std::string PanelReset(long long resetAtUnixSeconds, const std::string& fallback)
+{
+    if (resetAtUnixSeconds > 0) {
+        std::string text = ResetTime::get_instance()->Format(
+            resetAtUnixSeconds, g_resetDisplayMode, g_showResetDateDetails);
+        if (!text.empty()) return text;
+    }
+    return fallback;
+}
+
+// Sections render as contained cards rather than bare text on the window
+// background - that containment is what makes the reference popovers read as
+// designed instead of a dump of labels.
+// Layout derives from the configured interface font size so the whole panel
+// scales with the Settings choice instead of being pinned to magic numbers.
+static float PanelTitleSize() { return static_cast<float>(g_loadedFontSize) + 3.0f; }
+static float PanelPad() { return 10.0f; }
+
+static void PanelRule()
+{
+    // Cards provide the separation now; this is just the gap between them.
+    ImGui::Dummy(ImVec2(ImGui::GetContentRegionAvail().x, 7.0f));
+}
+
+static void PanelCardBackground(ImVec2 a, ImVec2 b)
+{
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(a, b, Color(31, 34, 43, 255), 10.0f);
+    dl->AddRect(a, b, Color(50, 54, 68, 200), 10.0f, 0, 1.0f);
+}
+
+static void PanelBarSection(
+    const char* title,
+    bool valid,
+    float usedPercent,
+    const std::string& rightText,
+    const std::string& subline
+)
+{
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float w = ImGui::GetContentRegionAvail().x;
+    const float lineH = ImGui::GetTextLineHeight();
+    const float pad = PanelPad();
+    const float titleH = PanelTitleSize() + 3.0f;
+    const float barH = 5.0f;
+
+    const float height = pad + titleH + 7.0f + barH + 8.0f + lineH
+        + (subline.empty() ? 0.0f : lineH + 3.0f) + pad;
+
+    const ImVec2 c0 = ImGui::GetCursorScreenPos();
+    const ImVec2 c1(c0.x + w, c0.y + height);
+    PanelCardBackground(c0, c1);
+
+    const float x = c0.x + pad;
+    const float innerW = w - pad * 2.0f;
+    float y = c0.y + pad;
+
+    ImFont* tf = g_widgetBigFont ? g_widgetBigFont : ImGui::GetFont();
+    dl->AddText(tf, PanelTitleSize(), ImVec2(x, y), Color(234, 238, 246), title);
+    y += titleH + 7.0f;
+
+    const float shown = valid ? (g_showRemaining ? 100.0f - usedPercent : usedPercent) : 0.0f;
+    ImGui::SetCursorScreenPos(ImVec2(x, y));
+    DrawThinBar(shown, innerW, valid ? PanelSeverity(usedPercent) : Color(60, 64, 76), barH,
+        Color(48, 52, 63));
+    y += barH + 8.0f;
+
+    const std::string left = valid
+        ? Format::get_instance()->Percent(shown) + (g_showRemaining ? " left" : " used")
+        : "No data";
+    dl->AddText(ImVec2(x, y), Color(206, 213, 227), left.c_str());
+
+    if (!rightText.empty()) {
+        const float rw = ImGui::CalcTextSize(rightText.c_str()).x;
+        dl->AddText(ImVec2(x + innerW - rw, y), Color(138, 146, 166), rightText.c_str());
+    }
+    y += lineH + 3.0f;
+
+    if (!subline.empty()) {
+        dl->AddText(ImVec2(x, y), Color(126, 134, 154), subline.c_str());
+    }
+
+    ImGui::SetCursorScreenPos(ImVec2(c0.x, c1.y));
+    ImGui::Dummy(ImVec2(w, 0.0f));
+}
+
+static void PanelInfoSection(const char* title, const std::vector<std::string>& lines)
+{
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float w = ImGui::GetContentRegionAvail().x;
+    const float lineH = ImGui::GetTextLineHeight();
+    const float pad = PanelPad();
+    const float titleH = PanelTitleSize() + 3.0f;
+
+    const float height = pad + titleH + 5.0f
+        + static_cast<float>(lines.size()) * (lineH + 4.0f) + pad - 4.0f;
+
+    const ImVec2 c0 = ImGui::GetCursorScreenPos();
+    const ImVec2 c1(c0.x + w, c0.y + height);
+    PanelCardBackground(c0, c1);
+
+    const float x = c0.x + pad;
+    float y = c0.y + pad;
+
+    ImFont* tf = g_widgetBigFont ? g_widgetBigFont : ImGui::GetFont();
+    dl->AddText(tf, PanelTitleSize(), ImVec2(x, y), Color(234, 238, 246), title);
+    y += titleH + 5.0f;
+
+    for (const std::string& line : lines) {
+        dl->AddText(ImVec2(x, y), Color(178, 185, 199), line.c_str());
+        y += lineH + 4.0f;
+    }
+
+    ImGui::SetCursorScreenPos(ImVec2(c0.x, c1.y));
+    ImGui::Dummy(ImVec2(w, 0.0f));
+}
+
+static void PanelStatusLine(const UsageTelemetry::AccessStatus& access, const std::string& statusText)
+{
+    std::string text;
+    if (!access.detail.empty() && access.state != UsageTelemetry::AccessState::Available) {
+        text = access.detail;
+    }
+    else if (!statusText.empty() && statusText.rfind("Plan:", 0) != 0) {
+        text = statusText;
+    }
+    if (text.empty()) return;
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float w = ImGui::GetContentRegionAvail().x;
+    const ImU32 color = access.state == UsageTelemetry::AccessState::Available
+        ? Color(120, 128, 148)
+        : Color(228, 168, 72);
+
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + w);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(color));
+    ImGui::TextWrapped("%s", text.c_str());
+    ImGui::PopStyleColor();
+    ImGui::PopTextWrapPos();
+    ImGui::Dummy(ImVec2(w, 8.0f));
+}
+
+// Section visibility, driven by the Settings picker.
+static bool PanelShows(int bit)
+{
+    return R().widgetSections ? ((*R().widgetSections) & bit) != 0 : true;
+}
+
+// Live token telemetry for the current turn - the numbers Claude Code and the
+// Codex app-server publish per request but which we were throwing away.
+static void PanelActivitySection(const UsageTelemetry::RunUsage& run)
+{
+    if (!PanelShows(AppSettings::WidgetSectionActivity)) return;
+    if (!run.valid || !run.tokenStatsValid) return;
+
+    std::vector<std::string> lines;
+
+    if (run.running && run.startedAtUnixSeconds > 0) {
+        const long long now = static_cast<long long>(std::time(nullptr));
+        lines.push_back("Elapsed: " + FormatRunDuration(
+            now >= run.startedAtUnixSeconds ? now - run.startedAtUnixSeconds : 0));
+    }
+    if (run.inputTokens > 0 || run.currentTokens > 0) {
+        lines.push_back("In " + FormatCompactTokenCount(run.inputTokens) +
+            "  ·  Out " + FormatCompactTokenCount(run.currentTokens));
+    }
+    if (run.cacheReadInputTokens > 0 || run.cacheCreationInputTokens > 0) {
+        lines.push_back("Cache read " + FormatCompactTokenCount(run.cacheReadInputTokens) +
+            "  ·  write " + FormatCompactTokenCount(run.cacheCreationInputTokens));
+    }
+    if (run.reasoningOutputTokens > 0) {
+        lines.push_back("Reasoning: " + FormatCompactTokenCount(run.reasoningOutputTokens));
+    }
+    if (run.tokens > 0) {
+        lines.push_back("Turn total: " + FormatCompactTokenCount(run.tokens));
+    }
+
+    if (lines.empty()) return;
+    PanelInfoSection("Activity", lines);
+    PanelRule();
+}
+
+// Session facts Claude Code only publishes through its statusLine payload.
+static void PanelSessionSection(const UsageTelemetry::RunUsage& run)
+{
+    if (!PanelShows(AppSettings::WidgetSectionDetails)) return;
+    if (run.sessionDetails.empty()) return;
+
+    PanelInfoSection("Session info", run.sessionDetails);
+    PanelRule();
+}
+
+// The model actually in use and the context limit resolved for it.
+static void PanelModelSection(const UsageTelemetry::ContextUsage& context)
+{
+    if (!PanelShows(AppSettings::WidgetSectionModel)) return;
+    if (context.model.empty() && context.contextWindowTokens <= 0) return;
+
+    std::vector<std::string> lines;
+    if (!context.model.empty()) lines.push_back(context.model);
+    if (context.contextWindowTokens > 0) {
+        lines.push_back("Context limit: " + FormatCompactTokenCount(context.contextWindowTokens));
+    }
+    if (!context.sourceLabel.empty()) lines.push_back(context.sourceLabel);
+
+    PanelInfoSection("Model", lines);
+    PanelRule();
+}
+
+static void PanelContextSection(const UsageTelemetry::ContextUsage& context)
+{
+    if (!PanelShows(AppSettings::WidgetSectionContext)) return;
+    if (!context.valid || context.contextWindowTokens <= 0) return;
+
+    const float used = Math::get_instance()->PercentUsed(
+        static_cast<double>(context.usedTokens),
+        static_cast<double>(context.contextWindowTokens));
+
+    std::string right;
+    if (context.compacting) right = "Compacting...";
+    else if (context.autoCompactPercentValid)
+        right = "Auto compact @ " + std::to_string(context.autoCompactPercentLeft) + "%";
+
+    const std::string tokens = FormatCompactTokenCount(context.usedTokens) + " / " +
+        FormatCompactTokenCount(context.contextWindowTokens) + " tokens";
+
+    PanelBarSection("Context", true, used, right, tokens);
+    PanelRule();
+}
+
+struct PanelScope
+{
+    bool pushed = false;
+    PanelScope() { if (g_widgetFont) { ImGui::PushFont(g_widgetFont); pushed = true; } }
+    ~PanelScope() { if (pushed) ImGui::PopFont(); }
+};
+
+// A custom refresh icon button (circular arrow), drawn from primitives.
+static bool PanelRefreshButton(const char* id, ImVec2 pos, float size, bool loading)
+{
+    ImGui::SetCursorScreenPos(pos);
+    ImGui::PushID(id);
+    const bool clicked = ImGui::InvisibleButton("##refresh", ImVec2(size, size));
+    const bool hovered = ImGui::IsItemHovered();
+    ImGui::PopID();
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImU32 fill = loading ? Color(38, 41, 52, 235)
+        : (hovered ? Color(48, 88, 150, 255) : Color(38, 41, 52, 235));
+    dl->AddRectFilled(pos, ImVec2(pos.x + size, pos.y + size), fill, 6.0f);
+    dl->AddRect(pos, ImVec2(pos.x + size, pos.y + size),
+        hovered ? Color(90, 150, 235, 255) : Color(54, 58, 72, 220), 6.0f, 0, 1.0f);
+
+    const ImVec2 c(pos.x + size * 0.5f, pos.y + size * 0.5f);
+    const float r = 6.0f;
+    const ImU32 ink = Color(226, 232, 242);
+    dl->PathArcTo(c, r, IM_PI * 0.4f, IM_PI * 1.95f, 24);
+    dl->PathStroke(ink, 0, 1.7f);
+    dl->AddTriangleFilled(
+        ImVec2(c.x + r * 0.95f, c.y - r * 1.0f),
+        ImVec2(c.x + r * 1.85f, c.y - r * 0.55f),
+        ImVec2(c.x + r * 0.75f, c.y - r * 0.05f), ink);
+
+    return clicked && !loading;
+}
+
+// The custom provider header: big name, muted "Updated ..." sub-line, plan on
+// the right, and a refresh button. Replaces the old stock refresh header.
+static void DrawProviderHeader(
+    const char* name,
+    const std::string& updated,
+    const std::string& plan,
     bool providerEnabled,
     bool loading,
     void (*refresh)(),
-    const char* buttonId
-) {
-    ImGui::TextUnformatted(label);
-    ImGui::SameLine();
+    const char* refreshId
+)
+{
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float w = ImGui::GetContentRegionAvail().x;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
 
-    if (loading) {
-        ImGui::TextDisabled("Loading");
+    ImFont* bf = g_widgetBigFont ? g_widgetBigFont : ImGui::GetFont();
+    dl->AddText(bf, PanelTitleSize() + 4.0f, p, Color(236, 240, 248), name);
+
+    std::string sub = loading ? "Refreshing..."
+        : (updated.empty() || updated == "never"
+            ? (ProviderAutoRefreshActive(providerEnabled) ? "Auto refresh on" : "Auto refresh off")
+            : "Updated " + updated);
+    dl->AddText(ImVec2(p.x, p.y + PanelTitleSize() + 8.0f), Color(128, 136, 156), sub.c_str());
+
+    // plan, right-aligned on the title row (leaving room for the refresh button)
+    const float btn = 30.0f;
+    if (!plan.empty()) {
+        const float ps = PanelTitleSize() - 2.0f;
+        const float pw = bf->CalcTextSizeA(ps, FLT_MAX, 0.0f, plan.c_str()).x;
+        dl->AddText(bf, ps, ImVec2(p.x + w - btn - 12.0f - pw, p.y + 4.0f),
+            Color(160, 168, 186), plan.c_str());
     }
-    else {
-        ImGui::TextDisabled(ProviderAutoRefreshActive(providerEnabled) ? "Auto refresh on" : "Auto refresh off");
-    }
 
-    const float buttonWidth = 72.0f;
-    const float right = ImGui::GetWindowContentRegionMax().x;
-    ImGui::SameLine();
-    ImGui::SetCursorPosX((std::max)(ImGui::GetCursorPosX(), right - buttonWidth));
-    ImGui::BeginDisabled(loading || refresh == nullptr);
+    const bool clicked = PanelRefreshButton(refreshId, ImVec2(p.x + w - btn, p.y), btn, loading);
+    if (clicked && refresh) refresh();
 
-    ImGui::PushID(buttonId);
-    if (ImGui::Button("Refresh", ImVec2(buttonWidth, 0.0f)) && refresh) {
-        refresh();
-    }
-    ImGui::PopID();
-
-    ImGui::EndDisabled();
+    ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + PanelTitleSize() + 26.0f));
+    PanelRule();
 }
+
+// ---- per-provider section bodies (no header) ----
+
+static void RenderCodexSections(const Codex::Snapshot& snapshot)
+{
+    PanelStatusLine(snapshot.access, snapshot.statusText);
+
+    for (const Codex::UsageBar& bar : snapshot.bars) {
+        if (!bar.valid || !PanelShows(AppSettings::WidgetSectionQuota)) continue;
+        const char* title = !bar.label.empty() ? bar.label.c_str()
+            : (!bar.sublabel.empty() ? bar.sublabel.c_str() : "Usage");
+        PanelBarSection(title, true, bar.usedPercent,
+            PanelReset(bar.resetAtUnixSeconds, bar.rightText), std::string{});
+        PanelRule();
+    }
+
+    if (PanelShows(AppSettings::WidgetSectionExtra) &&
+        snapshot.extraUsage.valid && snapshot.extraUsage.hasUsedPercent) {
+        PanelBarSection(snapshot.extraUsage.label.empty() ? "Extra usage" : snapshot.extraUsage.label.c_str(),
+            true, snapshot.extraUsage.usedPercent,
+            PanelReset(snapshot.extraUsage.resetAtUnixSeconds, snapshot.extraUsage.resetText),
+            snapshot.extraUsage.spentText.empty() ? std::string{}
+                : "This month: " + snapshot.extraUsage.spentText +
+                  (snapshot.extraUsage.limitText.empty() ? "" : " / " + snapshot.extraUsage.limitText));
+        PanelRule();
+    }
+    else if (PanelShows(AppSettings::WidgetSectionExtra) &&
+        snapshot.extraUsage.valid && !snapshot.extraUsage.spentText.empty()) {
+        PanelInfoSection(snapshot.extraUsage.label.empty() ? "Extra usage" : snapshot.extraUsage.label.c_str(),
+            { "This month: " + snapshot.extraUsage.spentText +
+              (snapshot.extraUsage.limitText.empty() ? "" : " / " + snapshot.extraUsage.limitText) });
+        PanelRule();
+    }
+
+    PanelContextSection(snapshot.context);
+
+    if (PanelShows(AppSettings::WidgetSectionExtra) &&
+        snapshot.creditBalance.valid && !snapshot.creditBalance.balanceText.empty()) {
+        PanelInfoSection("Credits",
+            { snapshot.creditBalance.unlimited ? "Unlimited" : snapshot.creditBalance.balanceText });
+        PanelRule();
+    }
+    if (PanelShows(AppSettings::WidgetSectionDetails) && snapshot.resetCreditsAvailableCount >= 0) {
+        PanelInfoSection("Reset credits",
+            { std::to_string(snapshot.resetCreditsAvailableCount) + " banked" });
+        PanelRule();
+    }
+
+    PanelActivitySection(snapshot.run);
+    PanelModelSection(snapshot.context);
+}
+
+static void RenderClaudeSections(const Claude::Snapshot& snapshot)
+{
+    PanelStatusLine(snapshot.access, snapshot.statusText);
+
+    const Claude::UsageWindow* windows[] = {
+        &snapshot.currentSession, &snapshot.weeklyAllModels,
+        &snapshot.weeklySonnet, &snapshot.weeklyFable
+    };
+    for (const Claude::UsageWindow* w : windows) {
+        if (!w->valid || !PanelShows(AppSettings::WidgetSectionQuota)) continue;
+        PanelBarSection(w->title.empty() ? "Usage" : w->title.c_str(), true, w->usedPercent,
+            PanelReset(w->resetAtUnixSeconds, w->resetText), std::string{});
+        PanelRule();
+    }
+    for (const Claude::UsageWindow& w : snapshot.additionalLimits) {
+        if (!w.valid || !PanelShows(AppSettings::WidgetSectionQuota)) continue;
+        PanelBarSection(w.title.empty() ? "Usage" : w.title.c_str(), true, w.usedPercent,
+            PanelReset(w.resetAtUnixSeconds, w.resetText), std::string{});
+        PanelRule();
+    }
+
+    PanelContextSection(snapshot.context);
+
+    if (PanelShows(AppSettings::WidgetSectionExtra) &&
+        snapshot.credits.valid && snapshot.credits.hasUsedPercent) {
+        PanelBarSection(snapshot.credits.label.empty() ? "Extra usage" : snapshot.credits.label.c_str(),
+            true, snapshot.credits.usedPercent,
+            PanelReset(snapshot.credits.resetAtUnixSeconds, snapshot.credits.resetText),
+            snapshot.credits.spentText.empty() ? std::string{}
+                : snapshot.credits.spentText +
+                  (snapshot.credits.monthlyLimitText.empty() ? "" : " / " + snapshot.credits.monthlyLimitText));
+        PanelRule();
+    }
+    else if (PanelShows(AppSettings::WidgetSectionExtra) &&
+        snapshot.credits.valid && !snapshot.credits.spentText.empty()) {
+        PanelInfoSection(snapshot.credits.label.empty() ? "Usage credits" : snapshot.credits.label.c_str(),
+            { snapshot.credits.spentText +
+              (snapshot.credits.monthlyLimitText.empty() ? "" : " / " + snapshot.credits.monthlyLimitText) });
+        PanelRule();
+    }
+
+    if (PanelShows(AppSettings::WidgetSectionCost) && snapshot.run.costValid) {
+        char spend[48];
+        std::snprintf(spend, sizeof(spend), "Session: $%.2f", snapshot.run.sessionCostUsd);
+        std::vector<std::string> lines{ spend };
+        if (snapshot.run.sessionLinesAdded > 0 || snapshot.run.sessionLinesRemoved > 0) {
+            lines.push_back("+" + std::to_string(snapshot.run.sessionLinesAdded) +
+                " / -" + std::to_string(snapshot.run.sessionLinesRemoved) + " lines");
+        }
+        PanelInfoSection("Cost", lines);
+        PanelRule();
+    }
+
+    PanelActivitySection(snapshot.run);
+    PanelSessionSection(snapshot.run);
+    PanelModelSection(snapshot.context);
+}
+
+static void RenderZAiSections(const ZAi::Snapshot& snapshot)
+{
+    PanelStatusLine(snapshot.access, snapshot.statusText);
+
+    for (const ZAi::UsageBar& bar : snapshot.bars) {
+        if (!bar.valid || !PanelShows(AppSettings::WidgetSectionQuota)) continue;
+        const char* title = !bar.label.empty() ? bar.label.c_str()
+            : (!bar.sublabel.empty() ? bar.sublabel.c_str() : "Usage");
+        PanelBarSection(title, true, bar.usedPercent,
+            PanelReset(bar.resetAtUnixSeconds, bar.resetText), std::string{});
+        PanelRule();
+    }
+
+    PanelContextSection(snapshot.context);
+
+    for (const ZAi::DetailRow& detail : snapshot.details) {
+        if (!PanelShows(AppSettings::WidgetSectionDetails)) break;
+        std::vector<std::string> lines;
+        if (!detail.leftLabel.empty()) lines.push_back(detail.leftLabel + ": " + detail.leftValue);
+        if (!detail.rightLabel.empty()) lines.push_back(detail.rightLabel + ": " + detail.rightValue);
+        if (!lines.empty()) { PanelInfoSection("Details", lines); PanelRule(); }
+    }
+
+    if (PanelShows(AppSettings::WidgetSectionQuota) && snapshot.mcp.valid) {
+        const float used = snapshot.mcp.limit > 0
+            ? Math::get_instance()->PercentUsed(
+                static_cast<double>(snapshot.mcp.used),
+                static_cast<double>(snapshot.mcp.limit))
+            : 0.0f;
+
+        std::string right;
+        if (snapshot.mcp.nextRefreshAtUnixSeconds > 0) {
+            right = PanelReset(snapshot.mcp.nextRefreshAtUnixSeconds, std::string{});
+        }
+
+        std::string sub = std::to_string(snapshot.mcp.used) + " / " +
+            std::to_string(snapshot.mcp.limit) + " calls";
+        if (snapshot.mcp.remaining > 0) {
+            sub += "  ·  " + std::to_string(snapshot.mcp.remaining) + " left";
+        }
+        if (!snapshot.mcp.level.empty()) {
+            sub += "  ·  " + snapshot.mcp.level;
+        }
+
+        PanelBarSection("MCP usage", snapshot.mcp.limit > 0, used, right, sub);
+        PanelRule();
+    }
+
+    PanelActivitySection(snapshot.run);
+    PanelModelSection(snapshot.context);
+}
+
+static void RenderGrokSections(const Grok::Snapshot& snapshot)
+{
+    PanelStatusLine(snapshot.access, snapshot.statusText);
+
+    if (PanelShows(AppSettings::WidgetSectionQuota) && snapshot.weeklyLimit.valid) {
+        PanelBarSection(snapshot.weeklyLimit.title.empty() ? "Weekly" : snapshot.weeklyLimit.title.c_str(),
+            true, snapshot.weeklyLimit.usedPercent,
+            PanelReset(snapshot.weeklyLimit.resetAtUnixSeconds, snapshot.weeklyLimit.resetText), std::string{});
+        PanelRule();
+    }
+    for (const Grok::ProductUsage& product : snapshot.products) {
+        if (!PanelShows(AppSettings::WidgetSectionQuota)) break;
+        PanelBarSection(product.product.empty() ? "Product" : product.product.c_str(),
+            true, product.usagePercent, std::string{}, std::string{});
+        PanelRule();
+    }
+    if (PanelShows(AppSettings::WidgetSectionExtra) && snapshot.extraCredits.valid) {
+        PanelInfoSection("Credits",
+            { "Balance: " + snapshot.extraCredits.balanceText, "Used: " + snapshot.extraCredits.usedText });
+        PanelRule();
+    }
+
+    PanelContextSection(snapshot.context);
+    PanelModelSection(snapshot.context);
+}
+
+// ---- main-window provider tabs ----
 
 static void DrawCodexTab() {
     Codex::Snapshot snapshot;
-
-    {
-        std::lock_guard<std::mutex> lock(g_codexMutex);
-        snapshot = g_codexState;
-    }
-
-    float contentWidth = ImGui::GetContentRegionAvail().x;
-    float cardWidth = contentWidth;
-
-    DrawProviderRefreshHeader(
-        "Codex usage",
-        g_codexAutoRefreshEnabled,
-        g_codexLoading,
-        RefreshCodexAsync,
-        "codex_manual_refresh"
-    );
-
-    if (!snapshot.statusText.empty() &&
-        snapshot.statusText.rfind("Plan:", 0) != 0 &&
-        snapshot.statusText != snapshot.access.detail) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
-        ImGui::TextWrapped("%s", snapshot.statusText.c_str());
-        ImGui::PopStyleColor();
-    }
-
-    DrawCodexAccessStatus(snapshot.access, snapshot.context, snapshot.run);
-    ImGui::Spacing();
-
-    DrawContextUsageCard(
-        snapshot.context,
-        cardWidth,
-        true,
-        ContextMeterStyle::CodexWhiteStandard
-    );
-    ImGui::Spacing();
-
-    std::string title = snapshot.plan.empty() ? "Codex" : snapshot.plan;
-    DrawUnifiedUsageCard(title.c_str(), BuildCodexBars(snapshot), cardWidth);
-
-    if (snapshot.creditBalance.valid || (snapshot.extraUsage.valid && !snapshot.extraUsage.hasUsedPercent)) {
-        ImGui::Spacing();
-        DrawCodexExtraUsageCard(snapshot, cardWidth);
-    }
-
-    ImGui::Spacing();
-
-    DrawCodexResetCreditsCard(snapshot, cardWidth);
+    { std::lock_guard<std::mutex> lock(g_codexMutex); snapshot = g_codexState; }
+    PanelScope scope;
+    DrawProviderHeader("Codex", snapshot.lastUpdated, snapshot.plan,
+        g_codexAutoRefreshEnabled, g_codexLoading.load(), RefreshCodexAsync, "codex_refresh");
+    RenderCodexSections(snapshot);
 }
 
 static void DrawClaudeTab() {
     Claude::Snapshot snapshot;
-
-    {
-        std::lock_guard<std::mutex> lock(g_claudeMutex);
-        snapshot = g_claudeState;
-    }
-
-    float contentWidth = ImGui::GetContentRegionAvail().x;
-    float cardWidth = contentWidth;
-
-    DrawProviderRefreshHeader(
-        snapshot.usageHeading.empty() ? "Claude usage" : snapshot.usageHeading.c_str(),
-        g_claudeAutoRefreshEnabled,
-        g_claudeLoading,
-        RefreshClaudeAsync,
-        "claude_manual_refresh"
-    );
-
-    if (!snapshot.statusText.empty() && snapshot.statusText.rfind("Plan:", 0) != 0 && snapshot.statusText != snapshot.access.detail) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
-        ImGui::TextWrapped("%s", snapshot.statusText.c_str());
-        ImGui::PopStyleColor();
-    }
-
-    DrawClaudeAccessStatus(snapshot.access, snapshot.context, snapshot.run);
-    ImGui::Spacing();
-
-    DrawContextUsageCard(
-        snapshot.context,
-        cardWidth,
-        true,
-        ContextMeterStyle::ClaudeBlueThin
-    );
-    ImGui::Spacing();
-
-    std::string title = snapshot.plan.empty() ? "Claude" : snapshot.plan;
-    std::vector<UiBar> bars = BuildClaudeBars(snapshot);
-
-    if (!bars.empty()) {
-        DrawUnifiedUsageCard(title.c_str(), bars, cardWidth);
-    }
-
-    ImGui::Spacing();
-    DrawClaudeExtraUsageCard(snapshot, cardWidth);
+    { std::lock_guard<std::mutex> lock(g_claudeMutex); snapshot = g_claudeState; }
+    PanelScope scope;
+    DrawProviderHeader(snapshot.plan.empty() ? "Claude" : snapshot.plan.c_str(),
+        snapshot.lastUpdated, std::string{},
+        g_claudeAutoRefreshEnabled, g_claudeLoading.load(), RefreshClaudeAsync, "claude_refresh");
+    RenderClaudeSections(snapshot);
 }
 
 static void DrawZAiTab() {
     ZAi::Snapshot snapshot;
-
-    {
-        std::lock_guard<std::mutex> lock(g_zaiMutex);
-        snapshot = g_zaiState;
-    }
-
-    float contentWidth = ImGui::GetContentRegionAvail().x;
-    float cardWidth = contentWidth;
-
-    DrawProviderRefreshHeader(
-        "Z.Ai usage",
-        g_zaiAutoRefreshEnabled,
-        g_zaiLoading,
-        RefreshZAiAsync,
-        "zai_manual_refresh"
-    );
-
-    if (!snapshot.statusText.empty() && snapshot.statusText != snapshot.access.detail) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
-        ImGui::TextWrapped("%s", snapshot.statusText.c_str());
-        ImGui::PopStyleColor();
-    }
-
-    DrawZAiAccessStatus(snapshot.access, snapshot.context, snapshot.run);
-    ImGui::Spacing();
-
-    DrawContextUsageCard(snapshot.context, cardWidth);
-    if (snapshot.context.valid) {
-        ImGui::Spacing();
-    }
-
-    std::string title = snapshot.plan.empty() ? "Z.Ai" : snapshot.plan;
-    std::vector<UiBar> bars = BuildZAiBars(snapshot);
-
-    if (!bars.empty()) {
-        DrawUnifiedUsageCard(title.c_str(), bars, cardWidth);
-        ImGui::Spacing();
-    }
-
-    DrawZAiDetailsCard(snapshot, cardWidth);
+    { std::lock_guard<std::mutex> lock(g_zaiMutex); snapshot = g_zaiState; }
+    PanelScope scope;
+    DrawProviderHeader("Z.Ai", snapshot.lastUpdated, snapshot.plan,
+        g_zaiAutoRefreshEnabled, g_zaiLoading.load(), RefreshZAiAsync, "zai_refresh");
+    RenderZAiSections(snapshot);
 }
 
 static void DrawGrokTab() {
     Grok::Snapshot snapshot;
-
-    {
-        std::lock_guard<std::mutex> lock(g_grokMutex);
-        snapshot = g_grokState;
-    }
-
-    float contentWidth = ImGui::GetContentRegionAvail().x;
-    float cardWidth = contentWidth;
-
-    DrawProviderRefreshHeader(
-        "Grok / xAI usage",
-        g_grokAutoRefreshEnabled,
-        g_grokLoading,
-        RefreshGrokAsync,
-        "grok_manual_refresh"
-    );
-
-    if (!snapshot.statusText.empty() && snapshot.statusText != "Updated" && snapshot.statusText != snapshot.access.detail) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
-        ImGui::TextWrapped("%s", snapshot.statusText.c_str());
-        ImGui::PopStyleColor();
-    }
-
-    DrawProviderAccessStatus(snapshot.access);
-    ImGui::Spacing();
-
-    std::string title = snapshot.plan.empty() ? "Grok" : snapshot.plan;
-    std::vector<UiBar> bars = BuildGrokBars(snapshot);
-
-    if (!bars.empty()) {
-        DrawUnifiedUsageCard(title.c_str(), bars, cardWidth);
-    }
-
-    if (snapshot.context.valid) {
-        ImGui::Spacing();
-        DrawContextUsageCard(snapshot.context, cardWidth);
-    }
+    { std::lock_guard<std::mutex> lock(g_grokMutex); snapshot = g_grokState; }
+    PanelScope scope;
+    DrawProviderHeader("Grok", snapshot.lastUpdated, snapshot.plan,
+        g_grokAutoRefreshEnabled, g_grokLoading.load(), RefreshGrokAsync, "grok_refresh");
+    RenderGrokSections(snapshot);
 }
 
 static void DrawSettingsHeader(const char* title)
@@ -3281,6 +3664,65 @@ static void DrawResetTimeModeSettings()
     }
 
     DrawSettingsMutedText(ResetTime::get_instance()->Description(g_resetDisplayMode));
+
+    ImGui::Spacing();
+    DrawSettingsMutedText("Interface font size");
+
+    if (R().uiFontSize) {
+        int size = AppSettings::ClampUiFontSize(*R().uiFontSize);
+
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::SliderInt("##ui_font_size", &size, 10, 22, "%d pt")) {
+            *R().uiFontSize = AppSettings::ClampUiFontSize(size);
+        }
+
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            // Rebuilding the atlas has to happen outside the frame, so flag it
+            // and let the app loop do it between frames.
+            g_fontReloadRequested = true;
+            if (R().saveAppSettings) R().saveAppSettings();
+        }
+    }
+
+    DrawSettingsMutedText("Font used by the provider panels and the widget.");
+
+    ImGui::Spacing();
+    DrawSettingsMutedText("Show in widget");
+
+    if (R().widgetSections) {
+        struct Toggle { const char* label; int bit; const char* hint; };
+        static const Toggle kToggles[] = {
+            { "Quota limits",   AppSettings::WidgetSectionQuota,    "Session, weekly and per-model limits" },
+            { "Context window", AppSettings::WidgetSectionContext,  "Tokens against the model context limit" },
+            { "Extra usage",    AppSettings::WidgetSectionExtra,    "Credits, balances and overage spend" },
+            { "Session cost",   AppSettings::WidgetSectionCost,     "Spend and lines changed (needs the statusLine hook)" },
+            { "Activity",       AppSettings::WidgetSectionActivity, "Live in/out/cache token counts for the running turn" },
+            { "Model",          AppSettings::WidgetSectionModel,    "Model id and the resolved context limit" },
+            { "Provider detail",AppSettings::WidgetSectionDetails,  "Reset credits, cache hit rate and other extras" }
+        };
+
+        int mask = *R().widgetSections;
+        bool changed = false;
+
+        for (const Toggle& toggle : kToggles) {
+            bool on = (mask & toggle.bit) != 0;
+            ImGui::PushID(toggle.bit);
+            if (ImGui::Checkbox(toggle.label, &on)) {
+                mask = on ? (mask | toggle.bit) : (mask & ~toggle.bit);
+                changed = true;
+            }
+            ImGui::PopID();
+
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s", toggle.hint);
+            }
+        }
+
+        if (changed) {
+            *R().widgetSections = mask;
+            if (R().saveAppSettings) R().saveAppSettings();
+        }
+    }
 }
 
 static void DrawCleanGeneralSettings(float contentWidth, float contentHeight)
@@ -3783,56 +4225,91 @@ enum class ActiveMainTab
 
 static ActiveMainTab g_activeTab = ActiveMainTab::Codex;
 
-static bool DrawIconTabButton(const char* id, const char* tooltip, TabImage& image, ActiveMainTab tab)
+// Cheap per-provider "primary usage" peeks for the tab-strip underline.
+static bool CodexPrimaryUsed(float& out) {
+    std::lock_guard<std::mutex> lock(g_codexMutex);
+    for (const auto& b : g_codexState.bars) if (b.valid) { out = b.usedPercent; return true; }
+    return false;
+}
+static bool ClaudePrimaryUsed(float& out) {
+    std::lock_guard<std::mutex> lock(g_claudeMutex);
+    if (g_claudeState.currentSession.valid) { out = g_claudeState.currentSession.usedPercent; return true; }
+    if (g_claudeState.weeklyAllModels.valid) { out = g_claudeState.weeklyAllModels.usedPercent; return true; }
+    return false;
+}
+static bool ZAiPrimaryUsed(float& out) {
+    std::lock_guard<std::mutex> lock(g_zaiMutex);
+    for (const auto& b : g_zaiState.bars) if (b.valid && !b.spendBalance) { out = b.usedPercent; return true; }
+    return false;
+}
+static bool GrokPrimaryUsed(float& out) {
+    std::lock_guard<std::mutex> lock(g_grokMutex);
+    if (g_grokState.weeklyLimit.valid) { out = g_grokState.weeklyLimit.usedPercent; return true; }
+    return false;
+}
+
+// One custom pill tab: provider icon, optional name, selected highlight, and a
+// tiny usage underline. `compact` (widget) drops the name for an icon-only pill.
+static void DrawProviderTabPill(
+    const char* name,
+    TabImage* image,
+    ActiveMainTab tab,
+    ActiveMainTab& sel,
+    bool compact,
+    bool hasUsage,
+    float usedPercent
+)
 {
-    bool selected = g_activeTab == tab;
+    const bool selected = sel == tab;
+    ImFont* f = g_widgetFont ? g_widgetFont : ImGui::GetFont();
+    const float fs = compact ? 13.0f : 15.0f;
+    const float iconS = compact ? 18.0f : 20.0f;
+    const float padX = compact ? 9.0f : 12.0f;
+    const float gap = 7.0f;
+    const bool showName = !compact;
+    const bool showIcon = image && image->srv;
+    const float nameW = showName ? f->CalcTextSizeA(fs, FLT_MAX, 0.0f, name).x : 0.0f;
+    const float pillW = padX
+        + (showIcon ? iconS : 0.0f)
+        + (showName ? (showIcon ? gap : 0.0f) + nameW : 0.0f)
+        + padX;
+    const float pillH = compact ? 36.0f : 40.0f;
 
-    ImGui::PushID(id);
-
-    ImVec2 buttonSize(46.0f, 34.0f);
-    ImVec2 pos = ImGui::GetCursorScreenPos();
-    bool clicked = ImGui::InvisibleButton("##tab_button", buttonSize);
-    bool hovered = ImGui::IsItemHovered();
-
-    if (clicked) {
-        g_activeTab = tab;
-    }
-
-    ImDrawList* draw = ImGui::GetWindowDrawList();
-    ImU32 fill = selected ? Color(38, 79, 120) : Color(34, 34, 34);
-
-    if (hovered && !selected) {
-        fill = Color(48, 58, 68);
-    }
-
-    draw->AddRectFilled(pos, ImVec2(pos.x + buttonSize.x, pos.y + buttonSize.y), fill, 6.0f);
-    draw->AddRect(pos, ImVec2(pos.x + buttonSize.x, pos.y + buttonSize.y), Color(70, 70, 70), 6.0f);
-
-    if (image.srv) {
-        ImVec2 imageSize(24.0f, 24.0f);
-        ImVec2 imagePos(pos.x + (buttonSize.x - imageSize.x) * 0.5f, pos.y + (buttonSize.y - imageSize.y) * 0.5f);
-        draw->AddImage(
-            reinterpret_cast<ImTextureID>(image.srv),
-            imagePos,
-            ImVec2(imagePos.x + imageSize.x, imagePos.y + imageSize.y)
-        );
-    }
-    else {
-        ImVec2 textSize = ImGui::CalcTextSize(tooltip);
-        draw->AddText(
-            ImVec2(pos.x + (buttonSize.x - textSize.x) * 0.5f, pos.y + (buttonSize.y - textSize.y) * 0.5f),
-            Color(235, 235, 235),
-            tooltip
-        );
-    }
-
-    if (hovered) {
-        ImGui::SetTooltip("%s", tooltip);
-    }
-
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    ImGui::PushID(name);
+    const bool clicked = ImGui::InvisibleButton("##pill", ImVec2(pillW, pillH));
+    const bool hovered = ImGui::IsItemHovered();
     ImGui::PopID();
+    if (clicked) sel = tab;
 
-    return clicked;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImU32 fill = selected ? Color(46, 92, 150, 255)
+        : (hovered ? Color(40, 44, 56, 255) : Color(28, 30, 38, 235));
+    dl->AddRectFilled(pos, ImVec2(pos.x + pillW, pos.y + pillH), fill, 9.0f);
+    dl->AddRect(pos, ImVec2(pos.x + pillW, pos.y + pillH),
+        selected ? Color(96, 156, 240, 255) : Color(52, 56, 70, 200), 9.0f, 0, selected ? 1.4f : 1.0f);
+
+    const float yShift = hasUsage ? 2.0f : 0.0f;
+    const ImVec2 ic(pos.x + padX, pos.y + (pillH - iconS) * 0.5f - yShift);
+    if (showIcon) {
+        dl->AddImage(reinterpret_cast<ImTextureID>(image->srv), ic, ImVec2(ic.x + iconS, ic.y + iconS));
+    }
+    if (showName) {
+        const ImU32 tcol = selected ? Color(242, 246, 253) : Color(198, 205, 219);
+        const float textX = showIcon ? ic.x + iconS + gap : pos.x + padX;
+        dl->AddText(f, fs, ImVec2(textX, pos.y + (pillH - fs) * 0.5f - yShift - 1.0f), tcol, name);
+    }
+
+    if (hasUsage) {
+        const float bw = pillW - padX * 2.0f;
+        const float bx = pos.x + padX;
+        const float by = pos.y + pillH - 7.0f;
+        dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + 3.0f), Color(60, 64, 78, 255), 1.5f);
+        const float shown = g_showRemaining ? 100.0f - usedPercent : usedPercent;
+        dl->AddRectFilled(ImVec2(bx, by),
+            ImVec2(bx + bw * std::clamp(shown / 100.0f, 0.0f, 1.0f), by + 3.0f),
+            PanelSeverity(usedPercent), 1.5f);
+    }
 }
 
 static void DrawProviderTabStrip()
@@ -3842,28 +4319,30 @@ static void DrawProviderTabStrip()
     TabImage& zai = EnsureTabImage(g_zaiTabImage, L"ZAi.ico");
     TabImage& grok = EnsureTabImage(g_grokTabImage, L"Grok.ico");
 
-    DrawIconTabButton("codex", "Codex", codex, ActiveMainTab::Codex);
-    ImGui::SameLine();
-    DrawIconTabButton("claude", "Claude", claude, ActiveMainTab::Claude);
-    ImGui::SameLine();
-    DrawIconTabButton("zai", "Z.Ai", zai, ActiveMainTab::ZAi);
-    ImGui::SameLine();
-    DrawIconTabButton("grok", "Grok", grok, ActiveMainTab::Grok);
-    ImGui::SameLine();
+    if (g_widgetFont) ImGui::PushFont(g_widgetFont);
 
-    bool selected = g_activeTab == ActiveMainTab::Settings;
-    ImGui::PushStyleColor(ImGuiCol_Button, selected ? ImVec4(0.150f, 0.310f, 0.470f, 1.0f) : ImVec4(0.135f, 0.135f, 0.135f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.210f, 0.270f, 0.330f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.180f, 0.360f, 0.540f, 1.0f));
+    float u = 0.0f;
+    bool has;
+    has = CodexPrimaryUsed(u);  DrawProviderTabPill("Codex", &codex, ActiveMainTab::Codex, g_activeTab, false, has, u);
+    ImGui::SameLine(0.0f, 8.0f);
+    has = ClaudePrimaryUsed(u); DrawProviderTabPill("Claude", &claude, ActiveMainTab::Claude, g_activeTab, false, has, u);
+    ImGui::SameLine(0.0f, 8.0f);
+    has = ZAiPrimaryUsed(u);    DrawProviderTabPill("Z.Ai", &zai, ActiveMainTab::ZAi, g_activeTab, false, has, u);
+    ImGui::SameLine(0.0f, 8.0f);
+    has = GrokPrimaryUsed(u);   DrawProviderTabPill("Grok", &grok, ActiveMainTab::Grok, g_activeTab, false, has, u);
 
-    if (ImGui::Button("Settings", ImVec2(96.0f, 34.0f))) {
-        g_activeTab = ActiveMainTab::Settings;
-    }
+    // Settings sits in the same row, just after a wider gap. Right-aligning it
+    // flung it against the window edge and clipped it.
+    ImGui::SameLine(0.0f, 20.0f);
+    DrawProviderTabPill("Settings", nullptr, ActiveMainTab::Settings, g_activeTab, false, false, 0.0f);
 
-    ImGui::PopStyleColor(3);
+    if (g_widgetFont) ImGui::PopFont();
 
-    ImGui::Separator();
-    ImGui::Spacing();
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 rp = ImGui::GetCursorScreenPos();
+    dl->AddLine(rp, ImVec2(rp.x + ImGui::GetContentRegionAvail().x, rp.y), Color(44, 48, 60), 1.0f);
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
 }
 
 static void DrawActiveMainTab()
@@ -3890,374 +4369,14 @@ static void DrawActiveMainTab()
 // ---------------------------------------------------------------------------
 // Widget mode
 //
-// Same information density as the main panel, in a docked column: a section per
-// host, then every quota window that host reports as label / capsule meter /
-// reading, followed by the live context meter. The meter is DrawThinBar - the
-// exact bar the main window uses - so the two views never disagree.
-//
-// The chrome (slab, rail, pills) is drawn straight into the draw list; only the
-// bars are shared. AIQuotaChecker.cpp owns snapping and the drop-down slide.
+// The same CodexBar-style sectioned panel the main window uses, in a docked
+// column: a compact icon tab strip picks the host, then that host's header and
+// sections render underneath. Everything is drawn from primitives.
 // ---------------------------------------------------------------------------
 
-namespace WidgetSkin
-{
-    static const ImU32 kPanelTop    = Color(24, 26, 34, 252);
-    static const ImU32 kPanelBottom = Color(15, 16, 22, 252);
-    static const ImU32 kBorder      = Color(54, 58, 72, 220);
-    static const ImU32 kCardTop     = Color(33, 36, 46, 255);
-    static const ImU32 kCardBottom  = Color(23, 25, 33, 255);
-    static const ImU32 kCardBorder  = Color(58, 63, 80, 210);
-    static const ImU32 kHeading     = Color(150, 158, 178);
-    static const ImU32 kHost        = Color(236, 240, 248);
-    static const ImU32 kLabel       = Color(196, 203, 217);
-    static const ImU32 kCaption     = Color(128, 136, 156);
-    static const ImU32 kGaugeTrack  = Color(46, 50, 62);
-    static const ImU32 kGood        = Color(64, 206, 140);
-    static const ImU32 kWarn        = Color(240, 178, 64);
-    static const ImU32 kBad         = Color(240, 82, 82);
+static ActiveMainTab g_widgetTab = ActiveMainTab::Claude;
 
-    static ImU32 Fade(ImU32 color, float alpha)
-    {
-        ImVec4 v = ImGui::ColorConvertU32ToFloat4(color);
-        v.w *= alpha;
-        return ImGui::ColorConvertFloat4ToU32(v);
-    }
-
-    static ImU32 Mix(ImU32 a, ImU32 b, float t)
-    {
-        ImVec4 x = ImGui::ColorConvertU32ToFloat4(a);
-        ImVec4 y = ImGui::ColorConvertU32ToFloat4(b);
-        return ImGui::ColorConvertFloat4ToU32(ImVec4(
-            x.x + (y.x - x.x) * t,
-            x.y + (y.y - x.y) * t,
-            x.z + (y.z - x.z) * t,
-            x.w + (y.w - x.w) * t
-        ));
-    }
-
-    // Rounded slab with a vertical gradient and a hairline border.
-    static void Slab(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 top, ImU32 bottom, ImU32 border, float rounding)
-    {
-        dl->AddRectFilledMultiColor(a, b, top, top, bottom, bottom);
-        // The multi-color fill has square corners; overlay a rounded border and
-        // clip the corners with the panel colour so the rounding still reads.
-        dl->AddRect(a, b, border, rounding, 0, 1.0f);
-    }
-
-    static ImU32 ProviderAccent(const std::string& key)
-    {
-        if (key == "codex") return Color(30, 200, 130);
-        if (key == "claude") return Color(216, 122, 85);
-        if (key == "zai") return Color(74, 134, 246);
-        return Color(170, 178, 192);
-    }
-
-    struct Verdict { const char* label; ImU32 color; };
-
-    static Verdict Severity(float usedPercent)
-    {
-        if (usedPercent >= 100.0f) return { "LIMIT", kBad };
-        if (usedPercent >= 90.0f)  return { "CRITICAL", kBad };
-        if (usedPercent >= 75.0f)  return { "LOW", kWarn };
-        return { "HEALTHY", kGood };
-    }
-}
-
-struct WidgetMetric
-{
-    std::string label;
-    std::string reading;
-    std::string reset;
-    float usedPercent = 0.0f;
-    long long resetAtUnixSeconds = 0;
-    bool valid = false;
-    bool bounded = true;
-    bool isContext = false;
-    ImU32 fill = Color(38, 132, 255);
-};
-
-static WidgetMetric WidgetTextMetric(
-    const std::string& label,
-    const std::string& value,
-    const std::string& sub = {}
-)
-{
-    WidgetMetric metric;
-    metric.label = label;
-    metric.reading = value;
-    metric.reset = sub;
-    metric.valid = true;
-    metric.bounded = false;
-    return metric;
-}
-
-// Where each card landed this frame, so a drag can be resolved to a target
-// slot. Cleared and refilled every frame.
-struct WidgetSectionHit
-{
-    std::string key;
-    float top = 0.0f;
-    float bottom = 0.0f;
-    bool active = false;
-};
-
-static std::vector<WidgetSectionHit> g_widgetSectionHits;
-static bool g_widgetOrderDirty = false;
-
-struct WidgetSection
-{
-    const char* key = "";
-    const char* host = "";
-    std::string plan;
-    std::string state;
-    std::string footer;
-    ImU32 stateColor = Color(126, 134, 152);
-    std::vector<WidgetMetric> metrics;
-};
-
-static std::string WidgetSectionFooter(
-    const UsageTelemetry::RunUsage& run,
-    const std::string& lastUpdated
-)
-{
-    std::string footer;
-
-    if (run.valid && run.running) {
-        const long long now = static_cast<long long>(std::time(nullptr));
-        const long long elapsed = run.startedAtUnixSeconds > 0 && now >= run.startedAtUnixSeconds
-            ? now - run.startedAtUnixSeconds
-            : 0;
-
-        footer = FormatRunDuration(elapsed);
-
-        if (run.tokenStatsValid && run.currentTokens > 0) {
-            footer += " · " + FormatCompactTokenCount(run.currentTokens) + " out";
-        }
-
-        if (run.tokens > 0) {
-            footer += " · " + FormatCompactTokenCount(run.tokens) + " total";
-        }
-
-        return footer;
-    }
-
-    if (!lastUpdated.empty() && lastUpdated != "never") {
-        return "Updated " + lastUpdated;
-    }
-
-    return {};
-}
-
-static std::string WidgetPercentReading(float usedPercent)
-{
-    const float shown = g_showRemaining ? 100.0f - usedPercent : usedPercent;
-    return Format::get_instance()->Percent(shown) +
-        (g_showRemaining ? " left" : " used");
-}
-
-// The pacing line the other usage tools lead with. Window length is never
-// reported, so this divides the quota actually left by the time actually left.
-static std::string WidgetPaceHint(float usedPercent, long long resetAtUnixSeconds)
-{
-    if (resetAtUnixSeconds <= 0) {
-        return {};
-    }
-
-    const long long now = static_cast<long long>(std::time(nullptr));
-    const long long secondsLeft = resetAtUnixSeconds - now;
-
-    if (secondsLeft <= 60) {
-        return {};
-    }
-
-    const float remaining = Math::get_instance()->ClampPercentFloat(100.0f - usedPercent);
-
-    if (remaining <= 0.0f) {
-        return "Exhausted until reset";
-    }
-
-    const double hoursLeft = static_cast<double>(secondsLeft) / 3600.0;
-    const double perHour = remaining / hoursLeft;
-
-    char buffer[64]{};
-
-    if (perHour >= 10.0) {
-        std::snprintf(buffer, sizeof(buffer), "%.0f%%/h left", perHour);
-    }
-    else if (perHour >= 1.0) {
-        std::snprintf(buffer, sizeof(buffer), "%.1f%%/h left", perHour);
-    }
-    else {
-        std::snprintf(buffer, sizeof(buffer), "%.2f%%/h left", perHour);
-    }
-
-    return buffer;
-}
-
-static WidgetMetric WidgetMetricFromWindow(
-    const std::string& label,
-    float usedPercent,
-    const std::string& resetText,
-    bool valid,
-    long long resetAtUnixSeconds = 0,
-    ImU32 fill = Color(38, 132, 255)
-)
-{
-    WidgetMetric metric;
-    metric.label = label;
-    metric.valid = valid;
-    metric.usedPercent = usedPercent;
-    metric.resetAtUnixSeconds = resetAtUnixSeconds;
-    metric.fill = fill;
-
-    if (valid) {
-        metric.reading = WidgetPercentReading(usedPercent);
-
-        metric.reset = resetAtUnixSeconds > 0
-            ? ResetTime::get_instance()->Format(
-                resetAtUnixSeconds,
-                g_resetDisplayMode,
-                g_showResetDateDetails
-            )
-            : resetText;
-
-        if (metric.reset.empty()) {
-            metric.reset = resetText;
-        }
-    }
-    else {
-        metric.reading = "--";
-    }
-
-    return metric;
-}
-
-static void AppendWidgetContextMetric(
-    WidgetSection& section,
-    const UsageTelemetry::ContextUsage& context
-)
-{
-    if (!context.valid || context.contextWindowTokens <= 0) {
-        return;
-    }
-
-    const float usedPercent = Math::get_instance()->PercentUsed(
-        static_cast<double>(context.usedTokens),
-        static_cast<double>(context.contextWindowTokens)
-    );
-
-    WidgetMetric metric;
-    metric.label = "Context";
-    metric.valid = true;
-    metric.isContext = true;
-    metric.usedPercent = usedPercent;
-    metric.fill = context.compacting ? WidgetSkin::kWarn : Color(88, 176, 255);
-    metric.reading = FormatCompactTokenCount(context.usedTokens) + " / " +
-        FormatCompactTokenCount(context.contextWindowTokens);
-
-    if (context.compacting) {
-        metric.reset = "compacting...";
-    }
-    else if (context.autoCompactPercentValid) {
-        metric.reset = "compact @ " + std::to_string(context.autoCompactPercentLeft) + "%";
-    }
-
-    section.metrics.push_back(std::move(metric));
-}
-
-static void SetWidgetSectionState(
-    WidgetSection& section,
-    const UsageTelemetry::AccessStatus& access,
-    const UsageTelemetry::RunUsage& run,
-    const UsageTelemetry::ContextUsage& context,
-    bool loading
-)
-{
-    if (context.compacting) {
-        section.state = "COMPACTING";
-        section.stateColor = WidgetSkin::kWarn;
-        return;
-    }
-
-    if (run.valid && run.running) {
-        section.state = "THINKING";
-        section.stateColor = WidgetSkin::kGood;
-        return;
-    }
-
-    if (loading) {
-        section.state = "SYNC";
-        section.stateColor = WidgetSkin::kCaption;
-        return;
-    }
-
-    const char* label = AccessStateLabel(access.state);
-    section.state = label && *label ? label : "";
-
-    const ImVec4 color = AccessStateColor(access.state);
-    section.stateColor = Color(
-        static_cast<int>(color.x * 255.0f),
-        static_cast<int>(color.y * 255.0f),
-        static_cast<int>(color.z * 255.0f)
-    );
-}
-
-static constexpr float kWidgetEdgeInset = 6.0f;
-
-// A 270-degree arc gauge, opening at the bottom. Draws the muted track then the
-// value arc with rounded end caps - the signature look of the reference apps.
-static void DrawGaugeArc(
-    ImDrawList* dl,
-    ImVec2 center,
-    float radius,
-    float thickness,
-    float fraction,
-    ImU32 color
-)
-{
-    const float start = IM_PI * 0.75f;
-    const float sweep = IM_PI * 1.5f;
-    fraction = std::clamp(fraction, 0.0f, 1.0f);
-
-    dl->PathArcTo(center, radius, start, start + sweep, 64);
-    dl->PathStroke(WidgetSkin::kGaugeTrack, 0, thickness);
-
-    if (fraction <= 0.001f) {
-        return;
-    }
-
-    const float end = start + sweep * fraction;
-    dl->PathArcTo(center, radius, start, end, std::max(4, static_cast<int>(64 * fraction)));
-    dl->PathStroke(color, 0, thickness);
-
-    dl->AddCircleFilled(
-        ImVec2(center.x + std::cos(start) * radius, center.y + std::sin(start) * radius),
-        thickness * 0.5f, color);
-    dl->AddCircleFilled(
-        ImVec2(center.x + std::cos(end) * radius, center.y + std::sin(end) * radius),
-        thickness * 0.5f, color);
-}
-
-// A small rounded status pill: HEALTHY / LOW / THINKING / UNAVAILABLE, etc.
-static void DrawStatusBadge(ImDrawList* dl, ImVec2 rightTop, const char* text, ImU32 color)
-{
-    if (!text || !*text) {
-        return;
-    }
-
-    const ImVec2 size = ImGui::CalcTextSize(text);
-    const float padX = 7.0f;
-    const float padY = 3.0f;
-    const ImVec2 b(rightTop.x, rightTop.y + size.y + padY * 2.0f);
-    const ImVec2 a(rightTop.x - size.x - padX * 2.0f, rightTop.y);
-
-    dl->AddRectFilled(a, b, WidgetSkin::Fade(color, 0.18f), (b.y - a.y) * 0.5f);
-    dl->AddRect(a, b, WidgetSkin::Fade(color, 0.75f), (b.y - a.y) * 0.5f, 0, 1.0f);
-    dl->AddText(ImVec2(a.x + padX, a.y + padY), color, text);
-}
-
-// Custom icon button drawn entirely from primitives - no stock ImGui frame, no
-// font glyphs. `icon`: 0 pin, 1 refresh, 2 restore, 3 close.
+// Small custom icon button. `icon`: 0 pin, 1 restore, 2 close.
 static bool WidgetIconButton(const char* id, int icon, ImVec2 size, ImU32 accent, bool activeState)
 {
     const ImVec2 pos = ImGui::GetCursorScreenPos();
@@ -4265,34 +4384,25 @@ static bool WidgetIconButton(const char* id, int icon, ImVec2 size, ImU32 accent
     const bool hovered = ImGui::IsItemHovered();
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
-    const ImU32 base = activeState ? WidgetSkin::Fade(accent, 0.85f)
-        : (hovered ? WidgetSkin::Fade(accent, 0.30f) : Color(38, 41, 52, 235));
+    const ImU32 base = activeState ? accent
+        : (hovered ? Color(48, 88, 150, 255) : Color(34, 37, 47, 235));
     dl->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y), base, 6.0f);
     dl->AddRect(pos, ImVec2(pos.x + size.x, pos.y + size.y),
-        hovered ? WidgetSkin::Fade(accent, 0.9f) : WidgetSkin::kBorder, 6.0f, 0, 1.0f);
+        hovered || activeState ? Color(96, 156, 240, 255) : Color(54, 58, 72, 220), 6.0f, 0, 1.0f);
 
     const ImVec2 c(pos.x + size.x * 0.5f, pos.y + size.y * 0.5f);
-    const ImU32 ink = WidgetSkin::kHost;
+    const ImU32 ink = Color(230, 235, 244);
     const float r = 5.0f;
 
     switch (icon) {
-    case 0: // pin: three dots
-        for (int i = -1; i <= 1; ++i) {
-            dl->AddCircleFilled(ImVec2(c.x + i * 4.0f, c.y), 1.6f, ink);
-        }
+    case 0: // pin: a tack
+        dl->AddCircleFilled(ImVec2(c.x, c.y - 2.0f), 3.2f, ink);
+        dl->AddLine(ImVec2(c.x, c.y + 1.0f), ImVec2(c.x, c.y + 6.0f), ink, 1.6f);
         break;
-    case 1: // refresh: open ring with an arrow head
-        dl->PathArcTo(c, r, IM_PI * 0.35f, IM_PI * 1.9f, 20);
-        dl->PathStroke(ink, 0, 1.6f);
-        dl->AddTriangleFilled(
-            ImVec2(c.x + r * 0.9f, c.y - r * 0.9f),
-            ImVec2(c.x + r * 1.7f, c.y - r * 0.5f),
-            ImVec2(c.x + r * 0.7f, c.y - r * 0.1f), ink);
-        break;
-    case 2: // restore: small square
+    case 1: // restore: a square
         dl->AddRect(ImVec2(c.x - r, c.y - r), ImVec2(c.x + r, c.y + r), ink, 1.5f, 0, 1.6f);
         break;
-    default: // close: X
+    default: // close: an X
         dl->AddLine(ImVec2(c.x - r, c.y - r), ImVec2(c.x + r, c.y + r), ink, 1.8f);
         dl->AddLine(ImVec2(c.x - r, c.y + r), ImVec2(c.x + r, c.y - r), ink, 1.8f);
         break;
@@ -4301,474 +4411,27 @@ static bool WidgetIconButton(const char* id, int icon, ImVec2 size, ImU32 accent
     return pressed;
 }
 
-// One provider, rendered as a card: radial gauge on the left, status + details
-// on the right, a reset strip along the bottom. This is the whole redesign -
-// every pixel is drawn here rather than composed from stock widgets.
-static void DrawWidgetSectionCard(const std::string& key, const WidgetSection& section)
+// A footer menu row, like the reference popover's "Settings... / About / Quit".
+// Custom drawn: hover highlight, no stock widget.
+static bool DrawWidgetMenuRow(const char* id, const char* label, ImU32 color)
 {
-    // Split the metrics into the gauge windows, the context meter, and text.
-    std::vector<const WidgetMetric*> windows;
-    const WidgetMetric* context = nullptr;
-    std::vector<const WidgetMetric*> texts;
+    const float w = ImGui::GetContentRegionAvail().x;
+    const float h = ImGui::GetTextLineHeight() + 12.0f;
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
 
-    for (const WidgetMetric& metric : section.metrics) {
-        if (metric.isContext) context = &metric;
-        else if (metric.bounded && metric.valid) windows.push_back(&metric);
-        else texts.push_back(&metric);
-    }
-
-    const WidgetMetric* primary = !windows.empty() ? windows[0] : nullptr;
-    const WidgetMetric* secondary = windows.size() > 1 ? windows[1] : context;
-
-    // Build the right-hand detail lines.
-    std::vector<std::string> details;
-    if (primary) {
-        const float shown = g_showRemaining ? 100.0f - primary->usedPercent : primary->usedPercent;
-        details.push_back(primary->label + "  " +
-            Format::get_instance()->Percent(shown) + (g_showRemaining ? " left" : " used"));
-    }
-    if (windows.size() > 1) {
-        const WidgetMetric* w = windows[1];
-        const float shown = g_showRemaining ? 100.0f - w->usedPercent : w->usedPercent;
-        details.push_back(w->label + "  " +
-            Format::get_instance()->Percent(shown) + (g_showRemaining ? " left" : " used"));
-    }
-    for (size_t i = 2; i < windows.size(); ++i) {
-        const WidgetMetric* w = windows[i];
-        const float shown = g_showRemaining ? 100.0f - w->usedPercent : w->usedPercent;
-        details.push_back(w->label + "  " + Format::get_instance()->Percent(shown));
-    }
-    for (const WidgetMetric* t : texts) {
-        std::string line = t->label + ": " + t->reading;
-        details.push_back(line);
-    }
-    if (context) {
-        std::string line = "Context  " + context->reading;
-        if (!context->reset.empty()) line += "  (" + context->reset + ")";
-        details.push_back(line);
-    }
-    if (details.size() > 4) details.resize(4);
-
-    const float lineH = ImGui::GetTextLineHeight();
-    const float pad = 12.0f;
-    const float gaugeR = 38.0f;
-    const float gaugeThick = 8.0f;
-
-    const float headerH = lineH + 6.0f;
-    const float detailBlockH = headerH + static_cast<float>(details.size()) * (lineH + 3.0f);
-    const float gaugeBlockH = gaugeR * 2.0f + 6.0f;
-    const bool hasReset = primary && !primary->reset.empty();
-    const float footerH = hasReset ? lineH + 10.0f : 4.0f;
-    const float cardH = pad + std::max(gaugeBlockH, detailBlockH) + footerH + pad;
-
-    const float width = ImGui::GetContentRegionAvail().x - kWidgetEdgeInset;
-    const ImVec2 origin = ImGui::GetCursorScreenPos();
-    const ImVec2 cardMin(origin.x, origin.y);
-    const ImVec2 cardMax(origin.x + width, origin.y + cardH);
+    ImGui::PushID(id);
+    const bool pressed = ImGui::InvisibleButton("##row", ImVec2(w, h));
+    const bool hovered = ImGui::IsItemHovered();
+    ImGui::PopID();
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const ImU32 accent = WidgetSkin::ProviderAccent(key);
-
-    WidgetSkin::Slab(dl, cardMin, cardMax, WidgetSkin::kCardTop, WidgetSkin::kCardBottom,
-        WidgetSkin::kCardBorder, 10.0f);
-    // Accent bar down the left edge.
-    dl->AddRectFilled(ImVec2(cardMin.x + 1.0f, cardMin.y + 8.0f),
-        ImVec2(cardMin.x + 3.5f, cardMax.y - 8.0f), accent, 2.0f);
-
-    // Drag handle: the top-left grip. Only this area starts a reorder, so the
-    // rest of the card stays inert.
-    ImGui::PushID(key.c_str());
-    ImGui::SetCursorScreenPos(ImVec2(cardMin.x + 8.0f, cardMin.y + 6.0f));
-    ImGui::InvisibleButton("##grip", ImVec2(width - 16.0f, headerH));
-    const bool active = ImGui::IsItemActive();
-    if (ImGui::IsItemHovered() || active) {
+    if (hovered) {
+        dl->AddRectFilled(pos, ImVec2(pos.x + w, pos.y + h), Color(44, 48, 60, 255), 7.0f);
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     }
-    ImGui::PopID();
-    g_widgetSectionHits.push_back({ section.key, cardMin.y, cardMax.y, active });
+    dl->AddText(ImVec2(pos.x + 10.0f, pos.y + 6.0f), color, label);
 
-    // ---- gauge ----
-    const ImVec2 gaugeCenter(cardMin.x + pad + gaugeR, cardMin.y + pad + gaugeR);
-
-    float primaryFrac = 0.0f;
-    float primaryShown = 0.0f;
-    ImU32 gaugeColor = WidgetSkin::kGaugeTrack;
-
-    if (primary) {
-        primaryShown = g_showRemaining ? 100.0f - primary->usedPercent : primary->usedPercent;
-        primaryFrac = primaryShown / 100.0f;
-        gaugeColor = WidgetSkin::Severity(primary->usedPercent).color;
-    }
-    else if (context) {
-        // Honour the global Used/Remaining toggle here too, matching the main
-        // window's context bar and the quota cards.
-        primaryShown = g_showRemaining ? 100.0f - context->usedPercent : context->usedPercent;
-        primaryFrac = primaryShown / 100.0f;
-        gaugeColor = WidgetSkin::Severity(context->usedPercent).color;
-    }
-
-    DrawGaugeArc(dl, gaugeCenter, gaugeR, gaugeThick, primaryFrac, gaugeColor);
-
-    if (secondary && secondary != primary) {
-        const float shown = g_showRemaining ? 100.0f - secondary->usedPercent : secondary->usedPercent;
-        DrawGaugeArc(dl, gaugeCenter, gaugeR - gaugeThick - 4.0f, 4.0f, shown / 100.0f,
-            WidgetSkin::Fade(gaugeColor, 0.55f));
-    }
-
-    // big number in the center
-    {
-        char big[16];
-        std::snprintf(big, sizeof(big), "%d", static_cast<int>(primaryShown + 0.5f));
-        ImFont* font = g_widgetBigFont ? g_widgetBigFont : ImGui::GetFont();
-        const float bigSize = 26.0f;
-        const ImVec2 sz = font->CalcTextSizeA(bigSize, FLT_MAX, 0.0f, big);
-        dl->AddText(font, bigSize, ImVec2(gaugeCenter.x - sz.x * 0.5f, gaugeCenter.y - sz.y * 0.6f),
-            WidgetSkin::kHost, big);
-
-        const char* pctSuffix = "%";
-        const ImVec2 psz = ImGui::CalcTextSize(pctSuffix);
-        dl->AddText(ImVec2(gaugeCenter.x - psz.x * 0.5f, gaugeCenter.y + sz.y * 0.4f - 2.0f),
-            WidgetSkin::kCaption, pctSuffix);
-    }
-
-    // ---- right block ----
-    const float rightX = cardMin.x + pad + gaugeR * 2.0f + 22.0f;
-    float y = cardMin.y + pad;
-
-    // provider name + badge
-    {
-        ImFont* font = g_widgetBigFont ? g_widgetBigFont : ImGui::GetFont();
-        const float nameSize = 17.0f;
-        dl->AddText(font, nameSize, ImVec2(rightX, y - 1.0f), accent, section.host);
-    }
-
-    // status badge, right-aligned at the top edge. A transient state (THINKING,
-    // COMPACTING, SYNC, RATE LIMITED, ...) wins; otherwise the badge is the
-    // severity of the primary window, or the context meter for context-only
-    // hosts, so every card carries a verdict.
-    {
-        const char* badgeText = section.state.c_str();
-        ImU32 badgeColor = section.stateColor;
-
-        const bool severityState = section.state.empty() || section.state == "AVAILABLE";
-        const WidgetMetric* ref = primary ? primary : context;
-
-        if (severityState && ref) {
-            const WidgetSkin::Verdict verdict = WidgetSkin::Severity(ref->usedPercent);
-            badgeText = verdict.label;
-            badgeColor = verdict.color;
-        }
-
-        DrawStatusBadge(dl, ImVec2(cardMax.x - pad, y), badgeText, badgeColor);
-    }
-
-    y += headerH + 2.0f;
-
-    for (const std::string& line : details) {
-        dl->AddText(ImVec2(rightX, y), WidgetSkin::kLabel, line.c_str());
-        y += lineH + 3.0f;
-    }
-
-    // ---- reset strip ----
-    if (hasReset) {
-        const float stripY = cardMax.y - footerH + 2.0f;
-        dl->AddLine(ImVec2(cardMin.x + pad, stripY), ImVec2(cardMax.x - pad, stripY),
-            WidgetSkin::Fade(WidgetSkin::kBorder, 0.6f), 1.0f);
-
-        std::string resetLine = primary->reset;
-        const std::string pace = WidgetPaceHint(primary->usedPercent, primary->resetAtUnixSeconds);
-        if (!pace.empty()) resetLine += "  ·  " + pace;
-
-        dl->AddText(ImVec2(cardMin.x + pad, stripY + 4.0f), WidgetSkin::kCaption, resetLine.c_str());
-    }
-
-    ImGui::SetCursorScreenPos(ImVec2(cardMin.x, cardMax.y));
-    ImGui::Dummy(ImVec2(width, 10.0f));
-}
-
-
-static WidgetSection BuildCodexWidgetSection()
-{
-    const Codex::Snapshot snapshot = CopyCodexSnapshotForSettings();
-
-    WidgetSection section;
-    section.key = "codex";
-    section.host = "CODEX";
-    section.plan = snapshot.plan;
-    SetWidgetSectionState(
-        section,
-        snapshot.access,
-        snapshot.run,
-        snapshot.context,
-        g_codexLoading.load()
-    );
-
-    for (const Codex::UsageBar& bar : snapshot.bars) {
-        if (!bar.valid) {
-            continue;
-        }
-
-        section.metrics.push_back(WidgetMetricFromWindow(
-            bar.label.empty() ? bar.sublabel : bar.label,
-            bar.usedPercent,
-            bar.rightText,
-            true,
-            bar.resetAtUnixSeconds
-        ));
-    }
-
-    if (snapshot.extraUsage.valid && snapshot.extraUsage.hasUsedPercent) {
-        section.metrics.push_back(WidgetMetricFromWindow(
-            snapshot.extraUsage.label,
-            snapshot.extraUsage.usedPercent,
-            snapshot.extraUsage.resetText,
-            true,
-            snapshot.extraUsage.resetAtUnixSeconds,
-            Color(160, 132, 240)
-        ));
-    }
-
-    if (snapshot.creditBalance.valid && !snapshot.creditBalance.balanceText.empty()) {
-        section.metrics.push_back(WidgetTextMetric(
-            "Credits",
-            snapshot.creditBalance.unlimited ? "Unlimited" : snapshot.creditBalance.balanceText
-        ));
-    }
-
-    if (snapshot.resetCreditsAvailableCount >= 0) {
-        section.metrics.push_back(WidgetTextMetric(
-            "Reset credits",
-            std::to_string(snapshot.resetCreditsAvailableCount) + " banked"
-        ));
-    }
-
-    if (!snapshot.usageNotice.empty()) {
-        section.metrics.push_back(WidgetTextMetric("Notice", std::string{}, snapshot.usageNotice));
-    }
-
-    AppendWidgetContextMetric(section, snapshot.context);
-    section.footer = WidgetSectionFooter(snapshot.run, snapshot.lastUpdated);
-    return section;
-}
-
-static WidgetSection BuildClaudeWidgetSection()
-{
-    const Claude::Snapshot snapshot = CopyClaudeSnapshotForSettings();
-
-    WidgetSection section;
-    section.key = "claude";
-    section.host = "CLAUDE";
-    section.plan = snapshot.plan;
-    SetWidgetSectionState(
-        section,
-        snapshot.access,
-        snapshot.run,
-        snapshot.context,
-        g_claudeLoading.load()
-    );
-
-    const Claude::UsageWindow* windows[] = {
-        &snapshot.currentSession,
-        &snapshot.weeklyAllModels,
-        &snapshot.weeklySonnet,
-        &snapshot.weeklyFable
-    };
-
-    for (const Claude::UsageWindow* window : windows) {
-        if (!window->valid) {
-            continue;
-        }
-
-        section.metrics.push_back(WidgetMetricFromWindow(
-            window->title,
-            window->usedPercent,
-            window->resetText,
-            true,
-            window->resetAtUnixSeconds
-        ));
-    }
-
-    for (const Claude::UsageWindow& window : snapshot.additionalLimits) {
-        if (!window.valid) {
-            continue;
-        }
-
-        section.metrics.push_back(WidgetMetricFromWindow(
-            window.title,
-            window.usedPercent,
-            window.resetText,
-            true,
-            window.resetAtUnixSeconds
-        ));
-    }
-
-    if (snapshot.credits.valid && snapshot.credits.hasUsedPercent) {
-        section.metrics.push_back(WidgetMetricFromWindow(
-            snapshot.credits.label,
-            snapshot.credits.usedPercent,
-            snapshot.credits.resetText,
-            true,
-            snapshot.credits.resetAtUnixSeconds,
-            Color(160, 132, 240)
-        ));
-    }
-
-    if (snapshot.credits.valid && !snapshot.credits.hasUsedPercent &&
-        !snapshot.credits.spentText.empty()) {
-        section.metrics.push_back(WidgetTextMetric(
-            snapshot.credits.label,
-            snapshot.credits.spentText,
-            snapshot.credits.monthlyLimitText.empty()
-                ? snapshot.credits.limitText
-                : "of " + snapshot.credits.monthlyLimitText
-        ));
-    }
-
-    if (snapshot.run.costValid) {
-        char spend[48]{};
-        std::snprintf(spend, sizeof(spend), "$%.2f", snapshot.run.sessionCostUsd);
-
-        std::string detail;
-
-        if (snapshot.run.sessionLinesAdded > 0 || snapshot.run.sessionLinesRemoved > 0) {
-            detail = "+" + std::to_string(snapshot.run.sessionLinesAdded) +
-                " / -" + std::to_string(snapshot.run.sessionLinesRemoved) + " lines";
-        }
-
-        if (snapshot.run.sessionApiDurationMs > 0) {
-            if (!detail.empty()) {
-                detail += "  ·  ";
-            }
-
-            detail += FormatRunDuration(snapshot.run.sessionApiDurationMs / 1000) + " API";
-        }
-
-        section.metrics.push_back(WidgetTextMetric("Session cost", spend, detail));
-    }
-
-    AppendWidgetContextMetric(section, snapshot.context);
-    section.footer = WidgetSectionFooter(snapshot.run, snapshot.lastUpdated);
-    return section;
-}
-
-static WidgetSection BuildZAiWidgetSection()
-{
-    const ZAi::Snapshot snapshot = CopyZAiSnapshotForSettings();
-
-    WidgetSection section;
-    section.key = "zai";
-    section.host = "Z.AI";
-    section.plan = snapshot.plan;
-    SetWidgetSectionState(
-        section,
-        snapshot.access,
-        snapshot.run,
-        snapshot.context,
-        g_zaiLoading.load()
-    );
-
-    for (const ZAi::UsageBar& bar : snapshot.bars) {
-        if (!bar.valid) {
-            continue;
-        }
-
-        ImU32 fill = Color(38, 132, 255);
-
-        if (bar.red) fill = Color(238, 65, 65);
-        else if (bar.green) fill = Color(68, 215, 128);
-        else if (bar.white) fill = Color(235, 235, 235);
-        else if (bar.spendBalance) fill = Color(160, 132, 240);
-
-        section.metrics.push_back(WidgetMetricFromWindow(
-            bar.label.empty() ? bar.sublabel : bar.label,
-            bar.usedPercent,
-            bar.resetText,
-            true,
-            bar.resetAtUnixSeconds,
-            fill
-        ));
-    }
-
-    for (const ZAi::DetailRow& detail : snapshot.details) {
-        if (!detail.leftLabel.empty() && !detail.leftValue.empty()) {
-            section.metrics.push_back(WidgetTextMetric(detail.leftLabel, detail.leftValue));
-        }
-
-        if (!detail.rightLabel.empty() && !detail.rightValue.empty()) {
-            section.metrics.push_back(WidgetTextMetric(detail.rightLabel, detail.rightValue));
-        }
-    }
-
-    if (snapshot.context.latestCacheHitPercentValid) {
-        section.metrics.push_back(WidgetTextMetric(
-            "Cache hit",
-            Format::get_instance()->Percent(snapshot.context.latestCacheHitPercent),
-            snapshot.context.averageCacheHitPercentValid
-                ? "avg " + Format::get_instance()->Percent(snapshot.context.averageCacheHitPercent)
-                : std::string{}
-        ));
-    }
-
-    AppendWidgetContextMetric(section, snapshot.context);
-    section.footer = WidgetSectionFooter(snapshot.run, snapshot.lastUpdated);
-    return section;
-}
-
-static WidgetSection BuildGrokWidgetSection()
-{
-    const Grok::Snapshot snapshot = CopyGrokSnapshotForSettings();
-
-    WidgetSection section;
-    section.key = "grok";
-    section.host = "GROK";
-    section.plan = snapshot.plan;
-
-    UsageTelemetry::RunUsage idle;
-    SetWidgetSectionState(
-        section,
-        snapshot.access,
-        idle,
-        snapshot.context,
-        g_grokLoading.load()
-    );
-
-    if (snapshot.weeklyLimit.valid) {
-        section.metrics.push_back(WidgetMetricFromWindow(
-            snapshot.weeklyLimit.title,
-            snapshot.weeklyLimit.usedPercent,
-            snapshot.weeklyLimit.resetText,
-            true,
-            snapshot.weeklyLimit.resetAtUnixSeconds
-        ));
-    }
-
-    for (const Grok::ProductUsage& product : snapshot.products) {
-        section.metrics.push_back(WidgetMetricFromWindow(
-            product.product,
-            product.usagePercent,
-            std::string{},
-            true
-        ));
-    }
-
-    if (snapshot.extraCredits.valid) {
-        WidgetMetric credits = WidgetMetricFromWindow(
-            "Credits",
-            snapshot.extraCredits.usedPercent,
-            std::string{},
-            true,
-            0,
-            Color(160, 132, 240)
-        );
-        credits.reading = snapshot.extraCredits.balanceText + " left";
-        section.metrics.push_back(std::move(credits));
-    }
-
-    AppendWidgetContextMetric(section, snapshot.context);
-
-    UsageTelemetry::RunUsage idleRun;
-    section.footer = WidgetSectionFooter(idleRun, snapshot.lastUpdated);
-    return section;
+    return pressed;
 }
 
 static void DrawWidgetUi()
@@ -4779,186 +4442,190 @@ static void DrawWidgetUi()
     const ImVec2 panelMax(panelMin.x + panelSize.x, panelMin.y + panelSize.y);
 
     draw->AddRectFilledMultiColor(panelMin, panelMax,
-        WidgetSkin::kPanelTop, WidgetSkin::kPanelTop,
-        WidgetSkin::kPanelBottom, WidgetSkin::kPanelBottom);
-    draw->AddRect(panelMin, panelMax, WidgetSkin::kBorder, 8.0f, 0, 1.0f);
+        Color(24, 26, 34, 252), Color(24, 26, 34, 252),
+        Color(15, 16, 22, 252), Color(15, 16, 22, 252));
+    draw->AddRect(panelMin, panelMax, Color(54, 58, 72, 220), 8.0f, 0, 1.0f);
 
-    // Everything in the widget renders in Segoe UI (falls back to default).
-    if (g_widgetFont) {
-        ImGui::PushFont(g_widgetFont);
-    }
+    if (g_widgetFont) ImGui::PushFont(g_widgetFont);
 
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 12.0f));
-    ImGui::BeginChild("##widget_panel", ImVec2(0.0f, 0.0f), false,
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(13.0f, 11.0f));
+    ImGui::BeginChild("##widget_panel", ImVec2(0.0f, 0.0f),
+        ImGuiChildFlags_AlwaysUseWindowPadding,
         ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
     ImDrawList* inner = ImGui::GetWindowDrawList();
     const float contentWidth = ImGui::GetContentRegionAvail().x;
     const ImVec2 headerOrigin = ImGui::GetCursorScreenPos();
 
-    // ---- header ----
+    // ---- title row ----
     {
-        // A little app badge: a filled rounded square with a spark.
-        const ImVec2 badgeA(headerOrigin.x, headerOrigin.y - 1.0f);
-        const ImVec2 badgeB(badgeA.x + 26.0f, badgeA.y + 26.0f);
+        const ImVec2 badgeA(headerOrigin.x, headerOrigin.y);
+        const ImVec2 badgeB(badgeA.x + 24.0f, badgeA.y + 24.0f);
         inner->AddRectFilledMultiColor(badgeA, badgeB,
             Color(88, 176, 255), Color(150, 110, 240),
             Color(120, 90, 220), Color(60, 140, 220));
-        inner->AddRect(badgeA, badgeB, WidgetSkin::Fade(Color(255, 255, 255), 0.25f), 6.0f, 0, 1.0f);
-        DrawGenericQuotaIcon(ImVec2((badgeA.x + badgeB.x) * 0.5f, (badgeA.y + badgeB.y) * 0.5f), 13.0f);
+        DrawGenericQuotaIcon(ImVec2((badgeA.x + badgeB.x) * 0.5f, (badgeA.y + badgeB.y) * 0.5f), 12.0f);
 
-        ImFont* titleFont = g_widgetBigFont ? g_widgetBigFont : ImGui::GetFont();
-        inner->AddText(titleFont, 17.0f, ImVec2(headerOrigin.x + 34.0f, headerOrigin.y - 3.0f),
-            WidgetSkin::kHost, "AI Quota");
-        inner->AddText(ImVec2(headerOrigin.x + 34.0f, headerOrigin.y + 15.0f),
-            WidgetSkin::kCaption, g_widgetPinned ? "pinned monitor" : "usage monitor");
+        ImFont* tf = g_widgetBigFont ? g_widgetBigFont : ImGui::GetFont();
+        inner->AddText(tf, 17.0f, ImVec2(headerOrigin.x + 32.0f, headerOrigin.y + 1.0f),
+            Color(236, 240, 248), g_widgetPinned ? "AI Quota - pinned" : "AI Quota");
     }
 
-    // right-aligned icon buttons: pin / refresh / restore / close
     const float btnW = 26.0f;
     const float btnH = 22.0f;
-    const float gap = 6.0f;
-    ImGui::SetCursorScreenPos(ImVec2(
-        headerOrigin.x + contentWidth - (btnW * 4.0f + gap * 3.0f),
-        headerOrigin.y));
+    ImGui::SetCursorScreenPos(ImVec2(headerOrigin.x + contentWidth - (btnW * 2.0f + 6.0f), headerOrigin.y));
 
-    const bool pin = WidgetIconButton("##w_pin", 0, ImVec2(btnW, btnH),
-        Color(214, 162, 48), g_widgetPinned);
-    ImGui::SameLine(0.0f, gap);
-    const bool refresh = WidgetIconButton("##w_refresh", 1, ImVec2(btnW, btnH), Color(60, 130, 210), false);
-    ImGui::SameLine(0.0f, gap);
-    const bool restore = WidgetIconButton("##w_restore", 2, ImVec2(btnW, btnH), Color(60, 130, 210), false);
-    ImGui::SameLine(0.0f, gap);
-    const bool close = WidgetIconButton("##w_close", 3, ImVec2(btnW, btnH), Color(200, 64, 64), false);
+    const bool pin = WidgetIconButton("##w_pin", 0, ImVec2(btnW, btnH), Color(196, 148, 44, 255), g_widgetPinned);
+    ImGui::SameLine(0.0f, 6.0f);
+    const bool close = WidgetIconButton("##w_close", 2, ImVec2(btnW, btnH), Color(170, 54, 54, 255), false);
 
     if (pin) {
         g_widgetPinned = !g_widgetPinned;
-        if (R().saveAppSettings) R().saveAppSettings();
-    }
-    if (refresh) {
-        if (R().refreshCodexAsync) R().refreshCodexAsync();
-        if (R().refreshClaudeAsync) R().refreshClaudeAsync();
-        if (R().refreshZAiAsync) R().refreshZAiAsync();
-        if (R().refreshGrokAsync) R().refreshGrokAsync();
-    }
-    if (restore) {
-        g_widgetMode = false;
         if (R().saveAppSettings) R().saveAppSettings();
     }
     if (close) {
         g_shouldClose = true;
     }
 
-    ImGui::SetCursorScreenPos(ImVec2(headerOrigin.x, headerOrigin.y + 30.0f));
+    ImGui::SetCursorScreenPos(ImVec2(headerOrigin.x, headerOrigin.y + 32.0f));
 
-    // gradient rule
-    const ImVec2 ruleAt = ImGui::GetCursorScreenPos();
-    inner->AddRectFilledMultiColor(ruleAt, ImVec2(ruleAt.x + contentWidth, ruleAt.y + 1.0f),
-        WidgetSkin::Fade(Color(120, 150, 255), 0.0f), Color(120, 150, 255),
-        Color(120, 150, 255), WidgetSkin::Fade(Color(120, 150, 255), 0.0f));
-
-    ImGui::Dummy(ImVec2(contentWidth, 10.0f));
-
-    // ---- ordered / filtered provider cards ----
-    static const char* const kKnownHosts[] = { "codex", "claude", "zai", "grok" };
-
-    std::vector<std::string> order;
+    // ---- compact icon tab strip ----
     {
-        std::stringstream stream(R().widgetOrder ? *R().widgetOrder : std::string{});
-        std::string token;
-        while (std::getline(stream, token, ',')) {
-            while (!token.empty() && (token.front() == ' ' || token.front() == '\t')) token.erase(token.begin());
-            while (!token.empty() && (token.back() == ' ' || token.back() == '\t')) token.pop_back();
-            if (token.empty()) continue;
-            bool known = false;
-            for (const char* host : kKnownHosts) if (token == host) known = true;
-            if (!known) continue;
-            if (std::find(order.begin(), order.end(), token) == order.end()) order.push_back(token);
-        }
-    }
-    for (const char* host : kKnownHosts) {
-        if (std::find(order.begin(), order.end(), host) == order.end()) order.emplace_back(host);
-    }
+        TabImage& codex = EnsureTabImage(g_codexTabImage, L"Codex.ico");
+        TabImage& claude = EnsureTabImage(g_claudeTabImage, L"Claude.ico");
+        TabImage& zai = EnsureTabImage(g_zaiTabImage, L"ZAi.ico");
+        TabImage& grok = EnsureTabImage(g_grokTabImage, L"Grok.ico");
 
-    const auto buildSection = [](const std::string& key) -> WidgetSection {
-        if (key == "codex") return BuildCodexWidgetSection();
-        if (key == "claude") return BuildClaudeWidgetSection();
-        if (key == "zai") return BuildZAiWidgetSection();
-        return BuildGrokWidgetSection();
-    };
-
-    std::vector<std::pair<std::string, WidgetSection>> visible;
-    for (const std::string& key : order) {
-        WidgetSection section = buildSection(key);
-        if (section.metrics.empty() && section.state != "SYNC") continue;
-        visible.emplace_back(key, std::move(section));
+        float u = 0.0f;
+        bool has;
+        has = CodexPrimaryUsed(u);  DrawProviderTabPill("wCodex", &codex, ActiveMainTab::Codex, g_widgetTab, true, has, u);
+        ImGui::SameLine(0.0f, 7.0f);
+        has = ClaudePrimaryUsed(u); DrawProviderTabPill("wClaude", &claude, ActiveMainTab::Claude, g_widgetTab, true, has, u);
+        ImGui::SameLine(0.0f, 7.0f);
+        has = ZAiPrimaryUsed(u);    DrawProviderTabPill("wZAi", &zai, ActiveMainTab::ZAi, g_widgetTab, true, has, u);
+        ImGui::SameLine(0.0f, 7.0f);
+        has = GrokPrimaryUsed(u);   DrawProviderTabPill("wGrok", &grok, ActiveMainTab::Grok, g_widgetTab, true, has, u);
     }
 
-    ImGui::BeginChild("##widget_body", ImVec2(0.0f, 0.0f), false,
+    ImGui::Dummy(ImVec2(contentWidth, 9.0f));
+    {
+        const ImVec2 rp = ImGui::GetCursorScreenPos();
+        inner->AddLine(rp, ImVec2(rp.x + contentWidth, rp.y), Color(44, 48, 60), 1.0f);
+        ImGui::Dummy(ImVec2(contentWidth, 10.0f));
+    }
+
+    // ---- selected host: header + sections ----
+    // Reserve room for the pinned footer menu; otherwise it scrolls off the
+    // bottom with the sections and can never be clicked.
+    const float footerHeight = 2.0f * (ImGui::GetTextLineHeight() + 12.0f) + 20.0f;
+
+    ImGui::BeginChild("##widget_body", ImVec2(0.0f, -footerHeight), false,
         ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
 
-    g_widgetSectionHits.clear();
-
-    if (visible.empty()) {
-        ImGui::Dummy(ImVec2(contentWidth, 6.0f));
-        ImGui::GetWindowDrawList()->AddText(ImGui::GetCursorScreenPos(),
-            WidgetSkin::kCaption, "No usage available yet");
+    switch (g_widgetTab) {
+    case ActiveMainTab::Codex: {
+        Codex::Snapshot s;
+        { std::lock_guard<std::mutex> lock(g_codexMutex); s = g_codexState; }
+        DrawProviderHeader("Codex", s.lastUpdated, s.plan,
+            g_codexAutoRefreshEnabled, g_codexLoading.load(), RefreshCodexAsync, "w_codex_refresh");
+        RenderCodexSections(s);
+        break;
     }
-    else {
-        for (const auto& entry : visible) {
-            DrawWidgetSectionCard(entry.first, entry.second);
-        }
+    case ActiveMainTab::Claude: {
+        Claude::Snapshot s;
+        { std::lock_guard<std::mutex> lock(g_claudeMutex); s = g_claudeState; }
+        DrawProviderHeader(s.plan.empty() ? "Claude" : s.plan.c_str(), s.lastUpdated, std::string{},
+            g_claudeAutoRefreshEnabled, g_claudeLoading.load(), RefreshClaudeAsync, "w_claude_refresh");
+        RenderClaudeSections(s);
+        break;
     }
-
-    // drag-to-reorder resolution
-    std::string draggedKey;
-    for (const WidgetSectionHit& hit : g_widgetSectionHits) {
-        if (hit.active) { draggedKey = hit.key; break; }
+    case ActiveMainTab::ZAi: {
+        ZAi::Snapshot s;
+        { std::lock_guard<std::mutex> lock(g_zaiMutex); s = g_zaiState; }
+        DrawProviderHeader("Z.Ai", s.lastUpdated, s.plan,
+            g_zaiAutoRefreshEnabled, g_zaiLoading.load(), RefreshZAiAsync, "w_zai_refresh");
+        RenderZAiSections(s);
+        break;
     }
-
-    if (!draggedKey.empty()) {
-        const float mouseY = ImGui::GetMousePos().y;
-        std::string overKey;
-        for (const WidgetSectionHit& hit : g_widgetSectionHits) {
-            if (mouseY >= hit.top && mouseY <= hit.bottom) { overKey = hit.key; break; }
-        }
-        if (overKey.empty() && !g_widgetSectionHits.empty()) {
-            if (mouseY < g_widgetSectionHits.front().top) overKey = g_widgetSectionHits.front().key;
-            else if (mouseY > g_widgetSectionHits.back().bottom) overKey = g_widgetSectionHits.back().key;
-        }
-        if (!overKey.empty() && overKey != draggedKey) {
-            const auto from = std::find(order.begin(), order.end(), draggedKey);
-            const auto to = std::find(order.begin(), order.end(), overKey);
-            if (from != order.end() && to != order.end()) {
-                const std::string moved = *from;
-                const size_t target = static_cast<size_t>(std::distance(order.begin(), to));
-                order.erase(from);
-                order.insert(order.begin() + std::min(target, order.size()), moved);
-                std::string joined;
-                for (const std::string& key : order) {
-                    if (!joined.empty()) joined.push_back(',');
-                    joined += key;
-                }
-                if (R().widgetOrder) *R().widgetOrder = joined;
-                g_widgetOrderDirty = true;
-            }
-        }
+    default: {
+        Grok::Snapshot s;
+        { std::lock_guard<std::mutex> lock(g_grokMutex); s = g_grokState; }
+        DrawProviderHeader("Grok", s.lastUpdated, s.plan,
+            g_grokAutoRefreshEnabled, g_grokLoading.load(), RefreshGrokAsync, "w_grok_refresh");
+        RenderGrokSections(s);
+        break;
     }
-
-    if (g_widgetOrderDirty && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
-        g_widgetOrderDirty = false;
-        if (R().saveAppSettings) R().saveAppSettings();
     }
 
     ImGui::EndChild();
+
+    // ---- footer menu (matches the reference popover), pinned to the bottom ----
+    {
+        const ImVec2 rp = ImGui::GetCursorScreenPos();
+        ImGui::GetWindowDrawList()->AddLine(rp, ImVec2(rp.x + contentWidth, rp.y),
+            Color(44, 48, 60), 1.0f);
+        ImGui::Dummy(ImVec2(contentWidth, 7.0f));
+    }
+
+    if (DrawWidgetMenuRow("m_settings", "Settings...", Color(214, 220, 232))) {
+        g_settingsWindowOpen = true;
+    }
+    if (DrawWidgetMenuRow("m_quit", "Quit", Color(214, 220, 232))) {
+        g_shouldClose = true;
+    }
+
     ImGui::EndChild();
     ImGui::PopStyleVar();
 
-    if (g_widgetFont) {
-        ImGui::PopFont();
-    }
+    if (g_widgetFont) ImGui::PopFont();
 }
 
+void RenderSettingsUi(State& state)
+{
+    g_state = &state;
+
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(viewport->WorkPos);
+    ImGui::SetNextWindowSize(viewport->WorkSize);
+
+    const ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoCollapse;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::Begin("AI Quota Settings Root", nullptr, flags);
+    ImGui::PopStyleVar(2);
+
+    // Title strip
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 a = ImGui::GetWindowPos();
+        const ImVec2 b(a.x + ImGui::GetWindowSize().x, a.y + 40.0f);
+        dl->AddRectFilled(a, b, Color(22, 24, 31), 0.0f);
+        dl->AddLine(ImVec2(a.x, b.y), ImVec2(b.x, b.y), Color(44, 48, 60), 1.0f);
+        dl->AddText(ImVec2(a.x + 16.0f, a.y + 12.0f), Color(232, 236, 244), "Settings");
+
+        ImGui::SetCursorScreenPos(ImVec2(a.x + ImGui::GetWindowSize().x - 84.0f, a.y + 8.0f));
+        if (ImGui::Button("Close", ImVec2(70.0f, 24.0f))) {
+            g_settingsWindowOpen = false;
+        }
+        ImGui::SetCursorScreenPos(ImVec2(a.x, b.y + 8.0f));
+    }
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.0f, 14.0f));
+    ImGui::BeginChild("##settings_body", ImVec2(0.0f, 0.0f),
+        ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_None);
+    ImGui::PopStyleVar();
+
+    DrawSettingsTab();
+
+    ImGui::EndChild();
+    ImGui::End();
+}
 
 void RenderMainUi(State& state)
 {
@@ -4985,24 +4652,44 @@ void RenderMainUi(State& state)
 
     ImGui::PopStyleVar(2);
 
+    // UI mode is selected at build time:
+    //   GUI_AND_WIDGET - tabbed form plus widget, switchable at runtime
+    //   GUI_ONLY       - tabbed form only
+    //   (neither)      - widget only (default)
+#if defined(GUI_AND_WIDGET)
     if (g_widgetMode) {
         DrawWidgetUi();
         ImGui::End();
         return;
     }
+#elif defined(GUI_ONLY)
+    // always the form
+#else
+    DrawWidgetUi();
+    ImGui::End();
+    return;
+#endif
 
+#if defined(GUI_AND_WIDGET) || defined(GUI_ONLY)
     DrawCustomTitleBar();
 
+    // AlwaysUseWindowPadding + an explicit padding: without it the panel content
+    // sat flush on x=0 and ran off the right edge, which is what made the whole
+    // window look unfinished.
     ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
-    ImGui::BeginChild("##main_panel", ImVec2(0.0f, 0.0f), true, ImGuiWindowFlags_NoScrollbar);
-    ImGui::PopStyleVar(2);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(18.0f, 14.0f));
+    ImGui::BeginChild("##main_panel", ImVec2(0.0f, 0.0f),
+        ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding,
+        ImGuiWindowFlags_NoScrollbar);
+    ImGui::PopStyleVar(3);
 
     DrawProviderTabStrip();
     DrawActiveMainTab();
 
     ImGui::EndChild();
     ImGui::End();
+#endif
 }
 
 

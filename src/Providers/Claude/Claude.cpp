@@ -2088,6 +2088,7 @@ namespace Claude {
         long long linesRemoved = 0;
         long long durationMs = 0;
         long long apiDurationMs = 0;
+        std::vector<std::string> details;
     };
 
     static std::filesystem::path ClaudeStatusLineFilePath() {
@@ -2233,8 +2234,69 @@ namespace Claude {
             );
         }
 
+        // Session facts published only here. Each is optional.
+        {
+            const auto model = root.find("model");
+            if (model != root.end() && model->is_object()) {
+                const std::string display = model->value("display_name", std::string{});
+                if (!display.empty()) payload.details.push_back("Model: " + display);
+            }
+
+            const auto style = root.find("output_style");
+            if (style != root.end() && style->is_object()) {
+                const std::string name = style->value("name", std::string{});
+                if (!name.empty()) payload.details.push_back("Output style: " + name);
+            }
+
+            const auto exceeds = root.find("exceeds_200k_tokens");
+            if (exceeds != root.end() && exceeds->is_boolean() && exceeds->get<bool>()) {
+                payload.details.push_back("Long-context tier (>200k)");
+            }
+
+            const auto workspace = root.find("workspace");
+            if (workspace != root.end() && workspace->is_object()) {
+                std::string dir = workspace->value("project_dir", std::string{});
+                if (dir.empty()) dir = workspace->value("current_dir", std::string{});
+                if (!dir.empty()) {
+                    const size_t slash = dir.find_last_of("/\\");
+                    payload.details.push_back("Project: " +
+                        (slash == std::string::npos ? dir : dir.substr(slash + 1)));
+                }
+                const std::string repo = workspace->value("repo", std::string{});
+                if (!repo.empty()) payload.details.push_back("Repo: " + repo);
+            }
+
+            const auto agent = root.find("agent");
+            if (agent != root.end() && agent->is_object()) {
+                const std::string name = agent->value("name", std::string{});
+                if (!name.empty()) payload.details.push_back("Agent: " + name);
+            }
+
+            const auto pr = root.find("pr");
+            if (pr != root.end() && pr->is_object()) {
+                const auto number = pr->find("number");
+                if (number != pr->end() && number->is_number()) {
+                    payload.details.push_back("PR #" +
+                        std::to_string(static_cast<long long>(number->get<double>())));
+                }
+            }
+
+            const auto worktree = root.find("worktree");
+            if (worktree != root.end() && worktree->is_object()) {
+                const std::string branch = worktree->value("branch", std::string{});
+                if (!branch.empty()) payload.details.push_back("Branch: " + branch);
+            }
+
+            const auto vim = root.find("vim");
+            if (vim != root.end() && vim->is_object()) {
+                const std::string mode = vim->value("mode", std::string{});
+                if (!mode.empty()) payload.details.push_back("Vim: " + mode);
+            }
+        }
+
         payload.valid = payload.contextWindowTokens > 0 ||
-            payload.hasFiveHour || payload.hasSevenDay || payload.hasCost;
+            payload.hasFiveHour || payload.hasSevenDay || payload.hasCost ||
+            !payload.details.empty();
         return payload;
     }
 
@@ -3089,6 +3151,10 @@ namespace Claude {
                 modelWindowFallback = false;
             }
 
+            if (matchesSession && !statusLine.details.empty()) {
+                local.run.sessionDetails = statusLine.details;
+            }
+
             if (matchesSession && statusLine.hasCost) {
                 local.run.costValid = true;
                 local.run.sessionCostUsd = statusLine.totalCostUsd;
@@ -3552,6 +3618,21 @@ namespace Claude {
         snapshot.access.detail = failureDetail.empty()
             ? age + ". Reset times are derived from the recorded series."
             : age + ". Live request unavailable: " + failureDetail;
+        // xu is the extra-usage percentage the history file records alongside
+        // the windows; ParseSnapshot has no field for it, so apply it directly.
+        if (sample.hasExtraUsage) {
+            snapshot.credits.reported = true;
+            snapshot.credits.valid = true;
+            snapshot.credits.enabled = true;
+            snapshot.credits.hasUsedPercent = true;
+            snapshot.credits.usedPercent = static_cast<float>(
+                Math::get_instance()->ClampPercentDouble(sample.extraUsagePercent));
+
+            if (snapshot.credits.label.empty()) {
+                snapshot.credits.label = "Extra usage";
+            }
+        }
+
         snapshot.accountKey = "desktop:" + sample.organizationId;
         return snapshot;
     }

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -51,6 +52,15 @@ namespace
     static HWND g_hwnd = nullptr;
     static bool g_shouldClose = false;
 
+    // Settings lives in its own top-level window with its own ImGui context, so
+    // the widget keeps rendering behind it.
+    static bool g_settingsWindowOpen = false;
+    static HWND g_settingsHwnd = nullptr;
+    static IDXGISwapChain* g_settingsSwapChain = nullptr;
+    static ID3D11RenderTargetView* g_settingsRenderTarget = nullptr;
+    static ImGuiContext* g_mainImGuiContext = nullptr;
+    static ImGuiContext* g_settingsImGuiContext = nullptr;
+
     static constexpr int kTitleBarHeight = 38;
     static constexpr int kResizeBorder = 6;
     // Width of the [-][widget][X] strip drawn by Renderer::DrawCustomTitleBar.
@@ -58,8 +68,8 @@ namespace
     // clicks for dragging before ImGui can see them.
     static constexpr int kTitleBarButtonStrip = 120;
 
-    static constexpr int kWidgetWidth = 340;
-    static constexpr int kWidgetHeight = 560;
+    static constexpr int kWidgetWidth = 360;
+    static constexpr int kWidgetHeight = 620;
     static constexpr int kWidgetMargin = 12;
     // How much of the widget stays on screen once it retracts. Wide enough to
     // grab with the pointer without hunting for it.
@@ -78,6 +88,8 @@ namespace
     // suppressed - the pill still toggles it back.
     static bool g_widgetPinned = false;
     static std::string g_widgetOrder = "codex,claude,zai,grok";
+    static int g_uiFontSize = 14;
+    static int g_widgetSections = 0x7F;
 
     static bool g_showRemaining = false;
     static bool g_showResetDateDetails = false;
@@ -219,9 +231,17 @@ namespace
         AppSettings::Load(settings);
 
         g_showRemaining = settings.showRemaining;
+#if defined(GUI_AND_WIDGET)
         g_widgetMode = settings.widgetMode;
+#elif defined(GUI_ONLY)
+        g_widgetMode = false;
+#else
+        g_widgetMode = true;
+#endif
         g_widgetPinned = settings.widgetPinned;
         g_widgetOrder = settings.widgetOrder;
+        g_uiFontSize = AppSettings::ClampUiFontSize(settings.uiFontSize);
+        g_widgetSections = settings.widgetSections;
         g_showResetDateDetails = settings.showResetDateDetails;
         g_resetDisplayMode = AppSettings::ClampResetDisplayMode(settings.resetDisplayMode);
         g_showNotificationsInsideWindow = settings.notificationsInsideWindow;
@@ -254,6 +274,8 @@ namespace
         settings.widgetMode = g_widgetMode;
         settings.widgetPinned = g_widgetPinned;
         settings.widgetOrder = g_widgetOrder;
+        settings.uiFontSize = AppSettings::ClampUiFontSize(g_uiFontSize);
+        settings.widgetSections = g_widgetSections;
         settings.showResetDateDetails = g_showResetDateDetails;
         settings.resetDisplayMode = AppSettings::ClampResetDisplayMode(g_resetDisplayMode);
         settings.notificationsInsideWindow = g_showNotificationsInsideWindow;
@@ -388,10 +410,64 @@ namespace
         }
     }
 
+    static void DestroySettingsWindow();
+
     static LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
     {
+        // Two windows, two ImGui contexts: the backend reads state from the
+        // CURRENT context, so select the one that owns this hwnd first.
+        if (hwnd == g_settingsHwnd && g_settingsImGuiContext) {
+            ImGui::SetCurrentContext(g_settingsImGuiContext);
+        }
+        else if (g_mainImGuiContext) {
+            ImGui::SetCurrentContext(g_mainImGuiContext);
+        }
+
         if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam)) {
             return true;
+        }
+
+        if (hwnd == g_settingsHwnd) {
+            switch (msg) {
+            case WM_SIZE:
+                if (g_settingsSwapChain && wparam != SIZE_MINIMIZED) {
+                    if (g_settingsRenderTarget) {
+                        g_settingsRenderTarget->Release();
+                        g_settingsRenderTarget = nullptr;
+                    }
+                    g_settingsSwapChain->ResizeBuffers(0, LOWORD(lparam), HIWORD(lparam),
+                        DXGI_FORMAT_UNKNOWN, 0);
+                    ID3D11Texture2D* back = nullptr;
+                    if (SUCCEEDED(g_settingsSwapChain->GetBuffer(0, IID_PPV_ARGS(&back)))) {
+                        g_device->CreateRenderTargetView(back, nullptr, &g_settingsRenderTarget);
+                        back->Release();
+                    }
+                }
+                return 0;
+
+            case WM_CLOSE:
+                g_settingsWindowOpen = false;
+                return 0;
+
+            case WM_NCHITTEST: {
+                // Drag by the title strip, but leave the Close button clickable.
+                POINT pt{ GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) };
+                RECT rc{};
+                GetWindowRect(hwnd, &rc);
+
+                const int x = pt.x - rc.left;
+                const int y = pt.y - rc.top;
+                const int w = rc.right - rc.left;
+
+                if (y >= 0 && y < 40 && x >= 0 && x < w - 96) {
+                    return HTCAPTION;
+                }
+
+                return HTCLIENT;
+            }
+            }
+
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
 
         switch (msg) {
@@ -438,7 +514,10 @@ namespace
         }
 
         case WM_SIZE:
-            if (g_device && wparam != SIZE_MINIMIZED) {
+            // Scope to the main window explicitly: a newly created window
+            // receives WM_SIZE during CreateWindowExW, before its handle has
+            // been stored, so it would otherwise resize the widget's swapchain.
+            if (hwnd == g_hwnd && g_device && wparam != SIZE_MINIMIZED) {
                 CleanupRenderTarget();
                 g_swapChain->ResizeBuffers(0, LOWORD(lparam), HIWORD(lparam), DXGI_FORMAT_UNKNOWN, 0);
                 CreateRenderTarget();
@@ -452,7 +531,11 @@ namespace
             break;
 
         case WM_DESTROY:
-            PostQuitMessage(0);
+            // Only the widget closing ends the app; destroying the settings
+            // window must not post WM_QUIT.
+            if (hwnd == g_hwnd) {
+                PostQuitMessage(0);
+            }
             return 0;
         }
 
@@ -568,9 +651,13 @@ namespace
         g_widgetRetracted = false;
     }
 
-    static int RetractedY()
+    // Use the window's ACTUAL height, not the constant: DPI virtualisation and
+    // any future resize mean the two can differ, and using the constant left
+    // the panel hanging half on-screen instead of retracting fully.
+    static int RetractedY(const RECT& rect)
     {
-        return WorkAreaForWindow(g_hwnd).top - (kWidgetHeight - kWidgetSliver);
+        const int height = (std::max)(1L, rect.bottom - rect.top);
+        return WorkAreaForWindow(g_hwnd).top - (height - kWidgetSliver);
     }
 
     static void PollWidgetWindow()
@@ -616,7 +703,7 @@ namespace
             g_widgetRetracted = true;
         }
 
-        g_widgetTargetY = g_widgetRetracted ? RetractedY() : g_widgetExpandedY;
+        g_widgetTargetY = g_widgetRetracted ? RetractedY(rect) : g_widgetExpandedY;
 
         const int currentY = static_cast<int>(rect.top);
 
@@ -652,6 +739,135 @@ namespace
             0,
             SWP_NOSIZE | SWP_NOACTIVATE
         );
+    }
+
+    static void DestroySettingsWindow()
+    {
+        if (!g_settingsHwnd) {
+            return;
+        }
+
+        ImGuiContext* previous = ImGui::GetCurrentContext();
+        ImGui::SetCurrentContext(g_settingsImGuiContext);
+        ImGui_ImplDX11_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext(g_settingsImGuiContext);
+        g_settingsImGuiContext = nullptr;
+        ImGui::SetCurrentContext(previous == nullptr ? g_mainImGuiContext : g_mainImGuiContext);
+
+        if (g_settingsRenderTarget) {
+            g_settingsRenderTarget->Release();
+            g_settingsRenderTarget = nullptr;
+        }
+        if (g_settingsSwapChain) {
+            g_settingsSwapChain->Release();
+            g_settingsSwapChain = nullptr;
+        }
+
+        DestroyWindow(g_settingsHwnd);
+        g_settingsHwnd = nullptr;
+    }
+
+    static bool CreateSettingsWindow(HINSTANCE instance)
+    {
+        if (g_settingsHwnd) {
+            SetForegroundWindow(g_settingsHwnd);
+            return true;
+        }
+
+        const RECT work = WorkAreaForWindow(g_hwnd);
+        const int width = 900;
+        const int height = 660;
+        const int x = work.left + ((work.right - work.left) - width) / 2;
+        const int y = work.top + ((work.bottom - work.top) - height) / 2;
+
+        g_settingsHwnd = CreateWindowExW(
+            0, L"AIQuotaCheckerDX11", L"AI Quota Checker - Settings",
+            WS_POPUP, x, y, width, height, nullptr, nullptr, instance, nullptr);
+
+        if (!g_settingsHwnd) {
+            return false;
+        }
+
+        DXGI_SWAP_CHAIN_DESC sd{};
+        sd.BufferCount = 2;
+        sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        sd.BufferDesc.RefreshRate.Numerator = 60;
+        sd.BufferDesc.RefreshRate.Denominator = 1;
+        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sd.OutputWindow = g_settingsHwnd;
+        sd.SampleDesc.Count = 1;
+        sd.Windowed = TRUE;
+        sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+        IDXGIDevice* dxgiDevice = nullptr;
+        IDXGIAdapter* adapter = nullptr;
+        IDXGIFactory* factory = nullptr;
+        bool ok = false;
+
+        if (SUCCEEDED(g_device->QueryInterface(IID_PPV_ARGS(&dxgiDevice))) &&
+            SUCCEEDED(dxgiDevice->GetParent(IID_PPV_ARGS(&adapter))) &&
+            SUCCEEDED(adapter->GetParent(IID_PPV_ARGS(&factory)))) {
+            ok = SUCCEEDED(factory->CreateSwapChain(g_device, &sd, &g_settingsSwapChain));
+        }
+
+        if (factory) factory->Release();
+        if (adapter) adapter->Release();
+        if (dxgiDevice) dxgiDevice->Release();
+
+        if (!ok) {
+            DestroyWindow(g_settingsHwnd);
+            g_settingsHwnd = nullptr;
+            return false;
+        }
+
+        ID3D11Texture2D* back = nullptr;
+        if (SUCCEEDED(g_settingsSwapChain->GetBuffer(0, IID_PPV_ARGS(&back)))) {
+            g_device->CreateRenderTargetView(back, nullptr, &g_settingsRenderTarget);
+            back->Release();
+        }
+
+        // Its own context: a separate font atlas and input state from the widget.
+        ImGuiContext* previous = ImGui::GetCurrentContext();
+        g_settingsImGuiContext = ImGui::CreateContext();
+        ImGui::SetCurrentContext(g_settingsImGuiContext);
+        ImGui::GetIO().IniFilename = nullptr;
+        Renderer::ApplyStyleColorsOnly();
+        ImGui_ImplWin32_Init(g_settingsHwnd);
+        ImGui_ImplDX11_Init(g_device, g_context);
+        // ShowWindow/UpdateWindow/SetForegroundWindow dispatch messages
+        // synchronously, and WndProc switches the current context to whichever
+        // window they target. Restore AFTER them, not before.
+        ShowWindow(g_settingsHwnd, SW_SHOW);
+        UpdateWindow(g_settingsHwnd);
+        SetForegroundWindow(g_settingsHwnd);
+
+        ImGui::SetCurrentContext(previous);
+        return true;
+    }
+
+    static void RenderSettingsWindow()
+    {
+        if (!g_settingsHwnd || !g_settingsImGuiContext || !g_settingsRenderTarget) {
+            return;
+        }
+
+        ImGui::SetCurrentContext(g_settingsImGuiContext);
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+
+        Renderer::RenderSettingsUi(g_rendererState);
+
+        ImGui::Render();
+
+        const float clear[4] = { 0.06f, 0.065f, 0.08f, 1.0f };
+        g_context->OMSetRenderTargets(1, &g_settingsRenderTarget, nullptr);
+        g_context->ClearRenderTargetView(g_settingsRenderTarget, clear);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        g_settingsSwapChain->Present(1, 0);
+
+        ImGui::SetCurrentContext(g_mainImGuiContext);
     }
 
     static void PollMinimizeRequest()
@@ -816,6 +1032,9 @@ namespace
         g_rendererState.widgetMode = &g_widgetMode;
         g_rendererState.widgetPinned = &g_widgetPinned;
         g_rendererState.widgetOrder = &g_widgetOrder;
+        g_rendererState.uiFontSize = &g_uiFontSize;
+        g_rendererState.widgetSections = &g_widgetSections;
+        g_rendererState.settingsWindowOpen = &g_settingsWindowOpen;
         g_rendererState.device = g_device;
 
         g_rendererState.codexMutex = codex->StateMutex();
@@ -957,6 +1176,50 @@ namespace
             std::filesystem::remove(temporary, ec);
         }
 
+        // Claude Code renders whatever this prints as the status line, so emit
+        // something useful rather than leaving it blank. Naive extraction keeps
+        // this path dependency-free.
+        auto findString = [&](const char* key) -> std::string {
+            const std::string needle = std::string("\"") + key + "\":\"";
+            const size_t at = payload.find(needle);
+            if (at == std::string::npos) return {};
+            const size_t begin = at + needle.size();
+            const size_t end = payload.find('"', begin);
+            return end == std::string::npos ? std::string{} : payload.substr(begin, end - begin);
+        };
+
+        auto findNumber = [&](const char* key) -> std::string {
+            const std::string needle = std::string("\"") + key + "\":";
+            const size_t at = payload.find(needle);
+            if (at == std::string::npos) return {};
+            size_t begin = at + needle.size();
+            while (begin < payload.size() && payload[begin] == ' ') ++begin;
+            size_t end = begin;
+            while (end < payload.size() &&
+                (std::isdigit(static_cast<unsigned char>(payload[end])) || payload[end] == '.')) {
+                ++end;
+            }
+            return end > begin ? payload.substr(begin, end - begin) : std::string{};
+        };
+
+        std::string line = findString("display_name");
+        const std::string used = findNumber("used_percentage");
+
+        if (!used.empty()) {
+            const size_t dot = used.find('.');
+            const std::string whole = dot == std::string::npos ? used : used.substr(0, dot);
+            line += line.empty() ? "" : "  |  ";
+            line += "ctx " + whole + "%";
+        }
+
+        if (!line.empty()) {
+            const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+            if (out && out != INVALID_HANDLE_VALUE) {
+                DWORD written = 0;
+                WriteFile(out, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+            }
+        }
+
         return 0;
     }
 
@@ -1008,7 +1271,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 
     RegisterClassExW(&wc);
 
-    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"AI Quota Checker", WS_POPUP | WS_MINIMIZEBOX, 100, 100, 1040, 760, nullptr, nullptr, wc.hInstance, nullptr);
+    #if defined(GUI_ONLY)
+    const int startWidth = 1040;
+    const int startHeight = 760;
+#else
+    const int startWidth = kWidgetWidth;
+    const int startHeight = kWidgetHeight;
+#endif
+
+    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"AI Quota Checker", WS_POPUP | WS_MINIMIZEBOX, 100, 100, startWidth, startHeight, nullptr, nullptr, wc.hInstance, nullptr);
 
     if (!CreateDeviceD3D(g_hwnd)) {
         CleanupDeviceD3D();
@@ -1020,7 +1291,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
     UpdateWindow(g_hwnd);
 
     IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
+    g_mainImGuiContext = ImGui::CreateContext();
 
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
@@ -1036,6 +1307,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
     ImGui_ImplDX11_Init(g_device, g_context);
 
     LoadAppSettings();
+
+    // ApplyStyle built the atlas at the default size; rebuild if the saved
+    // interface font size differs.
+    {
+        ImGui_ImplDX11_InvalidateDeviceObjects();
+        Renderer::ReloadFonts();
+        ImGui_ImplDX11_CreateDeviceObjects();
+    }
 
     if (g_autoRefreshEnabled && g_codexAutoRefreshEnabled) CodexProvider::get_instance()->RefreshAsync();
     if (g_autoRefreshEnabled && g_claudeAutoRefreshEnabled) ClaudeProvider::get_instance()->RefreshAsync();
@@ -1064,6 +1343,27 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
             break;
         }
 
+        if (g_settingsWindowOpen && !g_settingsHwnd) {
+            if (!CreateSettingsWindow(hInstance)) {
+                g_settingsWindowOpen = false;
+            }
+        }
+        else if (!g_settingsWindowOpen && g_settingsHwnd) {
+            DestroySettingsWindow();
+        }
+
+        if (Renderer::ConsumeFontReloadRequest()) {
+            ImGui_ImplDX11_InvalidateDeviceObjects();
+            Renderer::ReloadFonts();
+            ImGui_ImplDX11_CreateDeviceObjects();
+        }
+
+        // Anything above can dispatch window messages (window creation and
+        // destruction both do), and WndProc leaves the current context set to
+        // whichever window received them. Select the widget's context here,
+        // immediately before its frame, so that can never leak in.
+        ImGui::SetCurrentContext(g_mainImGuiContext);
+
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
@@ -1086,8 +1386,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
         g_swapChain->Present(1, 0);
+
+        RenderSettingsWindow();
     }
 
+    DestroySettingsWindow();
     Renderer::ReleaseTabImages();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

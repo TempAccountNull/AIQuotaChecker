@@ -4,6 +4,7 @@
 #include "Math.hpp"
 #include "ResetTime.hpp"
 
+#include <algorithm>
 #include <windows.h>
 
 namespace AppSettings
@@ -264,6 +265,11 @@ namespace AppSettings
         return Math::get_instance()->ClampAutoRefreshMinutes(value);
     }
 
+    int ClampUiFontSize(int value)
+    {
+        return std::clamp(value, 10, 22);
+    }
+
     int ClampResetDisplayMode(int value)
     {
         return ResetTime::get_instance()->ClampMode(value);
@@ -297,6 +303,8 @@ namespace AppSettings
         settings.showRemaining = ReadBool(L"UI", L"ShowRemaining", settings.showRemaining, path);
         settings.widgetMode = ReadBool(L"UI", L"WidgetMode", settings.widgetMode, path);
         settings.widgetPinned = ReadBool(L"UI", L"WidgetPinned", settings.widgetPinned, path);
+        settings.uiFontSize = ClampUiFontSize(ReadInt(L"UI", L"FontSize", settings.uiFontSize, path));
+        settings.widgetSections = ReadInt(L"UI", L"WidgetSections", settings.widgetSections, path);
         settings.widgetOrder = ReadUtf8(L"UI", L"WidgetOrder", settings.widgetOrder, path);
         settings.showResetDateDetails = ReadBool(L"UI", L"ShowResetDateDetails", settings.showResetDateDetails, path);
         settings.resetDisplayMode = ClampResetDisplayMode(ReadInt(L"UI", L"ResetDisplayMode", settings.resetDisplayMode, path));
@@ -366,6 +374,8 @@ namespace AppSettings
         ok = WriteBool(L"UI", L"ShowRemaining", settings.showRemaining, path) && ok;
         ok = WriteBool(L"UI", L"WidgetMode", settings.widgetMode, path) && ok;
         ok = WriteBool(L"UI", L"WidgetPinned", settings.widgetPinned, path) && ok;
+        ok = WriteInt(L"UI", L"FontSize", ClampUiFontSize(settings.uiFontSize), path) && ok;
+        ok = WriteInt(L"UI", L"WidgetSections", settings.widgetSections, path) && ok;
         ok = WriteUtf8(L"UI", L"WidgetOrder", settings.widgetOrder, path) && ok;
         ok = WriteBool(L"UI", L"ShowResetDateDetails", settings.showResetDateDetails, path) && ok;
         ok = WriteInt(L"UI", L"ResetDisplayMode", ClampResetDisplayMode(settings.resetDisplayMode), path) && ok;

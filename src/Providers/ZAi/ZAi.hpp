@@ -36,6 +36,19 @@ namespace ZAi
         UsageTelemetry::RunUsage run;
     };
 
+    // Official MCP quota, from /api/v1/mcp/usage:
+    //   { code, msg, data: { server_time, next_refresh_at, level,
+    //                        total_usage: { used, limit, remaining } } }
+    struct McpUsage
+    {
+        bool valid = false;
+        long long used = 0;
+        long long limit = 0;
+        long long remaining = 0;
+        std::string level;
+        long long nextRefreshAtUnixSeconds = 0;
+    };
+
     struct Snapshot
     {
         std::string plan = "Z.Ai";
@@ -43,6 +56,7 @@ namespace ZAi
         std::string lastUpdated = "never";
         std::vector<UsageBar> bars;
         std::vector<DetailRow> details;
+        McpUsage mcp;
         UsageTelemetry::AccessStatus access;
         UsageTelemetry::ContextUsage context;
         UsageTelemetry::RunUsage run;

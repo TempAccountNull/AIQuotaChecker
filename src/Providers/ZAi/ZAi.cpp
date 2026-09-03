@@ -1567,6 +1567,62 @@ namespace ZAi
         return snapshot.bars.size() > before;
     }
 
+    // /api/v1/mcp/usage -> data.total_usage {used,limit,remaining} plus
+    // next_refresh_at and level. Absent or malformed simply leaves it hidden.
+    static bool ApplyMcpUsageResponse(Snapshot& snapshot, const json& root)
+    {
+        if (!root.is_object() || !root.contains("data") || !root.at("data").is_object()) {
+            return false;
+        }
+
+        const json& data = root.at("data");
+        const json* usage = nullptr;
+
+        if (data.contains("total_usage") && data.at("total_usage").is_object()) {
+            usage = &data.at("total_usage");
+        }
+        else if (data.contains("used") && data.contains("limit")) {
+            usage = &data;
+        }
+
+        if (!usage) {
+            return false;
+        }
+
+        auto number = [](const json& object, const char* key) -> long long {
+            const auto it = object.find(key);
+            return (it != object.end() && it->is_number())
+                ? static_cast<long long>(it->get<double>())
+                : 0;
+        };
+
+        McpUsage mcp;
+        mcp.used = number(*usage, "used");
+        mcp.limit = number(*usage, "limit");
+        mcp.remaining = number(*usage, "remaining");
+
+        if (mcp.limit <= 0 && mcp.used <= 0) {
+            return false;
+        }
+
+        const auto level = data.find("level");
+        if (level != data.end() && level->is_string()) {
+            mcp.level = level->get<std::string>();
+        }
+
+        const long long nextRefresh = number(data, "next_refresh_at");
+        if (nextRefresh > 0) {
+            // The service reports seconds; tolerate milliseconds.
+            mcp.nextRefreshAtUnixSeconds = nextRefresh > 100000000000LL
+                ? nextRefresh / 1000
+                : nextRefresh;
+        }
+
+        mcp.valid = true;
+        snapshot.mcp = std::move(mcp);
+        return true;
+    }
+
     static bool ApplyQuotaResponse(Snapshot& snapshot, const json& root)
     {
         if (!EnvelopeSucceeded(root)) {
@@ -1727,6 +1783,7 @@ namespace ZAi
         addUrl("https://zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=1.0.0", "balance");
         addUrl("https://api.z.ai/api/monitor/usage/quota/limit", "quota");
         addUrl("https://api.z.ai/api/biz/subscription/list", "subscription");
+        addUrl("https://api.z.ai/api/v1/mcp/usage", "mcp");
 
         std::string lastError;
         std::string bestUnavailableReason;
@@ -1742,7 +1799,9 @@ namespace ZAi
 
             for (const auto& item : urls) {
                 try {
-                    std::wstring headers = (std::string(item.second) == "quota" || std::string(item.second) == "subscription")
+                    std::wstring headers = (std::string(item.second) == "quota" ||
+                        std::string(item.second) == "subscription" ||
+                        std::string(item.second) == "mcp")
                         ? Network::get_instance()->RawAuthorizationJsonHeaders(token, "https://zcode.z.ai", "https://zcode.z.ai/")
                         : Network::get_instance()->BearerJsonHeaders(token, "https://zcode.z.ai", "https://zcode.z.ai/");
 
@@ -1803,6 +1862,9 @@ namespace ZAi
                     }
                     else if (kind == "subscription") {
                         ApplySubscriptionList(candidate, root);
+                    }
+                    else if (kind == "mcp") {
+                        ApplyMcpUsageResponse(candidate, root);
                     }
                 }
                 catch (const std::exception& e) {

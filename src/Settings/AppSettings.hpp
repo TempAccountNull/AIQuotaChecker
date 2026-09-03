@@ -51,6 +51,10 @@ namespace AppSettings
         bool showResetDateDetails = false;
         bool widgetMode = false;
         bool widgetPinned = false;
+        // Interface font size in points for the custom panels.
+        int uiFontSize = 14;
+        // Which sections the widget renders. Bit set = shown.
+        int widgetSections = 0x7F;
         // Host order in the widget, as a comma-separated key list.
         std::string widgetOrder = "codex,claude,zai,grok";
         int resetDisplayMode = 0;
@@ -97,6 +101,19 @@ namespace AppSettings
     int ClampPrepareMinutes(int value);
     int ClampAutoRefreshMinutes(int value);
     int ClampResetDisplayMode(int value);
+    int ClampUiFontSize(int value);
+
+    // Widget section toggles.
+    enum WidgetSection : int
+    {
+        WidgetSectionQuota     = 1 << 0,  // session / weekly / model limits
+        WidgetSectionContext   = 1 << 1,  // context meter
+        WidgetSectionExtra     = 1 << 2,  // extra usage / credits
+        WidgetSectionCost      = 1 << 3,  // session spend
+        WidgetSectionActivity  = 1 << 4,  // live token telemetry
+        WidgetSectionModel     = 1 << 5,  // model + context limit
+        WidgetSectionDetails   = 1 << 6   // provider-specific detail rows
+    };
     int ClampClaudeAccountSource(int value);
     int ClampClaudeThinkingShimmerSpeedPercent(int value);
     int ClampCodexAccountSource(int value);
