@@ -30,6 +30,13 @@ namespace AppSettings
         return WritePrivateProfileStringW(section, key, text.c_str(), path.c_str()) != 0;
     }
 
+    // Passing a null value deletes the key outright, which is how a retired
+    // setting stops lingering in the file.
+    static void DeleteKey(const wchar_t* section, const wchar_t* key, const std::wstring& path)
+    {
+        WritePrivateProfileStringW(section, key, nullptr, path.c_str());
+    }
+
     static std::string WideToUtf8(const std::wstring& value)
     {
         if (value.empty()) {
@@ -388,6 +395,8 @@ namespace AppSettings
         ok = WriteBool(L"UI", L"WidgetAlwaysOnTop", settings.widgetAlwaysOnTop, path) && ok;
         ok = WriteInt(L"UI", L"FontSize", ClampUiFontSize(settings.uiFontSize), path) && ok;
         ok = WriteInt(L"UI", L"WidgetSectionsV2", settings.widgetSections & kWidgetSectionAll, path) && ok;
+        // Superseded by WidgetSectionsV2 when the section list outgrew 7 bits.
+        DeleteKey(L"UI", L"WidgetSections", path);
         ok = WriteInt(L"UI", L"WidgetAnchor", ClampWidgetAnchor(settings.widgetAnchor), path) && ok;
         ok = WriteInt(L"UI", L"WidgetMonitor", (std::max)(0, settings.widgetMonitor), path) && ok;
         ok = WriteUtf8(L"UI", L"WidgetBarRows", settings.widgetBarRows, path) && ok;

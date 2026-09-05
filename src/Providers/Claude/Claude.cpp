@@ -1065,9 +1065,14 @@ namespace Claude {
             else if (group == "weekly" && (lower.find("fable") != std::string::npos ||
                 lower.find("design") != std::string::npos ||
                 lower.find("omelette") != std::string::npos)) {
+                // "omelette" is the internal codename for Claude Design, not
+                // for Fable - the bundle renders omelette_promotional as
+                // "{product} grant" with product "Claude Design", and fable
+                // exists only as a model family tier (sonnet/opus/haiku/fable/
+                // mythos), never as a quota window.
                 snapshot.weeklyFable = ParseServerLimitWindow(
                     limit,
-                    displayName.empty() ? "Fable" : displayName,
+                    displayName.empty() ? "Claude Design" : displayName,
                     "Product-specific weekly limit"
                 );
                 parsedAny = snapshot.weeklyFable.valid || parsedAny;
@@ -3392,10 +3397,14 @@ namespace Claude {
 
             snapshot.weeklyFable = ParseFirstAvailableWindow(
                 root,
-                { "seven_day_omelette", "omelette_promotional", "seven_day_fable" },
-                "Fable",
-                "Fable"
+                { "seven_day_omelette", "omelette_promotional" },
+                "Claude Design",
+                "Product-specific weekly limit"
             );
+
+            if (!snapshot.weeklyFable.valid) {
+                snapshot.weeklyFable = ParseWindow(root, "seven_day_fable", "Fable", "Fable");
+            }
 
             AddAdditionalLimit(
                 snapshot,
@@ -3416,8 +3425,8 @@ namespace Claude {
             snapshot.weeklyFable = ParseWindow(
                 root,
                 "omelette_promotional",
-                "Fable",
-                "Fable"
+                "Claude Design grant",
+                "Promotional grant"
             );
         }
 
