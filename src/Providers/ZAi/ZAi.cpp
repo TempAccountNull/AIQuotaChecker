@@ -1238,7 +1238,7 @@ namespace ZAi
         }
 
         std::optional<double> total = JsonUtils::get_instance()->NumberAny(balance, {
-            "total_units", "total", "total_tokens", "quota", "limit", "max", "number", "unit"
+            "total_units", "total", "total_tokens", "quota", "limit", "max"
         });
 
         std::optional<double> used = JsonUtils::get_instance()->NumberAny(balance, {
@@ -1298,6 +1298,36 @@ namespace ZAi
         snapshot.bars.push_back(bar);
     }
 
+    // ZCode describes a window's PERIOD with `unit` (an enum) and `number` (a
+    // multiplier) - `unit 3 / number 5` is the five-hour pool, `unit 6` the
+    // weekly one, `unit 5 / number 1` the monthly tool allowance. They are not
+    // quota amounts: reading them as the total made a five-hour bar compute
+    // used/5*100 and peg at 100%.
+    static std::string ZAiPeriodLabel(const json& limit)
+    {
+        const std::optional<double> unit =
+            JsonUtils::get_instance()->NumberAny(limit, { "unit" });
+
+        if (!unit) {
+            return {};
+        }
+
+        const std::optional<double> number =
+            JsonUtils::get_instance()->NumberAny(limit, { "number" });
+        const int count = number ? static_cast<int>(*number) : 0;
+
+        switch (static_cast<int>(*unit)) {
+        case 3:
+            return count > 0 ? std::to_string(count) + "-hour" : "Hourly";
+        case 5:
+            return count > 1 ? std::to_string(count) + "-month" : "Monthly";
+        case 6:
+            return count > 1 ? std::to_string(count) + "-week" : "Weekly";
+        default:
+            return {};
+        }
+    }
+
     static void AddQuotaLimitBar(Snapshot& snapshot, const json& limit)
     {
         if (!limit.is_object()) {
@@ -1305,7 +1335,7 @@ namespace ZAi
         }
 
         std::optional<double> total = JsonUtils::get_instance()->NumberAny(limit, {
-            "number", "unit", "total", "total_tokens", "quota", "limit", "max", "total_units"
+            "total", "total_tokens", "quota", "limit", "max", "total_units"
         });
 
         std::optional<double> used = JsonUtils::get_instance()->NumberAny(limit, {
@@ -1332,6 +1362,21 @@ namespace ZAi
 
         UsageBar bar;
         bar.label = PickUsageLabel(limit, "Quota");
+
+        // Prefer the period the server describes over whatever generic name
+        // PickUsageLabel settled on - it is what tells two bars apart.
+        const std::string period = ZAiPeriodLabel(limit);
+
+        if (!period.empty()) {
+            const std::string lower = Text::get_instance()->ToLowerCopy(bar.label);
+
+            if (bar.label.empty() || lower == "quota" || lower == "usage") {
+                bar.label = period;
+            }
+            else if (lower.find(Text::get_instance()->ToLowerCopy(period)) == std::string::npos) {
+                bar.sublabel = period;
+            }
+        }
 
         if (total && *total > 0.0 && used) {
             bar.usedPercent = Math::get_instance()->PercentUsed(*used, *total);

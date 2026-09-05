@@ -1837,40 +1837,40 @@ static void DrawClaudeThinkingShimmer(const char* text)
     const ImVec2 size = ImGui::CalcTextSize(text);
     ImDrawList* drawList = ImGui::GetWindowDrawList();
 
-    // Claude-style thinking label: muted gray base with a narrow white band
-    // moving across it. Draw directly so only the status word animates.
-    drawList->AddText(
-        pos,
-        ImGui::GetColorU32(ImVec4(0.60f, 0.60f, 0.60f, 1.0f)),
-        text
-    );
+    // Measured frame-by-frame from ref/ezgif-split (283 frames at ~65ms):
+    // the state text fades UNIFORMLY - every column of it reaches minimum on
+    // the same frame and maximum on the same frame, so there is no travelling
+    // band - between roughly 75% and 100% brightness, symmetrically (16 frames
+    // down, 15 back up, i.e. a sine) over a ~2.0s period. The elapsed time and
+    // token count beside it measured dead flat, so only this text pulses.
+    constexpr float kPeriodSeconds = 2.0f;
+    constexpr float kMinAlpha = 0.75f;
 
-    const float bandWidth = 13.0f;
-    const float travelWidth = size.x + bandWidth * 2.0f;
+    const ImU32 kBase = Color(226, 232, 244);
+
+    // Reduced motion: the references kill the animation outright rather than
+    // slowing it, so a static label is the right fallback.
+    BOOL animationsOn = TRUE;
+    if (SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animationsOn, 0) && !animationsOn) {
+        drawList->AddText(pos, kBase, text);
+        ImGui::Dummy(size);
+        return;
+    }
+
     const int speedPercent = AppSettings::ClampClaudeThinkingShimmerSpeedPercent(
         g_claudeThinkingShimmerSpeedPercent
     );
-    // 60 px/s sits between the original slow sweep and the later 130 px/s
-    // version. The Claude setting scales it from 25%-250%.
-    const float pixelsPerSecond = 60.0f * (static_cast<float>(speedPercent) / 100.0f);
-    const float phase = std::fmod(
-        static_cast<float>(ImGui::GetTime()) * pixelsPerSecond,
-        travelWidth
-    );
-    const float bandCenter = pos.x - bandWidth + phase;
+    const float period = kPeriodSeconds / (static_cast<float>(speedPercent) / 100.0f);
 
-    drawList->PushClipRect(
-        ImVec2(bandCenter - bandWidth * 0.5f, pos.y),
-        ImVec2(bandCenter + bandWidth * 0.5f, pos.y + size.y),
-        true
+    const float wave = 0.5f - 0.5f * std::cos(
+        static_cast<float>(ImGui::GetTime()) * 6.2831853f / period
     );
-    drawList->AddText(
-        pos,
-        ImGui::GetColorU32(ImVec4(0.96f, 0.96f, 0.96f, 1.0f)),
-        text
-    );
-    drawList->PopClipRect();
+    const float alpha = kMinAlpha + (1.0f - kMinAlpha) * wave;
 
+    ImVec4 color = ImGui::ColorConvertU32ToFloat4(kBase);
+    color.w *= alpha;
+
+    drawList->AddText(pos, ImGui::ColorConvertFloat4ToU32(color), text);
     ImGui::Dummy(size);
 }
 
@@ -2497,11 +2497,13 @@ static bool ProviderAutoRefreshActive(bool providerEnabled)
 
 static ImU32 PanelSeverity(float usedPercent)
 {
-    // Deliberately desaturated: a wall of neon bars reads as noise. These sit
-    // closer to the reference popovers' muted accents.
-    if (usedPercent >= 90.0f) return Color(214, 96, 96);
-    if (usedPercent >= 75.0f) return Color(214, 160, 78);
-    return Color(94, 168, 132);
+    // Green -> yellow -> orange -> red. Deliberately desaturated: a wall of neon
+    // bars reads as noise, so these sit closer to the reference popovers' muted
+    // accents while still being four clearly distinct steps.
+    if (usedPercent >= 90.0f) return Color(214, 96, 96);    // red
+    if (usedPercent >= 75.0f) return Color(216, 138, 68);   // orange
+    if (usedPercent >= 55.0f) return Color(214, 186, 84);   // yellow
+    return Color(94, 168, 132);                             // green
 }
 
 // ResetTime bakes "Resets in" into all three mode formatters. A banked credit
@@ -2556,6 +2558,181 @@ static void PanelCardBackground(ImVec2 a, ImVec2 b)
     ImDrawList* dl = ImGui::GetWindowDrawList();
     dl->AddRectFilled(a, b, Color(31, 34, 43, 255), 10.0f);
     dl->AddRect(a, b, Color(50, 54, 68, 200), 10.0f, 0, 1.0f);
+}
+
+// A live status, split the way Claude renders it: the elapsed time and token
+// count are static, and only the trailing state word pulses. Measured from the
+// reference frames - the leading columns held dead flat while the state text
+// swung 75%-100%.
+struct LiveState
+{
+    std::string prefix;   // "1h 22m 50s \xc2\xb7 127.4k tokens"
+    std::string state;    // "Running tools\xe2\x80\xa6"
+    bool animated = true; // false for a settled result like "Thought for 12s"
+
+    bool empty() const { return state.empty(); }
+};
+
+static LiveState LiveRunState(const UsageTelemetry::RunUsage& run,
+    const UsageTelemetry::ContextUsage& context)
+{
+    LiveState live;
+    long long since = 0;
+
+    if (context.compacting) {
+        live.state = "Compacting session\xe2\x80\xa6";
+        since = context.compactionStartedAtUnixSeconds > 0
+            ? context.compactionStartedAtUnixSeconds
+            : run.startedAtUnixSeconds;
+    }
+    else if (!run.valid || !run.running) {
+        return live;
+    }
+    else {
+        since = run.startedAtUnixSeconds;
+
+        const long long now = static_cast<long long>(std::time(nullptr));
+        const long long elapsed = since > 0 && now > since ? now - since : 0;
+
+        // Waiting on the API: the transcript has stopped growing while the
+        // turn is still open, so nothing is being processed locally. This is
+        // derived, not reported - Claude Code's own wording and thresholds
+        // live in its cli.js, which is not in the reference set.
+        const bool waiting = run.idleSeconds >= 10;
+
+        if (waiting) {
+            live.state = "Waiting for Claude\xe2\x80\xa6";
+        }
+        else if (run.thinking) {
+            // The longer a thought runs, the more it warrants saying so.
+            // This threshold is ours; the CLI's is not discoverable here.
+            live.state = elapsed >= 90 ? "Still thinking\xe2\x80\xa6" : "Thinking\xe2\x80\xa6";
+        }
+        else if (run.lastThoughtDurationSeconds > 0 &&
+            run.lastThoughtCompletedAtUnixSeconds > 0 &&
+            now - run.lastThoughtCompletedAtUnixSeconds <= 5) {
+            // A finished thought is a result, not an activity, so it does not
+            // pulse - it just sits there until the next state replaces it.
+            live.state = "Thought for " + FormatRunDuration(run.lastThoughtDurationSeconds);
+            live.animated = false;
+        }
+        else {
+            live.state = "Running tools\xe2\x80\xa6";
+        }
+    }
+
+    if (since > 0) {
+        const long long now = static_cast<long long>(std::time(nullptr));
+        if (now > since) live.prefix = FormatRunDuration(now - since);
+    }
+
+    const long long tokens = run.tokens > 0 ? run.tokens : run.currentTokens;
+
+    if (tokens > 0) {
+        if (!live.prefix.empty()) live.prefix += "  \xc2\xb7  ";
+        live.prefix += FormatCompactTokenCount(tokens) + " tokens";
+    }
+
+    if (run.activeTaskCount > 0) {
+        if (!live.prefix.empty()) live.prefix += "  \xc2\xb7  ";
+        live.prefix += std::to_string(run.activeTaskCount) +
+            (run.activeTaskCount == 1 ? " task" : " tasks");
+    }
+
+    return live;
+}
+
+// What the selected host is doing right now, if anything. A quota bar's
+// right-hand slot is more useful showing "Thinking" or "Compacting" than a
+// reset countdown, which is not what you are watching for in that moment; the
+// countdown returns as soon as the turn ends.
+static LiveState g_panelLiveState;
+static std::string g_panelLiveModel;
+
+// Width the whole status needs, so callers can right-align it.
+static float MeasureLiveState(const LiveState& live)
+{
+    float width = ImGui::CalcTextSize(live.state.c_str()).x;
+
+    if (!live.prefix.empty()) {
+        width += ImGui::CalcTextSize(live.prefix.c_str()).x +
+            ImGui::CalcTextSize("  \xc2\xb7  ").x;
+    }
+
+    return width;
+}
+
+// Draws the static prefix then the state, pulsing only the latter.
+static void DrawLiveState(ImVec2 pos, const LiveState& live)
+{
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    float x = pos.x;
+
+    if (!live.prefix.empty()) {
+        dl->AddText(ImVec2(x, pos.y), Color(132, 140, 160), live.prefix.c_str());
+        x += ImGui::CalcTextSize(live.prefix.c_str()).x;
+
+        dl->AddText(ImVec2(x, pos.y), Color(132, 140, 160), "  \xc2\xb7  ");
+        x += ImGui::CalcTextSize("  \xc2\xb7  ").x;
+    }
+
+    if (live.animated) {
+        const ImVec2 restore = ImGui::GetCursorScreenPos();
+        ImGui::SetCursorScreenPos(ImVec2(x, pos.y));
+        DrawClaudeThinkingShimmer(live.state.c_str());
+        ImGui::SetCursorScreenPos(restore);
+    }
+    else {
+        dl->AddText(ImVec2(x, pos.y), Color(226, 232, 244), live.state.c_str());
+    }
+}
+
+// Which window a live state belongs on.
+//
+// Only the rolling session pool is being consumed by the turn in progress - a
+// weekly cap is not "thinking" - and a model-scoped window is only involved
+// when that model is the one actually running. Comparing the window's model
+// against the active model is what keeps Fable from claiming a turn spent on
+// Opus.
+static bool WindowTakesLiveState(const std::string& title, const std::string& activeModel)
+{
+    const std::string lower = Text::get_instance()->ToLowerCopy(title);
+
+    // Titles arrive as either "Session" or "<model> Â· Session".
+    std::string modelPart;
+    std::string periodPart = lower;
+
+    const size_t sep = lower.find("\xc2\xb7");
+
+    if (sep != std::string::npos) {
+        modelPart = lower.substr(0, sep);
+        periodPart = lower.substr(sep + 2);
+    }
+
+    if (periodPart.find("session") == std::string::npos) {
+        return false;
+    }
+
+    if (modelPart.find_first_not_of(" 	") == std::string::npos) {
+        return true;
+    }
+
+    if (activeModel.empty()) {
+        return false;
+    }
+
+    // Compare on letters and digits only: "GPT-5.3 Codex Spark" against
+    // "gpt-5.3-codex-spark" differs only in punctuation.
+    const auto compact = [](const std::string& value) {
+        std::string out;
+        for (unsigned char c : value) {
+            if (std::isalnum(c)) out.push_back(static_cast<char>(std::tolower(c)));
+        }
+        return out;
+    };
+
+    const std::string wanted = compact(modelPart);
+    return !wanted.empty() && compact(activeModel).find(wanted) != std::string::npos;
 }
 
 static void PanelBarSection(
@@ -2637,13 +2814,20 @@ static void PanelBarSection(
     // much as how much is left. Claude omits resets_at on a five-hour window
     // until the first message of a session, so an empty slot here is the norm
     // at 0% rather than an error; say which case it is instead of nothing.
-    const std::string right = !rightText.empty() ? rightText
-        : ((!valid || !resets) ? std::string{}
-            : (usedPercent <= 0.0f ? "Not started yet" : "Reset time not reported"));
+    if (resets && !g_panelLiveState.empty() &&
+        WindowTakesLiveState(title, g_panelLiveModel)) {
+        const float sw = MeasureLiveState(g_panelLiveState);
+        DrawLiveState(ImVec2(x + innerW - sw, y), g_panelLiveState);
+    }
+    else {
+        const std::string right = !rightText.empty() ? rightText
+            : ((!valid || !resets) ? std::string{}
+                : (usedPercent <= 0.0f ? "Not started yet" : "Reset time not reported"));
 
-    if (!right.empty()) {
-        const float rw = ImGui::CalcTextSize(right.c_str()).x;
-        dl->AddText(ImVec2(x + innerW - rw, y), Color(138, 146, 166), right.c_str());
+        if (!right.empty()) {
+            const float rw = ImGui::CalcTextSize(right.c_str()).x;
+            dl->AddText(ImVec2(x + innerW - rw, y), Color(138, 146, 166), right.c_str());
+        }
     }
     y += lineH + 3.0f;
 
@@ -2723,10 +2907,17 @@ static bool PanelShows(int bit)
 
 // Live token telemetry for the current turn - the numbers Claude Code and the
 // Codex app-server publish per request but which we were throwing away.
-static void PanelActivitySection(const UsageTelemetry::RunUsage& run)
+static void PanelActivitySection(const UsageTelemetry::RunUsage& run,
+    const UsageTelemetry::ContextUsage& context)
 {
     if (!PanelShows(AppSettings::WidgetSectionActivity)) return;
-    if (!run.valid || !run.tokenStatsValid) return;
+
+    // Compaction is worth announcing on its own: it happens precisely when the
+    // token stats are least meaningful, so gating the whole card on them would
+    // hide the one moment the user most wants to see.
+    const bool compacting = context.compacting;
+
+    if (!compacting && (!run.valid || !run.tokenStatsValid)) return;
 
     std::vector<std::string> lines;
 
@@ -2749,10 +2940,7 @@ static void PanelActivitySection(const UsageTelemetry::RunUsage& run)
     if (run.tokens > 0) {
         lines.push_back("Turn total: " + FormatCompactTokenCount(run.tokens));
     }
-    if (run.thinking) {
-        lines.push_back("Thinking...");
-    }
-    else if (run.lastThoughtDurationSeconds > 0) {
+    if (!run.thinking && run.lastThoughtDurationSeconds > 0) {
         lines.push_back("Thought for " + FormatRunDuration(run.lastThoughtDurationSeconds));
     }
 
@@ -3017,6 +3205,10 @@ static void DrawProviderHeader(
 
 static void RenderCodexSections(const Codex::Snapshot& snapshot)
 {
+    g_panelLiveState = LiveRunState(snapshot.run, snapshot.context);
+    g_panelLiveModel = snapshot.context.model;
+    g_panelLiveModel = snapshot.context.model;
+    g_panelLiveModel = snapshot.context.model;
     PanelStatusLine(snapshot.access, snapshot.statusText);
 
     PanelPlanSection("Codex", snapshot.plan, snapshot.statusText);
@@ -3077,7 +3269,7 @@ static void RenderCodexSections(const Codex::Snapshot& snapshot)
         PanelRule();
     }
 
-    PanelActivitySection(snapshot.run);
+    PanelActivitySection(snapshot.run, snapshot.context);
     PanelBreakdownSection(snapshot.context);
     PanelCacheSection(snapshot.context);
     PanelCompactionSection(snapshot.context);
@@ -3097,6 +3289,7 @@ static std::string PlanBeside(const char* provider, const std::string& plan)
 
 static void RenderClaudeSections(const Claude::Snapshot& snapshot)
 {
+    g_panelLiveState = LiveRunState(snapshot.run, snapshot.context);
     PanelStatusLine(snapshot.access, snapshot.statusText);
 
     PanelPlanSection("Claude", snapshot.plan, snapshot.statusText);
@@ -3155,7 +3348,7 @@ static void RenderClaudeSections(const Claude::Snapshot& snapshot)
         PanelRule();
     }
 
-    PanelActivitySection(snapshot.run);
+    PanelActivitySection(snapshot.run, snapshot.context);
     PanelSessionSection(snapshot.run);
     PanelTimingSection(snapshot.run);
     PanelBreakdownSection(snapshot.context);
@@ -3166,6 +3359,7 @@ static void RenderClaudeSections(const Claude::Snapshot& snapshot)
 
 static void RenderZAiSections(const ZAi::Snapshot& snapshot)
 {
+    g_panelLiveState = LiveRunState(snapshot.run, snapshot.context);
     PanelStatusLine(snapshot.access, snapshot.statusText);
 
     PanelPlanSection("Z.Ai", snapshot.plan, snapshot.statusText);
@@ -3215,7 +3409,7 @@ static void RenderZAiSections(const ZAi::Snapshot& snapshot)
         PanelRule();
     }
 
-    PanelActivitySection(snapshot.run);
+    PanelActivitySection(snapshot.run, snapshot.context);
     PanelBreakdownSection(snapshot.context);
     PanelCacheSection(snapshot.context);
     PanelCompactionSection(snapshot.context);
@@ -3224,6 +3418,9 @@ static void RenderZAiSections(const ZAi::Snapshot& snapshot)
 
 static void RenderGrokSections(const Grok::Snapshot& snapshot)
 {
+    // Grok publishes no per-turn run telemetry, so only compaction can be live.
+    g_panelLiveState = LiveRunState(UsageTelemetry::RunUsage{}, snapshot.context);
+    g_panelLiveModel = snapshot.context.model;
     PanelStatusLine(snapshot.access, snapshot.statusText);
 
     PanelPlanSection("Grok", snapshot.plan, snapshot.statusText);
@@ -4183,6 +4380,9 @@ struct WidgetPeek
     // meter's token counts, say). Wins over the reset time when set.
     std::string detail;
     bool resets = true;
+    // "Thinking..." / "Compacting..." while that host is mid-turn; empty when
+    // idle, in which case the reset countdown shows instead.
+    LiveState liveState;
     // "<provider>:<window>", stable across restarts.
     std::string key;
 };
@@ -4900,7 +5100,8 @@ static bool GrokPrimaryUsed(float& out) {
 // quota window, but nothing resets on a clock, so the right-hand slot carries
 // the token counts instead of a countdown.
 static void AddContextCandidate(std::vector<WidgetPeek>& out, const std::string& host,
-    const std::string& plan, const UsageTelemetry::ContextUsage& context)
+    const std::string& plan, const UsageTelemetry::ContextUsage& context,
+    const std::string& liveState = std::string{})
 {
     if (!context.valid || context.contextWindowTokens <= 0) return;
 
@@ -4930,7 +5131,10 @@ static std::vector<WidgetPeek> WidgetPeekCandidates()
 {
     std::vector<WidgetPeek> out;
 
-    const auto add = [&out](const std::string& host, const std::string& window,
+    LiveState liveState;
+    std::string liveModel;
+
+    const auto add = [&out, &liveState, &liveModel](const std::string& host, const std::string& window,
         bool valid, float used, long long resetAt, const std::string& resetText,
         const std::string& plan, const std::string& detail = std::string{},
         bool resets = true) {
@@ -4943,6 +5147,7 @@ static std::vector<WidgetPeek> WidgetPeekCandidates()
         peek.plan = plan;
         peek.detail = detail;
         peek.resets = resets;
+        if (WindowTakesLiveState(window, liveModel)) peek.liveState = liveState;
         peek.usedPercent = used;
         peek.resetAtUnixSeconds = resetAt;
         peek.resetText = resetText;
@@ -4959,6 +5164,8 @@ static std::vector<WidgetPeek> WidgetPeekCandidates()
     {
         std::lock_guard<std::mutex> lock(g_codexMutex);
         const std::string plan = PlanBeside("Codex", g_codexState.plan);
+        liveState = LiveRunState(g_codexState.run, g_codexState.context);
+        liveModel = g_codexState.context.model;
         for (const Codex::UsageBar& b : g_codexState.bars) {
             add("Codex", !b.label.empty() ? b.label : b.sublabel,
                 b.valid, b.usedPercent, b.resetAtUnixSeconds, b.rightText, plan);
@@ -4972,6 +5179,8 @@ static std::vector<WidgetPeek> WidgetPeekCandidates()
             &g_claudeState.weeklySonnet, &g_claudeState.weeklyFable
         };
         const std::string plan = PlanBeside("Claude", g_claudeState.plan);
+        liveState = LiveRunState(g_claudeState.run, g_claudeState.context);
+        liveModel = g_claudeState.context.model;
         for (const Claude::UsageWindow* w : windows) {
             add("Claude", w->title, w->valid, w->usedPercent,
                 w->resetAtUnixSeconds, w->resetText, plan);
@@ -4985,6 +5194,8 @@ static std::vector<WidgetPeek> WidgetPeekCandidates()
     {
         std::lock_guard<std::mutex> lock(g_zaiMutex);
         const std::string plan = PlanBeside("Z.Ai", g_zaiState.plan);
+        liveState = LiveRunState(g_zaiState.run, g_zaiState.context);
+        liveModel = g_zaiState.context.model;
         for (const ZAi::UsageBar& b : g_zaiState.bars) {
             if (b.spendBalance) continue;
             add("Z.Ai", !b.label.empty() ? b.label : b.sublabel,
@@ -4995,6 +5206,8 @@ static std::vector<WidgetPeek> WidgetPeekCandidates()
     {
         std::lock_guard<std::mutex> lock(g_grokMutex);
         const std::string plan = PlanBeside("Grok", g_grokState.plan);
+        liveState = LiveRunState(UsageTelemetry::RunUsage{}, g_grokState.context);
+        liveModel = g_grokState.context.model;
         add("Grok", g_grokState.weeklyLimit.title, g_grokState.weeklyLimit.valid,
             g_grokState.weeklyLimit.usedPercent,
             g_grokState.weeklyLimit.resetAtUnixSeconds, g_grokState.weeklyLimit.resetText, plan);
@@ -5270,12 +5483,18 @@ static void DrawWidgetPeekRow(const WidgetPeek& peek, float width)
     }
 
     const float valueW = ImGui::CalcTextSize(value.c_str()).x;
-    const float rightW = right.empty() ? 0.0f : ImGui::CalcTextSize(right.c_str()).x;
+    const bool showLive = !peek.liveState.empty();
+    const float rightW = showLive
+        ? MeasureLiveState(peek.liveState)
+        : (right.empty() ? 0.0f : ImGui::CalcTextSize(right.c_str()).x);
 
     const float valueX = x + innerW - valueW;
     dl->AddText(ImVec2(valueX, y), Color(228, 234, 246), value.c_str());
 
-    if (!right.empty()) {
+    if (showLive) {
+        DrawLiveState(ImVec2(valueX - 12.0f - rightW, y), peek.liveState);
+    }
+    else if (!right.empty()) {
         dl->AddText(ImVec2(valueX - 12.0f - rightW, y), Color(132, 140, 160), right.c_str());
     }
 
@@ -5325,7 +5544,7 @@ static void DrawWidgetPeekRow(const WidgetPeek& peek, float width)
 
     if (!fits(label)) {
         // Still too wide: clip with an ellipsis rather than print nothing.
-        const std::string ellipsis = "…";
+        const std::string ellipsis = "\xe2\x80\xa6";
         while (!label.empty() && !fits(label + ellipsis)) {
             // Step back over a whole UTF-8 code point, not a single byte.
             do { label.pop_back(); }

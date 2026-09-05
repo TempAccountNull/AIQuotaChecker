@@ -2588,6 +2588,35 @@ namespace Claude {
         return !hasToolResult || hasUserContent;
     }
 
+    // Whether any real turn activity was written after `index`. Attachments and
+    // the assorted bookkeeping records the CLI emits do not count - only model
+    // output or a tool result means the turn is still going.
+    static bool ClaudeActivityFollows(
+        const std::vector<std::string>& lines,
+        size_t index
+    ) {
+        for (size_t i = index + 1; i < lines.size(); ++i) {
+            const std::string& line = lines[i];
+
+            if (LooksLikeClaudeSidechainRecord(line)) {
+                continue;
+            }
+
+            json record = json::parse(line, nullptr, false);
+            if (record.is_discarded() || !record.is_object()) {
+                continue;
+            }
+
+            const std::string type = record.value("type", std::string{});
+
+            if (type == "assistant" || type == "user") {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     static UsageTelemetry::RunUsage ReadClaudeRunFromLines(
         const std::vector<std::string>& lines
     ) {
@@ -2624,14 +2653,31 @@ namespace Claude {
             }
 
             const std::string type = record.value("type", std::string{});
-            if (type == "result") {
+
+            // Sidechain records are subagent turns interleaved into the same
+            // transcript. Their end_turn is not the main turn ending, and
+            // treating it as one made the scan stop early and report "idle"
+            // for the whole time any subagent was running.
+            const bool sidechain =
+                ClaudeJsonBool(record, "isSidechain") ||
+                ClaudeJsonBool(record, "isMeta") ||
+                ClaudeJsonBool(record, "isSynthetic");
+
+            if (type == "result" && !sidechain) {
                 return run;
             }
 
-            if (type == "assistant" && record.contains("message") &&
+            if (type == "assistant" && !sidechain && record.contains("message") &&
                 record.at("message").is_object()) {
                 const json& message = record.at("message");
-                if (message.value("stop_reason", std::string{}) == "end_turn") {
+
+                // end_turn closes an API BLOCK, not the user's turn - the record
+                // carries an apiBlockIndex and a single turn spans several of
+                // them. It only means the turn is over when nothing came after
+                // it; otherwise the model is still working and stopping here
+                // reported "idle" for the whole rest of the turn.
+                if (message.value("stop_reason", std::string{}) == "end_turn" &&
+                    !ClaudeActivityFollows(lines, i)) {
                     return run;
                 }
             }
@@ -2695,10 +2741,44 @@ namespace Claude {
             run.thinking = false;
         };
 
+        // Subagent tasks still in flight: Task tool calls issued since the turn
+        // began, minus the ones whose result has already come back.
+        std::vector<std::string> pendingTasks;
+
         for (size_t i = runStart + 1; i < lines.size(); ++i) {
             const std::string& line = lines[i];
             if (LooksLikeClaudeSidechainRecord(line)) {
                 continue;
+            }
+
+            if (line.find("\"Task\"") != std::string::npos ||
+                line.find("tool_result") != std::string::npos) {
+                json probe = json::parse(line, nullptr, false);
+
+                if (!probe.is_discarded() && probe.is_object() &&
+                    probe.contains("message") && probe.at("message").is_object()) {
+                    const json& message = probe.at("message");
+
+                    if (message.contains("content") && message.at("content").is_array()) {
+                        for (const json& block : message.at("content")) {
+                            if (!block.is_object()) continue;
+
+                            const std::string blockType = block.value("type", std::string{});
+
+                            if (blockType == "tool_use" &&
+                                block.value("name", std::string{}) == "Task") {
+                                pendingTasks.push_back(block.value("id", std::string{}));
+                            }
+                            else if (blockType == "tool_result") {
+                                const std::string id =
+                                    block.value("tool_use_id", std::string{});
+                                pendingTasks.erase(
+                                    std::remove(pendingTasks.begin(), pendingTasks.end(), id),
+                                    pendingTasks.end());
+                            }
+                        }
+                    }
+                }
             }
 
             const bool mayAffectRun =
@@ -2879,6 +2959,7 @@ namespace Claude {
 
         }
 
+        run.activeTaskCount = static_cast<int>(pendingTasks.size());
         return run;
     }
 
@@ -3227,17 +3308,45 @@ namespace Claude {
         // correct foreground transcript; never treat the session JSON as an
         // authoritative running flag.
         if (desktopHint.valid && !desktopHint.cliSessionId.empty()) {
-            std::stable_sort(
-                candidates.begin(),
-                candidates.end(),
-                [&](const ClaudeSessionCandidate& left, const ClaudeSessionCandidate& right) {
-                    const bool leftMatch =
-                        left.path.stem().string() == desktopHint.cliSessionId;
-                    const bool rightMatch =
-                        right.path.stem().string() == desktopHint.cliSessionId;
-                    return leftMatch && !rightMatch;
+            // Only let the hint win while the session it names is still the one
+            // being written to. Desktop keeps pointing at the last CLI session
+            // it launched, so an old hint would pin us to a stale transcript and
+            // report "nothing running" while another session is mid-turn - which
+            // is exactly what it did.
+            std::filesystem::file_time_type newestWrite{};
+            std::filesystem::file_time_type hintWrite{};
+            bool hintSeen = false;
+
+            for (const ClaudeSessionCandidate& candidate : candidates) {
+                if (candidate.writeTime > newestWrite) newestWrite = candidate.writeTime;
+
+                if (candidate.path.stem().string() == desktopHint.cliSessionId) {
+                    hintWrite = candidate.writeTime;
+                    hintSeen = true;
                 }
-            );
+            }
+
+            const auto behindSeconds = hintSeen
+                ? std::chrono::duration_cast<std::chrono::seconds>(newestWrite - hintWrite).count()
+                : 0LL;
+
+            // A minute of slack covers the CLI trailing Desktop's own write
+            // without letting a session from an hour ago hold the slot.
+            constexpr long long kHintStaleSeconds = 60;
+
+            if (hintSeen && behindSeconds <= kHintStaleSeconds) {
+                std::stable_sort(
+                    candidates.begin(),
+                    candidates.end(),
+                    [&](const ClaudeSessionCandidate& left, const ClaudeSessionCandidate& right) {
+                        const bool leftMatch =
+                            left.path.stem().string() == desktopHint.cliSessionId;
+                        const bool rightMatch =
+                            right.path.stem().string() == desktopHint.cliSessionId;
+                        return leftMatch && !rightMatch;
+                    }
+                );
+            }
         }
 
         for (const ClaudeSessionCandidate& candidate : candidates) {
@@ -3275,6 +3384,17 @@ namespace Claude {
             // Compaction state comes only from explicit Claude transcript/provider
             // markers. Reaching an estimated threshold is not proof that a
             // compact operation is actually running.
+
+            // How long the transcript has been quiet. While a turn is running,
+            // a file that has stopped growing means the request is in flight
+            // and we are waiting on the API, not working locally.
+            if (local.run.running) {
+                const auto quiet = std::filesystem::file_time_type::clock::now() -
+                    candidate.writeTime;
+                const long long quietSeconds =
+                    std::chrono::duration_cast<std::chrono::seconds>(quiet).count();
+                local.run.idleSeconds = (std::max)(0LL, quietSeconds);
+            }
 
             if (local.context.valid || local.context.compacting || local.run.running) {
                 return local;

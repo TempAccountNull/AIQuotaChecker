@@ -643,10 +643,56 @@ namespace Codex {
         return FindObjectField(body, { "spendControl", "spend_control" });
     }
 
+    // Codex keeps working past an exhausted main limit by falling onto a second
+    // pool published as an additional rate limit named "gpt-reserve". Without
+    // this we report "usage exhausted" while the user is still being served.
+    static bool CodexReserveActive(const json& body) {
+        const json* additional = nullptr;
+
+        for (const char* key : { "additional_rate_limits", "additionalRateLimits" }) {
+            if (body.contains(key) && body.at(key).is_array()) {
+                additional = &body.at(key);
+                break;
+            }
+        }
+
+        if (!additional) {
+            return false;
+        }
+
+        for (const json& entry : *additional) {
+            if (!entry.is_object()) continue;
+
+            std::string name = ReadStringFlexible(entry, { "limitName", "limit_name" });
+            std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+
+            // Matched on the raw slug: the display transform would have already
+            // turned this into "Gpt Reserve" by the time a label is built.
+            if (name != "gpt-reserve" && name != "gpt_reserve") continue;
+
+            const json* limit = FindObjectField(entry, { "rateLimit", "rate_limit" });
+            const json& scope = limit ? *limit : entry;
+
+            const std::optional<bool> allowed = ReadBoolFlexible(scope, { "allowed" });
+            const bool reached =
+                ReadBoolFlexible(scope, { "limitReached", "limit_reached" }).value_or(false);
+
+            if (allowed.value_or(false) && !reached) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     static void ParseCodexLimitStatus(const json& body, Snapshot& snapshot) {
         if (!body.is_object()) {
             return;
         }
+
+        const bool reserveActive = CodexReserveActive(body);
 
         const std::string reachedType = ReadStatusIdentifier(
             body,
@@ -663,7 +709,9 @@ namespace Codex {
                 AppendUsageNotice(snapshot, "Usage exhausted: " + HumanizeIdentifier(reachedType));
             }
             else if (lower == "rate_limit_reached") {
-                AppendUsageNotice(snapshot, "Usage exhausted");
+                AppendUsageNotice(snapshot, reserveActive
+                    ? "Main limit reached - running on reserve"
+                    : "Usage exhausted");
             }
         }
 
@@ -673,7 +721,9 @@ namespace Codex {
             (allowed.has_value() && !*allowed);
 
         if (explicitRateLimitReached && reachedType.empty()) {
-            AppendUsageNotice(snapshot, "Usage exhausted");
+            AppendUsageNotice(snapshot, reserveActive
+                ? "Main limit reached - running on reserve"
+                : "Usage exhausted");
         }
 
         bool spendReached = ReadBoolFlexible(
@@ -819,6 +869,20 @@ namespace Codex {
     static std::chrono::system_clock::time_point ParseResetAtField(const json& object) {
         if (!object.is_object()) {
             return {};
+        }
+
+        // A server-computed countdown beats an absolute timestamp: reset_at is
+        // compared against the local clock, so a machine that is off by minutes
+        // shows a reset that is wrong by the same amount. reset_after_seconds
+        // carries no such assumption.
+        const std::optional<double> after = ReadNumberFlexible(
+            object,
+            { "reset_after_seconds", "resetAfterSeconds", "resets_in_seconds", "resetsInSeconds" }
+        );
+
+        if (after && *after >= 0.0) {
+            return std::chrono::system_clock::now() +
+                std::chrono::seconds(static_cast<long long>(*after));
         }
 
         for (const char* key : { "reset_at", "resetAt", "resets_at", "resetsAt" }) {
@@ -1058,7 +1122,8 @@ namespace Codex {
         auto readCount = [](const json& object) -> int {
             const std::optional<double> value = ReadNumberFlexible(
                 object,
-                { "available_count", "availableCount" }
+                { "applicable_available_count", "applicableAvailableCount",
+                  "available_count", "availableCount" }
             );
 
             if (!value || *value < 0.0) {
@@ -1669,6 +1734,119 @@ namespace Codex {
         }
     }
 
+    // "Subscription sharing": a pool consumed by third-party ChatPass apps,
+    // entirely separate from the main rate limits. Invisible until now, so a
+    // drain caused by a shared app looked like it came from nowhere.
+    static void ParseCodexChatPass(const json& body, Snapshot& snapshot) {
+        const json* chatpass = FindObjectField(body, { "chatpass", "chatPass" });
+
+        if (!chatpass) {
+            return;
+        }
+
+        const json* windows = nullptr;
+        for (const char* key : { "windows" }) {
+            if (chatpass->contains(key) && chatpass->at(key).is_array()) {
+                windows = &chatpass->at(key);
+                break;
+            }
+        }
+
+        if (!windows) {
+            return;
+        }
+
+        // Ascending by window length, the order the reference app renders.
+        std::vector<const json*> ordered;
+        for (const json& window : *windows) {
+            if (window.is_object()) ordered.push_back(&window);
+        }
+
+        std::stable_sort(ordered.begin(), ordered.end(), [](const json* a, const json* b) {
+            const double left = ReadNumberFlexible(
+                *a, { "limit_window_seconds", "limitWindowSeconds" }).value_or(0.0);
+            const double right = ReadNumberFlexible(
+                *b, { "limit_window_seconds", "limitWindowSeconds" }).value_or(0.0);
+            return left < right;
+        });
+
+        for (const json* window : ordered) {
+            const std::optional<double> seconds = ReadNumberFlexible(
+                *window, { "limit_window_seconds", "limitWindowSeconds" });
+
+            const std::string period = seconds && *seconds > 0.0
+                ? WindowTypeLabel(*seconds / 60.0, 0, ordered.size())
+                : std::string("Usage");
+
+            UsageBar bar = ParseCodexWindow(
+                *window,
+                "Subscription sharing \xc2\xb7 " + period,
+                seconds ? FormatWindowDuration(*seconds / 60.0) : std::string{},
+                /*quotaNotificationEligible=*/false
+            );
+
+            AddUsageBarIfUnique(snapshot, std::move(bar));
+        }
+    }
+
+    // A fully-formed monthly quota the server already computed - limit, used,
+    // percent and countdown - rather than one we derive. Also carries the
+    // server's own warning copy, per model.
+    static void ParseCodexSidebarWarnings(const json& body, Snapshot& snapshot) {
+        const json* warnings = FindObjectField(
+            body, { "sidebar_usage_warnings", "sidebarUsageWarnings" });
+
+        if (!warnings) {
+            return;
+        }
+
+        const json* def = FindObjectField(*warnings, { "default" });
+
+        if (!def) {
+            return;
+        }
+
+        if (const json* monthly = FindObjectField(*def, { "monthly_limit", "monthlyLimit" })) {
+            UsageBar bar = ParseCodexWindow(*monthly, "Monthly", std::string{}, false);
+
+            if (!bar.valid) {
+                // used_percent is absent on this shape; derive from used/limit.
+                const std::optional<double> used =
+                    ReadNumberFlexible(*monthly, { "used" });
+                const std::optional<double> limit =
+                    ReadNumberFlexible(*monthly, { "limit" });
+
+                if (used && limit && *limit > 0.0) {
+                    bar.valid = true;
+                    bar.label = "Monthly";
+                    bar.usedPercent = static_cast<float>(
+                        Math::get_instance()->PercentUsed(*used, *limit));
+
+                    const std::chrono::system_clock::time_point resetAt =
+                        ParseResetAtField(*monthly);
+
+                    if (resetAt.time_since_epoch().count() != 0) {
+                        bar.resetAt = resetAt;
+                        bar.resetAtUnixSeconds = static_cast<long long>(
+                            std::chrono::system_clock::to_time_t(resetAt));
+                        bar.rightText = FormatCodexResetText("Monthly", resetAt) + "  ";
+                    }
+
+                    bar.rightText += FormatPercent(bar.usedPercent);
+                }
+            }
+
+            AddUsageBarIfUnique(snapshot, std::move(bar));
+        }
+
+        const std::string title = ReadStringFlexible(*def, { "title" });
+        const std::string description = ReadStringFlexible(*def, { "description" });
+
+        if (!title.empty()) {
+            AppendUsageNotice(snapshot, description.empty() ? title : title + ": " + description);
+        }
+    }
+
     static void ParseAppServerResetCredits(const json& result, Snapshot& snapshot) {
         snapshot.resetCreditsAvailableCount = -1;
         snapshot.resetCredits.clear();
@@ -1686,6 +1864,8 @@ namespace Codex {
         if (!resets && (
             result.contains("availableCount") ||
             result.contains("available_count") ||
+            result.contains("applicable_available_count") ||
+            result.contains("applicableAvailableCount") ||
             result.contains("credits")
         )) {
             resets = &result;
@@ -1696,7 +1876,13 @@ namespace Codex {
         }
 
         snapshot.resetCreditsAvailableCount = static_cast<int>(
-            ReadNumberFlexible(*resets, { "availableCount", "available_count" }).value_or(-1.0)
+            // applicable_* counts only the credits redeemable against the limit
+            // currently being hit; available_count is the whole wallet and
+            // over-reports what is actually usable right now.
+            ReadNumberFlexible(*resets, {
+                "applicableAvailableCount", "applicable_available_count",
+                "availableCount", "available_count"
+            }).value_or(-1.0)
         );
 
         if (!resets->contains("credits") || !resets->at("credits").is_array()) {
@@ -1816,6 +2002,8 @@ namespace Codex {
             ParseCodexMonthlyUsage(result, snapshot);
         }
 
+        ParseCodexChatPass(result, snapshot);
+        ParseCodexSidebarWarnings(result, snapshot);
         ParseAppServerResetCredits(result, snapshot);
         return snapshot;
     }
@@ -1993,6 +2181,8 @@ namespace Codex {
         ParseCodexCreditBalance(usageJson, snapshot);
         ParseCodexIndividualLimit(usageJson, snapshot);
         ParseCodexMonthlyUsage(usageJson, snapshot);
+        ParseCodexChatPass(usageJson, snapshot);
+        ParseCodexSidebarWarnings(usageJson, snapshot);
         ParseCodexLimitStatus(usageJson, snapshot);
 
         const json* rateLimit = GetMainRateLimitObject(usageJson);

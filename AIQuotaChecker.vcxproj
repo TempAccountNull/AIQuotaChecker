@@ -81,6 +81,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;$(AIQuotaImGuiDir);$(AIQuotaImGuiDir)\backends;$(AIQuotaJsonDir)\single_include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>Global.hpp</PrecompiledHeaderFile>
@@ -101,6 +102,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;$(AIQuotaImGuiDir);$(AIQuotaImGuiDir)\backends;$(AIQuotaJsonDir)\single_include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>Global.hpp</PrecompiledHeaderFile>
@@ -119,6 +121,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <LanguageStandard>stdcpplatest</LanguageStandard>
       <LanguageStandard_C>stdclatest</LanguageStandard_C>
       <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;$(AIQuotaImGuiDir);$(AIQuotaImGuiDir)\backends;$(AIQuotaJsonDir)\single_include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
@@ -141,6 +144,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <LanguageStandard>stdcpplatest</LanguageStandard>
       <LanguageStandard_C>stdclatest</LanguageStandard_C>
       <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;$(AIQuotaImGuiDir);$(AIQuotaImGuiDir)\backends;$(AIQuotaJsonDir)\single_include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>

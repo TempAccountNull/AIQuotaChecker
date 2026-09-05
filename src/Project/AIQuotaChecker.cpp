@@ -874,11 +874,11 @@ namespace
 
     // Track the content height the renderer measured, so turning cards off in
     // Settings actually shortens the panel instead of leaving dead space.
-    static void UpdateWidgetContentSize()
+    static void UpdateWidgetContentSize(bool allowHeight)
     {
         const int measuredHeight = Renderer::WidgetDesiredHeight();
 
-        if (measuredHeight > 0) {
+        if (allowHeight && measuredHeight > 0) {
             const int maxHeight = (std::max)(kWidgetMinHeight,
                 static_cast<int>(g_widgetWork.bottom - g_widgetWork.top) - kWidgetMargin * 2);
             const int wanted = std::clamp(measuredHeight, kWidgetMinHeight, maxHeight);
@@ -1004,9 +1004,11 @@ namespace
             }
         }
 
-        if (!g_widgetRetracted) {
-            UpdateWidgetContentSize();
-        }
+        // Width is measured from the bar rows, which draw in both states, and
+        // widening does not fight the roll animation (that only moves the top
+        // edge). Gating this on "expanded" meant a fresh launch stayed 360px
+        // and clipped its own rows until the panel had been opened once.
+        UpdateWidgetContentSize(!g_widgetRetracted);
 
         const RECT target = WidgetRestRect(g_widgetRetracted, g_widgetFullHeight);
 
