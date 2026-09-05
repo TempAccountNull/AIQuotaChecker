@@ -2538,7 +2538,11 @@ static void PanelBarSection(
     bool valid,
     float usedPercent,
     const std::string& rightText,
-    const std::string& subline
+    const std::string& subline,
+    // Whether this bar tracks a window that resets on a clock. The context
+    // meter does not - it moves with the conversation - so it must not be
+    // annotated with a reset that will never come.
+    bool resets = true
 )
 {
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -2574,9 +2578,17 @@ static void PanelBarSection(
         : "No data";
     dl->AddText(ImVec2(x, y), Color(206, 213, 227), left.c_str());
 
-    if (!rightText.empty()) {
-        const float rw = ImGui::CalcTextSize(rightText.c_str()).x;
-        dl->AddText(ImVec2(x + innerW - rw, y), Color(138, 146, 166), rightText.c_str());
+    // A percentage on its own is half the answer - when it resets matters as
+    // much as how much is left. Claude omits resets_at on a five-hour window
+    // until the first message of a session, so an empty slot here is the norm
+    // at 0% rather than an error; say which case it is instead of nothing.
+    const std::string right = !rightText.empty() ? rightText
+        : ((!valid || !resets) ? std::string{}
+            : (usedPercent <= 0.0f ? "Not started yet" : "Reset time not reported"));
+
+    if (!right.empty()) {
+        const float rw = ImGui::CalcTextSize(right.c_str()).x;
+        dl->AddText(ImVec2(x + innerW - rw, y), Color(138, 146, 166), right.c_str());
     }
     y += lineH + 3.0f;
 
@@ -2738,7 +2750,7 @@ static void PanelContextSection(const UsageTelemetry::ContextUsage& context)
     const std::string tokens = FormatCompactTokenCount(context.usedTokens) + " / " +
         FormatCompactTokenCount(context.contextWindowTokens) + " tokens";
 
-    PanelBarSection("Context", true, used, right, tokens);
+    PanelBarSection("Context", true, used, right, tokens, /*resets=*/false);
     PanelRule();
 }
 
@@ -4746,20 +4758,15 @@ static void DrawWidgetPeekStrip(float width, bool onTop)
 
     const ImU32 severity = peek.valid ? PanelSeverity(peek.usedPercent) : Color(70, 76, 92);
 
-    // Row: severity dot, host + window, then the headline number, then reset.
+    // Row: severity dot, host + window, then the reset, then the headline
+    // number hard against the right edge.
     dl->AddCircleFilled(ImVec2(x + 3.5f, y + lineH * 0.5f), 3.5f, severity);
-
-    std::string label = peek.host;
-    if (!peek.window.empty()) label += "  ·  " + peek.window;
-    dl->AddText(ImVec2(x + 13.0f, y), Color(158, 166, 186), label.c_str());
 
     const std::string value = peek.valid
         ? Format::get_instance()->Percent(
               g_showRemaining ? 100.0f - peek.usedPercent : peek.usedPercent) +
           (g_showRemaining ? " left" : " used")
         : "No data";
-    const float valueW = ImGui::CalcTextSize(value.c_str()).x;
-    const float labelEnd = x + 13.0f + ImGui::CalcTextSize(label.c_str()).x;
 
     // Reset without the date suffix: 360px is not enough for both, and the
     // relative time is the part worth reading at a glance.
@@ -4768,16 +4775,32 @@ static void DrawWidgetPeekStrip(float width, bool onTop)
         right = ResetTime::get_instance()->Format(peek.resetAtUnixSeconds, g_resetDisplayMode, false);
     }
     if (right.empty()) right = peek.resetText;
+    if (right.empty() && peek.valid) {
+        right = peek.usedPercent <= 0.0f ? "Not started yet" : "Reset not reported";
+    }
 
+    const float valueW = ImGui::CalcTextSize(value.c_str()).x;
     const float rightW = right.empty() ? 0.0f : ImGui::CalcTextSize(right.c_str()).x;
 
-    // The number is what matters most, so it keeps its place against the right
-    // edge and the reset text is dropped rather than overlapped when tight.
     const float valueX = x + innerW - valueW;
     dl->AddText(ImVec2(valueX, y), Color(228, 234, 246), value.c_str());
 
-    if (!right.empty() && labelEnd + 10.0f + rightW + 12.0f < valueX) {
+    if (!right.empty()) {
         dl->AddText(ImVec2(valueX - 12.0f - rightW, y), Color(132, 140, 160), right.c_str());
+    }
+
+    // The label yields, not the reset: a percentage without a reset time is
+    // half an answer, whereas the window name is recoverable from the panel.
+    const float labelX = x + 13.0f;
+    const float labelRoom = (valueX - 12.0f - rightW) - labelX - 10.0f;
+
+    std::string label = peek.host;
+    if (!peek.window.empty()) {
+        const std::string full = label + "  ·  " + peek.window;
+        if (ImGui::CalcTextSize(full.c_str()).x <= labelRoom) label = full;
+    }
+    if (ImGui::CalcTextSize(label.c_str()).x <= labelRoom) {
+        dl->AddText(ImVec2(labelX, y), Color(158, 166, 186), label.c_str());
     }
 
     y += lineH + 7.0f;
