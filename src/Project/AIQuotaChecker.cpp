@@ -106,8 +106,9 @@ namespace
     static bool g_widgetSettled = false;
     static int g_widgetAnchor = AppSettings::WidgetAnchorTopRight;
     // Resting top-left for the current anchor, and where the slide is heading.
-    // Panel height when fully out; the retracted rect is derived from it.
+    // Panel size when fully out; the retracted rect is derived from it.
     static int g_widgetFullHeight = kWidgetHeight;
+    static int g_widgetFullWidth = kWidgetWidth;
     // Work area of the monitor the panel lives on, captured while it is still
     // on screen. Re-deriving it from the window each frame walks the panel onto
     // a neighbouring monitor as it slides off the edge of this one.
@@ -216,6 +217,7 @@ namespace
         return ClampWidgetMonitor(g_widgetMonitor);
     }
     static std::string g_widgetOrder = "codex,claude,zai,grok";
+    static std::string g_widgetBarRows;
     static int g_uiFontSize = 14;
     static int g_widgetSections = AppSettings::kWidgetSectionAll;
 
@@ -370,6 +372,7 @@ namespace
         g_widgetAnchor = AppSettings::ClampWidgetAnchor(settings.widgetAnchor);
         g_widgetMonitor = ClampWidgetMonitor(settings.widgetMonitor);
         g_widgetOrder = settings.widgetOrder;
+        g_widgetBarRows = settings.widgetBarRows;
         g_uiFontSize = AppSettings::ClampUiFontSize(settings.uiFontSize);
         g_widgetSections = settings.widgetSections;
         g_showResetDateDetails = settings.showResetDateDetails;
@@ -406,6 +409,7 @@ namespace
         settings.widgetAnchor = AppSettings::ClampWidgetAnchor(g_widgetAnchor);
         settings.widgetMonitor = g_widgetMonitor;
         settings.widgetOrder = g_widgetOrder;
+        settings.widgetBarRows = g_widgetBarRows;
         settings.uiFontSize = AppSettings::ClampUiFontSize(g_uiFontSize);
         settings.widgetSections = g_widgetSections;
         settings.showResetDateDetails = g_showResetDateDetails;
@@ -453,7 +457,7 @@ namespace
         GrokProvider::get_instance()->RefreshAsync();
     }
 
-    static void CreateRenderTarget()
+    static bool CreateRenderTarget()
     {
         ID3D11Texture2D* backBuffer = nullptr;
 
@@ -461,6 +465,8 @@ namespace
             g_device->CreateRenderTargetView(backBuffer, nullptr, &g_renderTarget);
             backBuffer->Release();
         }
+
+        return g_renderTarget != nullptr;
     }
 
     static void CleanupRenderTarget()
@@ -653,8 +659,17 @@ namespace
             // been stored, so it would otherwise resize the widget's swapchain.
             if (hwnd == g_hwnd && g_device && wparam != SIZE_MINIMIZED) {
                 CleanupRenderTarget();
-                g_swapChain->ResizeBuffers(0, LOWORD(lparam), HIWORD(lparam), DXGI_FORMAT_UNKNOWN, 0);
-                CreateRenderTarget();
+
+                // Moving the panel between monitors resizes it while the swap
+                // chain is being retargeted, and ResizeBuffers can legitimately
+                // fail mid-transition. The old code ignored that and left the
+                // view null, which the frame loop then handed to
+                // ClearRenderTargetView - an access violation, not a dropped
+                // frame. Leave it null and let the loop retry instead.
+                if (SUCCEEDED(g_swapChain->ResizeBuffers(
+                        0, LOWORD(lparam), HIWORD(lparam), DXGI_FORMAT_UNKNOWN, 0))) {
+                    CreateRenderTarget();
+                }
             }
             return 0;
 
@@ -775,6 +790,7 @@ namespace
         // bottom row and the sides.
         g_widgetWork = WidgetMonitorWork();
         g_widgetFullHeight = kWidgetHeight;
+        g_widgetFullWidth = kWidgetWidth;
         g_widgetRetracted = false;
         g_widgetSettled = false;
         g_widgetLastHoverSeconds = MonotonicSeconds();
@@ -828,9 +844,10 @@ namespace
     {
         const RECT work = g_widgetWork;
         const int height = (std::max)(1, fullHeight);
-        POINT origin = AnchorOrigin(g_widgetAnchor, work, kWidgetWidth, height);
+        const int width = (std::max)(1, g_widgetFullWidth);
+        POINT origin = AnchorOrigin(g_widgetAnchor, work, width, height);
 
-        RECT out{ origin.x, origin.y, origin.x + kWidgetWidth, origin.y + height };
+        RECT out{ origin.x, origin.y, origin.x + width, origin.y + height };
         if (!retracted) {
             return out;
         }
@@ -849,21 +866,35 @@ namespace
 
     // Track the content height the renderer measured, so turning cards off in
     // Settings actually shortens the panel instead of leaving dead space.
-    static void UpdateWidgetContentHeight()
+    static void UpdateWidgetContentSize()
     {
-        const int measured = Renderer::WidgetDesiredHeight();
-        if (measured <= 0) {
-            return;
+        const int measuredHeight = Renderer::WidgetDesiredHeight();
+
+        if (measuredHeight > 0) {
+            const int maxHeight = (std::max)(kWidgetMinHeight,
+                static_cast<int>(g_widgetWork.bottom - g_widgetWork.top) - kWidgetMargin * 2);
+            const int wanted = std::clamp(measuredHeight, kWidgetMinHeight, maxHeight);
+
+            // Deadband: sub-pixel text metrics jitter by a pixel or two between
+            // frames, and resizing every frame would flicker the swapchain.
+            if (std::abs(wanted - g_widgetFullHeight) > kWidgetResizeDeadband) {
+                g_widgetFullHeight = wanted;
+            }
         }
 
-        const int maxHeight = (std::max)(kWidgetMinHeight,
-            static_cast<int>(g_widgetWork.bottom - g_widgetWork.top) - kWidgetMargin * 2);
-        const int wanted = std::clamp(measured, kWidgetMinHeight, maxHeight);
+        // Width follows the longest bar row so a long model name is shown in
+        // full rather than ellipsised. Measured untrimmed, so widening cannot
+        // feed back into the measurement.
+        const int measuredWidth = Renderer::WidgetDesiredWidth();
 
-        // Deadband: sub-pixel text metrics jitter by a pixel or two between
-        // frames, and resizing every frame would flicker the swapchain.
-        if (std::abs(wanted - g_widgetFullHeight) > kWidgetResizeDeadband) {
-            g_widgetFullHeight = wanted;
+        if (measuredWidth > 0) {
+            const int maxWidth = (std::max)(kWidgetWidth,
+                static_cast<int>(g_widgetWork.right - g_widgetWork.left) - kWidgetMargin * 2);
+            const int wanted = std::clamp(measuredWidth, kWidgetWidth, maxWidth);
+
+            if (std::abs(wanted - g_widgetFullWidth) > kWidgetResizeDeadband) {
+                g_widgetFullWidth = wanted;
+            }
         }
     }
 
@@ -882,8 +913,9 @@ namespace
         g_widgetLastHoverSeconds = MonotonicSeconds();
 
         const RECT rest = WidgetRestRect(false, g_widgetFullHeight);
-        SetWindowPos(g_hwnd, HWND_TOPMOST, rest.left, rest.top,
-            rest.right - rest.left, rest.bottom - rest.top, SWP_NOACTIVATE);
+        SetWindowPos(g_hwnd, nullptr, rest.left, rest.top,
+            rest.right - rest.left, rest.bottom - rest.top,
+            SWP_NOACTIVATE | SWP_NOZORDER);
     }
 
     static void PollWidgetWindow()
@@ -945,7 +977,7 @@ namespace
         }
 
         if (!g_widgetRetracted) {
-            UpdateWidgetContentHeight();
+            UpdateWidgetContentSize();
         }
 
         const RECT target = WidgetRestRect(g_widgetRetracted, g_widgetFullHeight);
@@ -984,14 +1016,18 @@ namespace
         const LONG right = step(rect.right, target.right);
         const LONG bottom = step(rect.bottom, target.bottom);
 
+        // SWP_NOZORDER, not HWND_TOPMOST: the panel is already topmost from
+        // EnterWidgetMode, and re-asserting it every animation frame re-inserts
+        // it at the top of the topmost band - which buried the notification
+        // toasts, themselves topmost, behind the widget.
         SetWindowPos(
             g_hwnd,
-            HWND_TOPMOST,
+            nullptr,
             static_cast<int>(left),
             static_cast<int>(top),
             static_cast<int>((std::max)(1L, right - left)),
             static_cast<int>((std::max)(1L, bottom - top)),
-            SWP_NOACTIVATE
+            SWP_NOACTIVATE | SWP_NOZORDER
         );
     }
 
@@ -1025,6 +1061,11 @@ namespace
     static bool CreateSettingsWindow(HINSTANCE instance)
     {
         if (g_settingsHwnd) {
+            // Already open but possibly buried: raise and restore it.
+            if (IsIconic(g_settingsHwnd)) {
+                ShowWindow(g_settingsHwnd, SW_RESTORE);
+            }
+            BringWindowToTop(g_settingsHwnd);
             SetForegroundWindow(g_settingsHwnd);
             return true;
         }
@@ -1035,13 +1076,25 @@ namespace
         const int x = work.left + ((work.right - work.left) - width) / 2;
         const int y = work.top + ((work.bottom - work.top) - height) / 2;
 
+        // Owned by the widget and given a taskbar button.
+        //
+        // Unowned, it sank behind whatever was clicked next with no way back -
+        // the widget is WS_EX_TOPMOST so it could not even be raised by
+        // clicking that. The owner keeps it above the widget; WS_EX_APPWINDOW
+        // gives a popup a taskbar entry it would not otherwise get, so it can
+        // be brought forward again from anywhere.
         g_settingsHwnd = CreateWindowExW(
-            0, L"AIQuotaCheckerDX11", L"AI Quota Checker - Settings",
-            WS_POPUP, x, y, width, height, nullptr, nullptr, instance, nullptr);
+            WS_EX_APPWINDOW, L"AIQuotaCheckerDX11", L"AI Quota Checker - Settings",
+            WS_POPUP, x, y, width, height, g_hwnd, nullptr, instance, nullptr);
 
         if (!g_settingsHwnd) {
             return false;
         }
+
+        // An owner that is topmost would otherwise drag this along with it and
+        // float the settings window over every other application.
+        SetWindowPos(g_settingsHwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
         DXGI_SWAP_CHAIN_DESC sd{};
         sd.BufferCount = 2;
@@ -1296,6 +1349,7 @@ namespace
         g_rendererState.widgetMonitorCount = static_cast<int>(g_monitorLabelPtrs.size());
         g_rendererState.repositionWidget = RepositionWidget;
         g_rendererState.widgetOrder = &g_widgetOrder;
+        g_rendererState.widgetBarRows = &g_widgetBarRows;
         g_rendererState.uiFontSize = &g_uiFontSize;
         g_rendererState.widgetSections = &g_widgetSections;
         g_rendererState.settingsWindowOpen = &g_settingsWindowOpen;
@@ -1643,6 +1697,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
             0.075f,
             1.0f
         };
+
+        // ClearRenderTargetView dereferences the view, so a null one is a crash
+        // rather than a no-op. Rebuild it here if a resize left us without one.
+        // ImGui::Render above already ended the frame; just skip submitting
+        // this one's draw data and try again next tick.
+        if (!g_renderTarget && !CreateRenderTarget()) {
+            RenderSettingsWindow();
+            continue;
+        }
 
         g_context->OMSetRenderTargets(1, &g_renderTarget, nullptr);
         g_context->ClearRenderTargetView(g_renderTarget, clearColor);

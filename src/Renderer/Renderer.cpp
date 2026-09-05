@@ -16,6 +16,8 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
+#include <fstream>
 #include <cstring>
 #include <cmath>
 #include <ctime>
@@ -2502,6 +2504,29 @@ static ImU32 PanelSeverity(float usedPercent)
     return Color(94, 168, 132);
 }
 
+// ResetTime bakes "Resets in" into all three mode formatters. A banked credit
+// expires rather than resets, so relabel the verb here instead of threading a
+// noun through every one of them.
+static std::string PanelExpiry(long long expiresAtUnixSeconds)
+{
+    if (expiresAtUnixSeconds <= 0) return {};
+
+    std::string text = ResetTime::get_instance()->Format(
+        expiresAtUnixSeconds, g_resetDisplayMode, g_showResetDateDetails);
+
+    const std::string prefix = "Resets in ";
+    if (text.rfind(prefix, 0) == 0) return "Expires in " + text.substr(prefix.size());
+    if (text.rfind("Reset available", 0) == 0) return "Expired";
+
+    return text;
+}
+
+static long long UnixSecondsFrom(std::chrono::system_clock::time_point point)
+{
+    if (point.time_since_epoch().count() == 0) return 0;
+    return std::chrono::duration_cast<std::chrono::seconds>(point.time_since_epoch()).count();
+}
+
 static std::string PanelReset(long long resetAtUnixSeconds, const std::string& fallback)
 {
     if (resetAtUnixSeconds > 0) {
@@ -2542,7 +2567,10 @@ static void PanelBarSection(
     // Whether this bar tracks a window that resets on a clock. The context
     // meter does not - it moves with the conversation - so it must not be
     // annotated with a reset that will never come.
-    bool resets = true
+    bool resets = true,
+    // "<provider>:<window>". When set, the card can be dragged into the
+    // rolled-up bar to pin it there.
+    const std::string& dragKey = std::string{}
 )
 {
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -2557,7 +2585,34 @@ static void PanelBarSection(
 
     const ImVec2 c0 = ImGui::GetCursorScreenPos();
     const ImVec2 c1(c0.x + w, c0.y + height);
+
+    // Drag the card into the bar to pin it there. The hit area goes down first
+    // so the card's own painting covers it.
+    bool dragging = false;
+    if (!dragKey.empty()) {
+        ImGui::PushID(dragKey.c_str());
+        ImGui::InvisibleButton("##card_drag", ImVec2(w, height));
+
+        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
+            ImGui::SetDragDropPayload("AQC_BAR_KEY", dragKey.c_str(),
+                dragKey.size() + 1);
+            ImGui::Text("Pin %s to the bar", title);
+            ImGui::EndDragDropSource();
+            dragging = true;
+        }
+        else if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Drag onto the bar at the bottom to pin it");
+        }
+
+        ImGui::PopID();
+        ImGui::SetCursorScreenPos(c0);
+    }
+
     PanelCardBackground(c0, c1);
+
+    if (dragging) {
+        dl->AddRect(c0, c1, Color(96, 156, 240, 220), 10.0f, 0, 1.5f);
+    }
 
     const float x = c0.x + pad;
     const float innerW = w - pad * 2.0f;
@@ -2733,7 +2788,8 @@ static void PanelModelSection(const UsageTelemetry::ContextUsage& context)
     PanelRule();
 }
 
-static void PanelContextSection(const UsageTelemetry::ContextUsage& context)
+static void PanelContextSection(const UsageTelemetry::ContextUsage& context,
+    const char* provider = nullptr)
 {
     if (!PanelShows(AppSettings::WidgetSectionContext)) return;
     if (!context.valid || context.contextWindowTokens <= 0) return;
@@ -2750,7 +2806,8 @@ static void PanelContextSection(const UsageTelemetry::ContextUsage& context)
     const std::string tokens = FormatCompactTokenCount(context.usedTokens) + " / " +
         FormatCompactTokenCount(context.contextWindowTokens) + " tokens";
 
-    PanelBarSection("Context", true, used, right, tokens, /*resets=*/false);
+    PanelBarSection("Context", true, used, right, tokens, /*resets=*/false,
+        provider ? std::string(provider) + ":Context" : std::string{});
     PanelRule();
 }
 
@@ -2969,7 +3026,8 @@ static void RenderCodexSections(const Codex::Snapshot& snapshot)
         const char* title = !bar.label.empty() ? bar.label.c_str()
             : (!bar.sublabel.empty() ? bar.sublabel.c_str() : "Usage");
         PanelBarSection(title, true, bar.usedPercent,
-            PanelReset(bar.resetAtUnixSeconds, bar.rightText), std::string{});
+            PanelReset(bar.resetAtUnixSeconds, bar.rightText), std::string{},
+            true, std::string("Codex:") + title);
         PanelRule();
     }
 
@@ -2991,7 +3049,7 @@ static void RenderCodexSections(const Codex::Snapshot& snapshot)
         PanelRule();
     }
 
-    PanelContextSection(snapshot.context);
+    PanelContextSection(snapshot.context, "Codex");
 
     if (PanelShows(AppSettings::WidgetSectionExtra) &&
         snapshot.creditBalance.valid && !snapshot.creditBalance.balanceText.empty()) {
@@ -3000,8 +3058,22 @@ static void RenderCodexSections(const Codex::Snapshot& snapshot)
         PanelRule();
     }
     if (PanelShows(AppSettings::WidgetSectionDetails) && snapshot.resetCreditsAvailableCount >= 0) {
-        PanelInfoSection("Reset credits",
-            { std::to_string(snapshot.resetCreditsAvailableCount) + " banked" });
+        std::vector<std::string> lines;
+        lines.push_back(std::to_string(snapshot.resetCreditsAvailableCount) + " banked");
+
+        // Each banked credit carries its own expiry, already sorted soonest
+        // first by the provider. A bare count hides the only thing that is
+        // actually actionable about them.
+        for (const Codex::ResetCredit& credit : snapshot.resetCredits) {
+            const std::string when = PanelExpiry(UnixSecondsFrom(credit.expiresAt));
+            if (when.empty() && credit.title.empty()) continue;
+
+            std::string line = credit.title.empty() ? std::string("Credit") : credit.title;
+            if (!when.empty()) line += "  ·  " + when;
+            lines.push_back(std::move(line));
+        }
+
+        PanelInfoSection("Reset credits", lines);
         PanelRule();
     }
 
@@ -3036,17 +3108,19 @@ static void RenderClaudeSections(const Claude::Snapshot& snapshot)
     for (const Claude::UsageWindow* w : windows) {
         if (!w->valid || !PanelShows(AppSettings::WidgetSectionQuota)) continue;
         PanelBarSection(w->title.empty() ? "Usage" : w->title.c_str(), true, w->usedPercent,
-            PanelReset(w->resetAtUnixSeconds, w->resetText), std::string{});
+            PanelReset(w->resetAtUnixSeconds, w->resetText), std::string{},
+            true, "Claude:" + w->title);
         PanelRule();
     }
     for (const Claude::UsageWindow& w : snapshot.additionalLimits) {
         if (!w.valid || !PanelShows(AppSettings::WidgetSectionQuota)) continue;
         PanelBarSection(w.title.empty() ? "Usage" : w.title.c_str(), true, w.usedPercent,
-            PanelReset(w.resetAtUnixSeconds, w.resetText), std::string{});
+            PanelReset(w.resetAtUnixSeconds, w.resetText), std::string{},
+            true, "Claude:" + w.title);
         PanelRule();
     }
 
-    PanelContextSection(snapshot.context);
+    PanelContextSection(snapshot.context, "Claude");
 
     if (PanelShows(AppSettings::WidgetSectionExtra) &&
         snapshot.credits.valid && snapshot.credits.hasUsedPercent) {
@@ -3101,11 +3175,12 @@ static void RenderZAiSections(const ZAi::Snapshot& snapshot)
         const char* title = !bar.label.empty() ? bar.label.c_str()
             : (!bar.sublabel.empty() ? bar.sublabel.c_str() : "Usage");
         PanelBarSection(title, true, bar.usedPercent,
-            PanelReset(bar.resetAtUnixSeconds, bar.resetText), std::string{});
+            PanelReset(bar.resetAtUnixSeconds, bar.resetText), std::string{},
+            true, std::string("Z.Ai:") + title);
         PanelRule();
     }
 
-    PanelContextSection(snapshot.context);
+    PanelContextSection(snapshot.context, "Z.Ai");
 
     for (const ZAi::DetailRow& detail : snapshot.details) {
         if (!PanelShows(AppSettings::WidgetSectionDetails)) break;
@@ -3156,13 +3231,15 @@ static void RenderGrokSections(const Grok::Snapshot& snapshot)
     if (PanelShows(AppSettings::WidgetSectionQuota) && snapshot.weeklyLimit.valid) {
         PanelBarSection(snapshot.weeklyLimit.title.empty() ? "Weekly" : snapshot.weeklyLimit.title.c_str(),
             true, snapshot.weeklyLimit.usedPercent,
-            PanelReset(snapshot.weeklyLimit.resetAtUnixSeconds, snapshot.weeklyLimit.resetText), std::string{});
+            PanelReset(snapshot.weeklyLimit.resetAtUnixSeconds, snapshot.weeklyLimit.resetText),
+            std::string{}, true, "Grok:" + snapshot.weeklyLimit.title);
         PanelRule();
     }
     for (const Grok::ProductUsage& product : snapshot.products) {
         if (!PanelShows(AppSettings::WidgetSectionQuota)) break;
         PanelBarSection(product.product.empty() ? "Product" : product.product.c_str(),
-            true, product.usagePercent, std::string{}, std::string{});
+            true, product.usagePercent, std::string{}, std::string{},
+            true, "Grok:" + product.product);
         PanelRule();
     }
     if (PanelShows(AppSettings::WidgetSectionExtra) && snapshot.extraCredits.valid) {
@@ -3171,7 +3248,7 @@ static void RenderGrokSections(const Grok::Snapshot& snapshot)
         PanelRule();
     }
 
-    PanelContextSection(snapshot.context);
+    PanelContextSection(snapshot.context, "Grok");
     PanelBreakdownSection(snapshot.context);
     PanelCacheSection(snapshot.context);
     PanelModelSection(snapshot.context);
@@ -4078,6 +4155,154 @@ static void DrawWidgetPlacementSettings(float contentWidth)
     DrawSettingsMutedText("Snapping and rolling away are relative to this monitor only.");
 }
 
+// One row of the collapsed bar: a quota window from some host.
+struct WidgetPeek
+{
+    bool valid = false;
+    std::string host;
+    std::string window;
+    float usedPercent = 0.0f;
+    long long resetAtUnixSeconds = 0;
+    std::string resetText;
+    // The host's plan, brand prefix already trimmed ("Max 5x").
+    std::string plan;
+    // Right-hand text for rows that do not reset on a clock (the context
+    // meter's token counts, say). Wins over the reset time when set.
+    std::string detail;
+    bool resets = true;
+    // "<provider>:<window>", stable across restarts.
+    std::string key;
+};
+
+static WidgetPeek WidgetPeekSummary();
+static std::vector<WidgetPeek> WidgetPeekCandidates();
+static const std::vector<WidgetPeek>& WidgetPeekRows();
+
+// The collapsed bar's contents: tick the windows you want, drag to reorder.
+// Candidates come from whatever the hosts are actually reporting right now, so
+// a signed-out host simply has no rows to offer.
+static void DrawWidgetBarRowPicker(float contentWidth)
+{
+    if (!R().widgetBarRows) return;
+
+    const std::vector<WidgetPeek> candidates = WidgetPeekCandidates();
+
+    // The current selection, in order. Keys are kept even when their host is
+    // not reporting right now - a host that has not refreshed yet, or is signed
+    // out, must not silently delete a pick and then save the deletion.
+    std::vector<std::string> chosen;
+    {
+        std::stringstream stream(*R().widgetBarRows);
+        std::string key;
+        while (std::getline(stream, key, ',')) {
+            if (key.empty()) continue;
+            if (std::find(chosen.begin(), chosen.end(), key) == chosen.end()) {
+                chosen.push_back(key);
+            }
+        }
+    }
+
+    if (candidates.empty() && chosen.empty()) {
+        DrawSettingsMutedText("No quota windows reported yet - refresh a host first.");
+        return;
+    }
+
+    const auto reporting = [&candidates](const std::string& key) {
+        for (const WidgetPeek& c : candidates) {
+            if (c.key == key) return true;
+        }
+        return false;
+    };
+
+    bool changed = false;
+
+    // Picked rows first, in order, each draggable onto another to reorder.
+    for (size_t i = 0; i < chosen.size(); ++i) {
+        ImGui::PushID(static_cast<int>(i));
+
+        bool on = true;
+        if (ImGui::Checkbox("##pick", &on)) {
+            chosen.erase(chosen.begin() + static_cast<long long>(i));
+            changed = true;
+            ImGui::PopID();
+            break;
+        }
+
+        ImGui::SameLine();
+
+        std::string label = chosen[i];
+        const size_t colon = label.find(':');
+        if (colon != std::string::npos) label[colon] = ' ';
+        if (!reporting(chosen[i])) label += "   (not reporting)";
+        ImGui::Selectable(("≡  " + label).c_str(), false, 0, ImVec2(contentWidth * 0.6f, 0.0f));
+
+        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoDisableHover)) {
+            const int from = static_cast<int>(i);
+            ImGui::SetDragDropPayload("AQC_BAR_ROW", &from, sizeof(from));
+            ImGui::TextUnformatted(label.c_str());
+            ImGui::EndDragDropSource();
+        }
+        if (ImGui::BeginDragDropTarget()) {
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("AQC_BAR_ROW")) {
+                const int from = *static_cast<const int*>(payload->Data);
+                const int to = static_cast<int>(i);
+                if (from >= 0 && from < static_cast<int>(chosen.size()) && from != to) {
+                    const std::string moved = chosen[static_cast<size_t>(from)];
+                    chosen.erase(chosen.begin() + from);
+                    chosen.insert(chosen.begin() + to, moved);
+                    changed = true;
+                }
+            }
+            ImGui::EndDragDropTarget();
+        }
+
+        ImGui::PopID();
+    }
+
+    if (!chosen.empty()) {
+        ImGui::Spacing();
+        DrawSettingsMutedText("Not shown");
+    }
+
+    // Everything else, unticked.
+    for (const WidgetPeek& candidate : candidates) {
+        if (std::find(chosen.begin(), chosen.end(), candidate.key) != chosen.end()) continue;
+
+        ImGui::PushID(candidate.key.c_str());
+        bool on = false;
+        std::string label = candidate.host + "  " + candidate.window;
+        if (ImGui::Checkbox(label.c_str(), &on)) {
+            chosen.push_back(candidate.key);
+            changed = true;
+        }
+        ImGui::PopID();
+    }
+
+    if (candidates.empty()) {
+        DrawSettingsMutedText("Refresh a host to see its other windows here.");
+    }
+
+    ImGui::Spacing();
+    if (ImGui::Button("Follow selected host")) {
+        // Empty means "whatever tab is open", the original behaviour.
+        chosen.clear();
+        changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Clear the picks and let the bar track the open host tab");
+    }
+
+    if (changed) {
+        std::string joined;
+        for (const std::string& key : chosen) {
+            if (!joined.empty()) joined.push_back(',');
+            joined += key;
+        }
+        *R().widgetBarRows = joined;
+        if (R().saveAppSettings) R().saveAppSettings();
+    }
+}
+
 static void DrawCleanViewSettings(float contentWidth, float contentHeight)
 {
     BeginCleanSettingsCard("##settings_view", "View",
@@ -4096,6 +4321,13 @@ static void DrawCleanViewSettings(float contentWidth, float contentHeight)
     ImGui::Spacing();
 
     DrawWidgetPlacementSettings(contentWidth);
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    DrawSettingsMutedText("Rolled-up bar");
+    DrawWidgetBarRowPicker(contentWidth);
 
     EndCleanSettingsCard();
 }
@@ -4614,6 +4846,10 @@ static float g_widgetContentHeight = 0.0f;
 // Height of the bottom summary strip, including the panel padding below it.
 // This is how much of the window stays on screen while retracted.
 static float g_widgetPeekHeight = 0.0f;
+// Widest bar row measured this frame, untrimmed. The window widens to this so
+// a long model name is shown rather than ellipsised.
+static float g_widgetContentWidth = 0.0f;
+static float g_widgetContentWidthAccum = 0.0f;
 
 // Cheap per-provider "primary usage" peeks for the tab-strip underline.
 static bool CodexPrimaryUsed(float& out) {
@@ -4646,15 +4882,246 @@ static bool GrokPrimaryUsed(float& out) {
 // that remaining band: the selected host's session quota and reset, readable
 // without pulling the panel back down.
 
-struct WidgetPeek
+
+// The context meter as a pinnable row. It has a percentage and a bar like any
+// quota window, but nothing resets on a clock, so the right-hand slot carries
+// the token counts instead of a countdown.
+static void AddContextCandidate(std::vector<WidgetPeek>& out, const std::string& host,
+    const std::string& plan, const UsageTelemetry::ContextUsage& context)
 {
-    bool valid = false;
-    std::string host;
-    std::string window;
-    float usedPercent = 0.0f;
-    long long resetAtUnixSeconds = 0;
-    std::string resetText;
-};
+    if (!context.valid || context.contextWindowTokens <= 0) return;
+
+    WidgetPeek peek;
+    peek.valid = true;
+    peek.host = host;
+    peek.window = "Context";
+    peek.plan = plan;
+    peek.resets = false;
+    peek.usedPercent = Math::get_instance()->PercentUsed(
+        static_cast<double>(context.usedTokens),
+        static_cast<double>(context.contextWindowTokens));
+    peek.detail = FormatCompactTokenCount(context.usedTokens) + " / " +
+        FormatCompactTokenCount(context.contextWindowTokens);
+    peek.key = host + ":Context";
+
+    for (const WidgetPeek& existing : out) {
+        if (existing.key == peek.key) return;
+    }
+    out.push_back(std::move(peek));
+}
+
+// Every quota window across every host, as stable "<provider>:<window>" keys.
+// The collapsed bar picks from this, so the key has to survive a restart -
+// hence the window title rather than an index into a list that reorders.
+static std::vector<WidgetPeek> WidgetPeekCandidates()
+{
+    std::vector<WidgetPeek> out;
+
+    const auto add = [&out](const std::string& host, const std::string& window,
+        bool valid, float used, long long resetAt, const std::string& resetText,
+        const std::string& plan, const std::string& detail = std::string{},
+        bool resets = true) {
+        if (!valid || window.empty()) return;
+
+        WidgetPeek peek;
+        peek.valid = true;
+        peek.host = host;
+        peek.window = window;
+        peek.plan = plan;
+        peek.detail = detail;
+        peek.resets = resets;
+        peek.usedPercent = used;
+        peek.resetAtUnixSeconds = resetAt;
+        peek.resetText = resetText;
+        peek.key = host + ":" + window;
+
+        // Providers can report the same window twice (a server-driven limit
+        // plus its legacy named field); first one wins.
+        for (const WidgetPeek& existing : out) {
+            if (existing.key == peek.key) return;
+        }
+        out.push_back(std::move(peek));
+    };
+
+    {
+        std::lock_guard<std::mutex> lock(g_codexMutex);
+        const std::string plan = PlanBeside("Codex", g_codexState.plan);
+        for (const Codex::UsageBar& b : g_codexState.bars) {
+            add("Codex", !b.label.empty() ? b.label : b.sublabel,
+                b.valid, b.usedPercent, b.resetAtUnixSeconds, b.rightText, plan);
+        }
+        AddContextCandidate(out, "Codex", plan, g_codexState.context);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_claudeMutex);
+        const Claude::UsageWindow* windows[] = {
+            &g_claudeState.currentSession, &g_claudeState.weeklyAllModels,
+            &g_claudeState.weeklySonnet, &g_claudeState.weeklyFable
+        };
+        const std::string plan = PlanBeside("Claude", g_claudeState.plan);
+        for (const Claude::UsageWindow* w : windows) {
+            add("Claude", w->title, w->valid, w->usedPercent,
+                w->resetAtUnixSeconds, w->resetText, plan);
+        }
+        for (const Claude::UsageWindow& w : g_claudeState.additionalLimits) {
+            add("Claude", w.title, w.valid, w.usedPercent,
+                w.resetAtUnixSeconds, w.resetText, plan);
+        }
+        AddContextCandidate(out, "Claude", plan, g_claudeState.context);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_zaiMutex);
+        const std::string plan = PlanBeside("Z.Ai", g_zaiState.plan);
+        for (const ZAi::UsageBar& b : g_zaiState.bars) {
+            if (b.spendBalance) continue;
+            add("Z.Ai", !b.label.empty() ? b.label : b.sublabel,
+                b.valid, b.usedPercent, b.resetAtUnixSeconds, b.resetText, plan);
+        }
+        AddContextCandidate(out, "Z.Ai", plan, g_zaiState.context);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_grokMutex);
+        const std::string plan = PlanBeside("Grok", g_grokState.plan);
+        add("Grok", g_grokState.weeklyLimit.title, g_grokState.weeklyLimit.valid,
+            g_grokState.weeklyLimit.usedPercent,
+            g_grokState.weeklyLimit.resetAtUnixSeconds, g_grokState.weeklyLimit.resetText, plan);
+        for (const Grok::ProductUsage& p : g_grokState.products) {
+            add("Grok", p.product, true, p.usagePercent, 0, std::string{}, plan);
+        }
+        AddContextCandidate(out, "Grok", plan, g_grokState.context);
+    }
+
+    return out;
+}
+
+// Punctuation- and case-insensitive form of a pin key, used only as a fallback
+// when an exact match fails.
+static std::string CompactKey(const std::string& key)
+{
+    std::string out;
+    out.reserve(key.size());
+
+    for (unsigned char c : key) {
+        if (std::isalnum(c)) out.push_back(static_cast<char>(std::tolower(c)));
+    }
+    return out;
+}
+
+// The stored pick list, unresolved. Kept separate from WidgetPeekRows because
+// reordering has to move the keys, not the rows they happen to resolve to.
+static std::vector<std::string> WidgetBarKeys()
+{
+    std::vector<std::string> keys;
+    if (!R().widgetBarRows) return keys;
+
+    std::stringstream stream(*R().widgetBarRows);
+    std::string key;
+    while (std::getline(stream, key, ',')) {
+        if (key.empty()) continue;
+        if (std::find(keys.begin(), keys.end(), key) == keys.end()) keys.push_back(key);
+    }
+    return keys;
+}
+
+static void SetWidgetBarKeys(const std::vector<std::string>& keys)
+{
+    if (!R().widgetBarRows) return;
+
+    std::string joined;
+    for (const std::string& key : keys) {
+        if (!joined.empty()) joined.push_back(',');
+        joined += key;
+    }
+
+    *R().widgetBarRows = joined;
+    if (R().saveAppSettings) R().saveAppSettings();
+}
+
+// The rows the collapsed bar should show: the user's picks in their order,
+// falling back to the selected host's primary window when nothing is picked.
+//
+// Cached for the frame: the height helpers ask for this several times per
+// frame and each uncached answer locks all four provider mutexes and rebuilds
+// the candidate list.
+static std::vector<WidgetPeek> WidgetPeekRowsUncached();
+
+static const std::vector<WidgetPeek>& WidgetPeekRows()
+{
+    static int cachedFrame = -1;
+    static std::vector<WidgetPeek> cached;
+
+    const int frame = ImGui::GetFrameCount();
+    if (frame != cachedFrame) {
+        cachedFrame = frame;
+        cached = WidgetPeekRowsUncached();
+    }
+
+    return cached;
+}
+
+static std::vector<WidgetPeek> WidgetPeekRowsUncached()
+{
+    std::vector<WidgetPeek> rows;
+
+    const std::string spec = R().widgetBarRows ? *R().widgetBarRows : std::string{};
+
+    if (!spec.empty()) {
+        const std::vector<WidgetPeek> all = WidgetPeekCandidates();
+
+        std::stringstream stream(spec);
+        std::string key;
+        while (std::getline(stream, key, ',')) {
+            while (!key.empty() && (key.front() == ' ' || key.front() == '	')) key.erase(key.begin());
+            while (!key.empty() && (key.back() == ' ' || key.back() == '	')) key.pop_back();
+            if (key.empty()) continue;
+
+            const WidgetPeek* found = nullptr;
+            for (const WidgetPeek& candidate : all) {
+                if (candidate.key == key) { found = &candidate; break; }
+            }
+
+            // Keys embed the window's display name, so relabelling a window
+            // orphans every pin that referenced it - fixing "GPT 5 3" to
+            // "GPT 5.3" silently broke the saved rows. Fall back to a match
+            // that ignores punctuation and case so a cosmetic rename keeps
+            // resolving.
+            if (!found) {
+                const std::string wanted = CompactKey(key);
+                for (const WidgetPeek& candidate : all) {
+                    if (CompactKey(candidate.key) == wanted) { found = &candidate; break; }
+                }
+            }
+
+            if (found) {
+                rows.push_back(*found);
+                continue;
+            }
+
+            // Hold the slot. A host that has not answered yet resolves nothing,
+            // and dropping the row would shift everything below it up - the
+            // order visibly rearranging itself as each host reports in. It also
+            // keeps rows 1:1 with the stored keys, which the reorder and unpin
+            // handlers index by position.
+            WidgetPeek placeholder;
+            placeholder.valid = false;
+            placeholder.key = key;
+
+            const size_t colon = key.find(':');
+            placeholder.host = colon == std::string::npos ? key : key.substr(0, colon);
+            placeholder.window = colon == std::string::npos
+                ? std::string{} : key.substr(colon + 1);
+
+            rows.push_back(std::move(placeholder));
+        }
+    }
+
+    // Nothing picked at all: follow whichever host tab is open.
+    if (rows.empty()) {
+        rows.push_back(WidgetPeekSummary());
+    }
+
+    return rows;
+}
 
 static WidgetPeek WidgetPeekSummary()
 {
@@ -4664,6 +5131,7 @@ static WidgetPeek WidgetPeekSummary()
     case ActiveMainTab::Codex: {
         std::lock_guard<std::mutex> lock(g_codexMutex);
         peek.host = "Codex";
+        peek.plan = PlanBeside("Codex", g_codexState.plan);
         for (const Codex::UsageBar& b : g_codexState.bars) {
             if (!b.valid) continue;
             peek.valid = true;
@@ -4678,6 +5146,7 @@ static WidgetPeek WidgetPeekSummary()
     case ActiveMainTab::Claude: {
         std::lock_guard<std::mutex> lock(g_claudeMutex);
         peek.host = "Claude";
+        peek.plan = PlanBeside("Claude", g_claudeState.plan);
         const Claude::UsageWindow* w = g_claudeState.currentSession.valid
             ? &g_claudeState.currentSession
             : (g_claudeState.weeklyAllModels.valid ? &g_claudeState.weeklyAllModels : nullptr);
@@ -4693,6 +5162,7 @@ static WidgetPeek WidgetPeekSummary()
     case ActiveMainTab::ZAi: {
         std::lock_guard<std::mutex> lock(g_zaiMutex);
         peek.host = "Z.Ai";
+        peek.plan = PlanBeside("Z.Ai", g_zaiState.plan);
         for (const ZAi::UsageBar& b : g_zaiState.bars) {
             if (!b.valid || b.spendBalance) continue;
             peek.valid = true;
@@ -4707,6 +5177,7 @@ static WidgetPeek WidgetPeekSummary()
     default: {
         std::lock_guard<std::mutex> lock(g_grokMutex);
         peek.host = "Grok";
+        peek.plan = PlanBeside("Grok", g_grokState.plan);
         if (g_grokState.weeklyLimit.valid) {
             peek.valid = true;
             peek.window = g_grokState.weeklyLimit.title;
@@ -4724,33 +5195,38 @@ static WidgetPeek WidgetPeekSummary()
 // Height of the strip for the current font. The app reads this to decide how
 // much of the window to leave on screen when retracted, so it has to be
 // knowable without drawing.
-static float WidgetPeekStripPad() { return 8.0f; }
+static float WidgetPeekStripPad() { return 6.0f; }
 static float WidgetPeekBarHeight() { return 5.0f; }
 
-static float WidgetPeekStripHeight()
+static float WidgetPeekRowHeight()
 {
-    return WidgetPeekStripPad() + ImGui::GetTextLineHeight() + 7.0f
+    return WidgetPeekStripPad() + ImGui::GetTextLineHeight() + 5.0f
         + WidgetPeekBarHeight() + WidgetPeekStripPad();
 }
 
-static void DrawWidgetPeekStrip(float width, bool onTop)
+// The bar is as tall as the rows the user picked. One row is the default.
+static int WidgetPeekRowCount()
 {
-    const WidgetPeek peek = WidgetPeekSummary();
+    const std::string spec = R().widgetBarRows ? *R().widgetBarRows : std::string{};
+    if (spec.empty()) return 1;
 
+    const int rows = static_cast<int>(WidgetPeekRows().size());
+    return rows > 0 ? rows : 1;
+}
+
+static float WidgetPeekStripHeight()
+{
+    return WidgetPeekRowHeight() * static_cast<float>(WidgetPeekRowCount());
+}
+
+static void DrawWidgetPeekRow(const WidgetPeek& peek, float width)
+{
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 c0 = ImGui::GetCursorScreenPos();
     const float pad = WidgetPeekStripPad();
     const float lineH = ImGui::GetTextLineHeight();
     const float barH = WidgetPeekBarHeight();
-    const float height = WidgetPeekStripHeight();
-
-    // Its own slightly lighter ground so the strip still reads as a distinct
-    // band when it is the only thing left on screen.
-    dl->AddRectFilled(c0, ImVec2(c0.x + width, c0.y + height), Color(26, 28, 36, 252));
-    // The divider faces the panel body, which is above the strip at the bottom
-    // edge and below it at the top edge.
-    const float ruleY = onTop ? c0.y + height : c0.y;
-    dl->AddLine(ImVec2(c0.x, ruleY), ImVec2(c0.x + width, ruleY), Color(52, 57, 70), 1.0f);
+    const float height = WidgetPeekRowHeight();
 
     const float x = c0.x + 13.0f;
     const float innerW = width - 26.0f;
@@ -4770,12 +5246,13 @@ static void DrawWidgetPeekStrip(float width, bool onTop)
 
     // Reset without the date suffix: 360px is not enough for both, and the
     // relative time is the part worth reading at a glance.
-    std::string right;
-    if (peek.resetAtUnixSeconds > 0) {
+    std::string right = peek.detail;
+
+    if (right.empty() && peek.resetAtUnixSeconds > 0) {
         right = ResetTime::get_instance()->Format(peek.resetAtUnixSeconds, g_resetDisplayMode, false);
     }
     if (right.empty()) right = peek.resetText;
-    if (right.empty() && peek.valid) {
+    if (right.empty() && peek.valid && peek.resets) {
         right = peek.usedPercent <= 0.0f ? "Not started yet" : "Reset not reported";
     }
 
@@ -4794,16 +5271,62 @@ static void DrawWidgetPeekStrip(float width, bool onTop)
     const float labelX = x + 13.0f;
     const float labelRoom = (valueX - 12.0f - rightW) - labelX - 10.0f;
 
-    std::string label = peek.host;
-    if (!peek.window.empty()) {
-        const std::string full = label + "  ·  " + peek.window;
-        if (ImGui::CalcTextSize(full.c_str()).x <= labelRoom) label = full;
+    // "Codex (Pro 20x)  ·  Weekly", degrading by what matters least first.
+    //
+    // The window name is what tells two rows of the same host apart, so it is
+    // the LAST thing to go - dropping it first left two Codex rows both
+    // reading just "Codex". Order of sacrifice: plan, then host, then finally
+    // truncate the window name itself.
+    const auto fits = [labelRoom](const std::string& text) {
+        return ImGui::CalcTextSize(text.c_str()).x <= labelRoom;
+    };
+
+    // What this row would need to show everything untrimmed. Accumulated across
+    // rows so the window can widen to the longest one.
+    {
+        const std::string sep = "  ·  ";
+        const std::string planned = peek.plan.empty()
+            ? peek.host : peek.host + " (" + peek.plan + ")";
+        const std::string widest = peek.window.empty()
+            ? planned : planned + sep + peek.window;
+
+        const float needed = 13.0f + 13.0f + ImGui::CalcTextSize(widest.c_str()).x
+            + 10.0f + rightW + 12.0f + valueW + 13.0f;
+
+        g_widgetContentWidthAccum = (std::max)(g_widgetContentWidthAccum, needed);
     }
-    if (ImGui::CalcTextSize(label.c_str()).x <= labelRoom) {
+
+    std::string label;
+    if (peek.window.empty()) {
+        label = peek.plan.empty() ? peek.host : peek.host + " (" + peek.plan + ")";
+    }
+    else {
+        const std::string sep = "  ·  ";
+        const std::string planned = peek.plan.empty()
+            ? peek.host : peek.host + " (" + peek.plan + ")";
+
+        if (fits(planned + sep + peek.window)) label = planned + sep + peek.window;
+        else if (fits(peek.host + sep + peek.window)) label = peek.host + sep + peek.window;
+        else label = peek.window;
+    }
+
+    if (!fits(label)) {
+        // Still too wide: clip with an ellipsis rather than print nothing.
+        const std::string ellipsis = "…";
+        while (!label.empty() && !fits(label + ellipsis)) {
+            // Step back over a whole UTF-8 code point, not a single byte.
+            do { label.pop_back(); }
+            while (!label.empty() &&
+                (static_cast<unsigned char>(label.back()) & 0xC0) == 0x80);
+        }
+        if (!label.empty()) label += ellipsis;
+    }
+
+    if (!label.empty()) {
         dl->AddText(ImVec2(labelX, y), Color(158, 166, 186), label.c_str());
     }
 
-    y += lineH + 7.0f;
+    y += lineH + 5.0f;
 
     // The same bar the cards use, so the strip is a real reading and not a
     // second visual language for the same number.
@@ -4815,6 +5338,144 @@ static void DrawWidgetPeekStrip(float width, bool onTop)
 
     ImGui::SetCursorScreenPos(ImVec2(c0.x, c0.y + height));
     ImGui::Dummy(ImVec2(width, 0.0f));
+}
+
+static void DrawWidgetPeekStrip(float width, bool onTop)
+{
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 c0 = ImGui::GetCursorScreenPos();
+    const float height = WidgetPeekStripHeight();
+
+    // Its own slightly lighter ground so the bar still reads as a distinct
+    // band when it is the only thing left on screen.
+    dl->AddRectFilled(c0, ImVec2(c0.x + width, c0.y + height), Color(26, 28, 36, 252));
+
+    // The divider faces the panel body, which is above the bar at the bottom
+    // edge and below it at the top edge.
+    const float ruleY = onTop ? c0.y + height : c0.y;
+    dl->AddLine(ImVec2(c0.x, ruleY), ImVec2(c0.x + width, ruleY), Color(52, 57, 70), 1.0f);
+
+    const std::vector<WidgetPeek>& rows = WidgetPeekRows();
+    std::vector<std::string> keys = WidgetBarKeys();
+
+    // Applied after the loop: mutating the list mid-iteration invalidates the
+    // indices the drop handlers were computed from.
+    bool keysChanged = false;
+    int dropAt = -1;
+    std::string dropKey;
+    int removeAt = -1;
+    int moveFrom = -1;
+    int moveTo = -1;
+
+    const float rowH = WidgetPeekRowHeight();
+
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const ImVec2 rowTop(c0.x, c0.y + rowH * static_cast<float>(i));
+
+        if (i > 0) {
+            dl->AddLine(ImVec2(rowTop.x + 13.0f, rowTop.y),
+                ImVec2(rowTop.x + width - 13.0f, rowTop.y), Color(42, 46, 58), 1.0f);
+        }
+
+        // Hit area first, painting second, so the row draws over it.
+        ImGui::SetCursorScreenPos(rowTop);
+        ImGui::PushID(static_cast<int>(i));
+        ImGui::InvisibleButton("##bar_row", ImVec2(width, rowH),
+            ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
+
+        const bool hovered = ImGui::IsItemHovered();
+
+        // Right-click unpins. Only meaningful once the list is explicit.
+        if (!keys.empty() && i < keys.size() &&
+            ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+            removeAt = static_cast<int>(i);
+        }
+
+        if (!keys.empty() && i < keys.size() &&
+            ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
+            const int from = static_cast<int>(i);
+            ImGui::SetDragDropPayload("AQC_BAR_MOVE", &from, sizeof(from));
+            ImGui::TextUnformatted(keys[i].c_str());
+            ImGui::EndDragDropSource();
+        }
+
+        if (ImGui::BeginDragDropTarget()) {
+            if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("AQC_BAR_KEY")) {
+                dropKey.assign(static_cast<const char*>(p->Data));
+                dropAt = static_cast<int>(i);
+            }
+            if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("AQC_BAR_MOVE")) {
+                moveFrom = *static_cast<const int*>(p->Data);
+                moveTo = static_cast<int>(i);
+            }
+            dl->AddLine(rowTop, ImVec2(rowTop.x + width, rowTop.y),
+                Color(96, 156, 240), 2.0f);
+            ImGui::EndDragDropTarget();
+        }
+        else if (hovered && !keys.empty()) {
+            dl->AddRectFilled(rowTop, ImVec2(rowTop.x + width, rowTop.y + rowH),
+                Color(255, 255, 255, 10));
+            ImGui::SetTooltip("Drag to reorder  ·  right-click to unpin");
+        }
+
+        ImGui::PopID();
+
+        ImGui::SetCursorScreenPos(rowTop);
+        DrawWidgetPeekRow(rows[i], width);
+    }
+
+    // Below the last row: dropping here appends rather than inserting.
+    {
+        const float tailTop = c0.y + rowH * static_cast<float>(rows.size());
+        const float tailH = (c0.y + height) - tailTop;
+
+        if (tailH > 1.0f) {
+            ImGui::SetCursorScreenPos(ImVec2(c0.x, tailTop));
+            ImGui::InvisibleButton("##bar_tail", ImVec2(width, tailH));
+
+            if (ImGui::BeginDragDropTarget()) {
+                if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("AQC_BAR_KEY")) {
+                    dropKey.assign(static_cast<const char*>(p->Data));
+                    dropAt = static_cast<int>(keys.size());
+                }
+                ImGui::EndDragDropTarget();
+            }
+        }
+    }
+
+    if (!dropKey.empty()) {
+        // Dropping onto the implicit "follow the open tab" bar makes the list
+        // explicit, starting with what was just dropped.
+        std::vector<std::string>::iterator existing =
+            std::find(keys.begin(), keys.end(), dropKey);
+
+        if (existing != keys.end()) keys.erase(existing);
+
+        const size_t at = std::min(static_cast<size_t>(std::max(0, dropAt)), keys.size());
+        keys.insert(keys.begin() + static_cast<long long>(at), dropKey);
+        keysChanged = true;
+    }
+    else if (moveFrom >= 0 && moveTo >= 0 && moveFrom != moveTo &&
+        moveFrom < static_cast<int>(keys.size()) && moveTo < static_cast<int>(keys.size())) {
+        const std::string moved = keys[static_cast<size_t>(moveFrom)];
+        keys.erase(keys.begin() + moveFrom);
+        keys.insert(keys.begin() + moveTo, moved);
+        keysChanged = true;
+    }
+    else if (removeAt >= 0 && removeAt < static_cast<int>(keys.size())) {
+        keys.erase(keys.begin() + removeAt);
+        keysChanged = true;
+    }
+
+    if (keysChanged) {
+        SetWidgetBarKeys(keys);
+    }
+
+    ImGui::SetCursorScreenPos(ImVec2(c0.x, c0.y + height));
+    ImGui::Dummy(ImVec2(width, 0.0f));
+
+    g_widgetContentWidth = g_widgetContentWidthAccum;
+    g_widgetContentWidthAccum = 0.0f;
 }
 
 // One custom pill tab: provider icon, optional name, selected highlight, and a
@@ -5210,6 +5871,11 @@ int WidgetDesiredHeight()
 int WidgetPeekHeight()
 {
     return static_cast<int>(g_widgetPeekHeight + 0.5f);
+}
+
+int WidgetDesiredWidth()
+{
+    return static_cast<int>(g_widgetContentWidth + 0.5f);
 }
 
 void RenderSettingsUi(State& state)

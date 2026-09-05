@@ -1311,9 +1311,25 @@ namespace Codex {
     }
 
     static std::string HumanizeIdentifier(std::string text) {
-        for (char& c : text) {
-            if (c == '_' || c == '-' || c == '/' || c == '.') {
-                c = ' ';
+        // A dot between digits is a version number, not a word break. Splitting
+        // on it turned "gpt-5.3-codex-spark" into "Gpt 5 3 Codex Spark".
+        for (size_t i = 0; i < text.size(); ++i) {
+            const char c = text[i];
+
+            if (c == '_' || c == '-' || c == '/') {
+                text[i] = ' ';
+                continue;
+            }
+
+            if (c != '.') continue;
+
+            const bool digitBefore = i > 0 &&
+                std::isdigit(static_cast<unsigned char>(text[i - 1])) != 0;
+            const bool digitAfter = i + 1 < text.size() &&
+                std::isdigit(static_cast<unsigned char>(text[i + 1])) != 0;
+
+            if (!digitBefore || !digitAfter) {
+                text[i] = ' ';
             }
         }
 
@@ -1335,21 +1351,95 @@ namespace Codex {
         }
 
         while (!output.empty() && output.back() == ' ') output.pop_back();
+
+        // Word-by-word acronym pass: title casing alone gives "Gpt", "Api".
+        static const char* const kAcronyms[] = { "gpt", "api", "gpu", "cpu", "ai", "id", "url" };
+
+        size_t start = 0;
+        while (start < output.size()) {
+            size_t end = output.find(' ', start);
+            if (end == std::string::npos) end = output.size();
+
+            std::string word = output.substr(start, end - start);
+            std::string lower = word;
+            std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+
+            for (const char* acronym : kAcronyms) {
+                if (lower != acronym) continue;
+                std::transform(word.begin(), word.end(), word.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::toupper(c));
+                });
+                output.replace(start, end - start, word);
+                break;
+            }
+
+            start = end + 1;
+        }
+
         return output;
     }
 
+    // "GPT-5.3-Codex-Spark" -> "GPT-5.3 Codex Spark".
+    //
+    // The model and its version stay hyphenated; everything after becomes
+    // words. Anything not GPT-prefixed just loses its hyphens.
+    static std::string FormatCodexLimitName(const std::string& displayName) {
+        std::vector<std::string> parts;
+        std::string current;
+
+        for (char c : displayName) {
+            if (c == '-') {
+                if (!current.empty()) parts.push_back(current);
+                current.clear();
+                continue;
+            }
+            current.push_back(c);
+        }
+        if (!current.empty()) parts.push_back(current);
+
+        if (parts.size() < 2) {
+            return displayName;
+        }
+
+        std::string head = parts[0];
+        std::transform(head.begin(), head.end(), head.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+
+        std::string out;
+
+        if (head == "gpt") {
+            out = "GPT-" + parts[1];
+            for (size_t i = 2; i < parts.size(); ++i) out += " " + parts[i];
+            return out;
+        }
+
+        for (size_t i = 0; i < parts.size(); ++i) {
+            if (i > 0) out.push_back(' ');
+            out += parts[i];
+        }
+        return out;
+    }
+
     static std::string AppServerRateLimitName(const json& rateLimit, const std::string& fallbackKey) {
-        std::string name = ReadStringFlexible(rateLimit, { "limitName", "limit_name" });
+        // limit_name arrives already display-cased from the server; running it
+        // through HumanizeIdentifier was destroying it (hyphens to spaces, then
+        // "5.3" split into "5 3"). Only the id/key fallbacks are real slugs.
+        const std::string display = ReadStringFlexible(rateLimit, { "limitName", "limit_name" });
 
-        if (name.empty()) {
-            name = ReadStringFlexible(rateLimit, { "limitId", "limit_id" });
+        if (!display.empty()) {
+            return FormatCodexLimitName(display);
         }
 
-        if (name.empty()) {
-            name = fallbackKey;
+        std::string slug = ReadStringFlexible(rateLimit, { "limitId", "limit_id" });
+
+        if (slug.empty()) {
+            slug = fallbackKey;
         }
 
-        name = HumanizeIdentifier(name);
+        const std::string name = HumanizeIdentifier(slug);
         return name.empty() ? "Codex" : name;
     }
 

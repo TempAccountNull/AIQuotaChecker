@@ -28,6 +28,8 @@ namespace Renderer
         const char* const* widgetMonitorNames = nullptr;
         int widgetMonitorCount = 0;
         std::string* widgetOrder = nullptr;
+        // Ordered "<provider>:<window>" keys shown in the collapsed bar.
+        std::string* widgetBarRows = nullptr;
         int* uiFontSize = nullptr;
         int* widgetSections = nullptr;
         // Raised by the widget footer; the app opens a separate settings window.
@@ -110,6 +112,8 @@ namespace Renderer
     // Height in pixels the widget's content wants, measured during the last
     // DrawWidgetUi. Zero until the widget has drawn at least one frame.
     int WidgetDesiredHeight();
+    // Width the widest bar row needs to render untrimmed. Zero until measured.
+    int WidgetDesiredWidth();
     // Height of the bottom summary strip. The widget retracts to exactly this,
     // so the selected host's quota stays readable while rolled up.
     int WidgetPeekHeight();

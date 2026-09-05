@@ -313,6 +313,7 @@ namespace AppSettings
             ReadInt(L"UI", L"WidgetAnchor", settings.widgetAnchor, path));
         settings.widgetMonitor = (std::max)(0,
             ReadInt(L"UI", L"WidgetMonitor", settings.widgetMonitor, path));
+        settings.widgetBarRows = ReadUtf8(L"UI", L"WidgetBarRows", settings.widgetBarRows, path);
         settings.widgetOrder = ReadUtf8(L"UI", L"WidgetOrder", settings.widgetOrder, path);
         settings.showResetDateDetails = ReadBool(L"UI", L"ShowResetDateDetails", settings.showResetDateDetails, path);
         settings.resetDisplayMode = ClampResetDisplayMode(ReadInt(L"UI", L"ResetDisplayMode", settings.resetDisplayMode, path));
@@ -386,6 +387,7 @@ namespace AppSettings
         ok = WriteInt(L"UI", L"WidgetSectionsV2", settings.widgetSections & kWidgetSectionAll, path) && ok;
         ok = WriteInt(L"UI", L"WidgetAnchor", ClampWidgetAnchor(settings.widgetAnchor), path) && ok;
         ok = WriteInt(L"UI", L"WidgetMonitor", (std::max)(0, settings.widgetMonitor), path) && ok;
+        ok = WriteUtf8(L"UI", L"WidgetBarRows", settings.widgetBarRows, path) && ok;
         ok = WriteUtf8(L"UI", L"WidgetOrder", settings.widgetOrder, path) && ok;
         ok = WriteBool(L"UI", L"ShowResetDateDetails", settings.showResetDateDetails, path) && ok;
         ok = WriteInt(L"UI", L"ResetDisplayMode", ClampResetDisplayMode(settings.resetDisplayMode), path) && ok;

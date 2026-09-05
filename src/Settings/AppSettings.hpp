@@ -60,6 +60,10 @@ namespace AppSettings
         // Which monitor it parks on, as an index into the app's enumerated
         // list. Clamped against the live monitor count on use.
         int widgetMonitor = 0;
+        // Which rows the collapsed bar shows, as an ordered comma-separated
+        // list of "<provider>:<window>" keys. Empty means "whatever host is
+        // selected", the original single-row behaviour.
+        std::string widgetBarRows;
         // Host order in the widget, as a comma-separated key list.
         std::string widgetOrder = "codex,claude,zai,grok";
         int resetDisplayMode = 0;
