@@ -51,6 +51,9 @@ namespace AppSettings
         bool showResetDateDetails = false;
         bool widgetMode = false;
         bool widgetPinned = false;
+        // Whether the widget floats above other windows. Off puts it in the
+        // normal z-order, where it can be covered like any other window.
+        bool widgetAlwaysOnTop = true;
         // Interface font size in points for the custom panels.
         int uiFontSize = 14;
         // Which sections the widget renders. Bit set = shown.

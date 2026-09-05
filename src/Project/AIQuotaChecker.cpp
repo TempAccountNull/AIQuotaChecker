@@ -101,6 +101,10 @@ namespace
     // Pinned keeps the panel down: no auto-retract, only the hover slide is
     // suppressed - the pill still toggles it back.
     static bool g_widgetPinned = false;
+    static bool g_widgetAlwaysOnTop = true;
+    // Last topmost state actually applied to the window, so a Settings change
+    // can be detected and applied without touching z-order every frame.
+    static bool g_widgetTopmostApplied = true;
     // True once the slide has reached its target, so a later position change
     // can be attributed to the user dragging the panel rather than to us.
     static bool g_widgetSettled = false;
@@ -369,6 +373,7 @@ namespace
         g_widgetMode = true;
 #endif
         g_widgetPinned = settings.widgetPinned;
+        g_widgetAlwaysOnTop = settings.widgetAlwaysOnTop;
         g_widgetAnchor = AppSettings::ClampWidgetAnchor(settings.widgetAnchor);
         g_widgetMonitor = ClampWidgetMonitor(settings.widgetMonitor);
         g_widgetOrder = settings.widgetOrder;
@@ -406,6 +411,7 @@ namespace
         settings.showRemaining = g_showRemaining;
         settings.widgetMode = g_widgetMode;
         settings.widgetPinned = g_widgetPinned;
+        settings.widgetAlwaysOnTop = g_widgetAlwaysOnTop;
         settings.widgetAnchor = AppSettings::ClampWidgetAnchor(g_widgetAnchor);
         settings.widgetMonitor = g_widgetMonitor;
         settings.widgetOrder = g_widgetOrder;
@@ -782,7 +788,7 @@ namespace
         SetWindowLongPtrW(
             g_hwnd,
             GWL_EXSTYLE,
-            GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE) | WS_EX_TOOLWINDOW | WS_EX_TOPMOST
+            GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE) | WS_EX_TOOLWINDOW
         );
 
         // Park at the stored anchor and roll into whichever edge it sits on,
@@ -799,13 +805,15 @@ namespace
 
         SetWindowPos(
             g_hwnd,
-            HWND_TOPMOST,
+            g_widgetAlwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST,
             rest.left,
             rest.top,
             rest.right - rest.left,
             rest.bottom - rest.top,
             SWP_SHOWWINDOW | SWP_FRAMECHANGED
         );
+
+        g_widgetTopmostApplied = g_widgetAlwaysOnTop;
     }
 
     static void LeaveWidgetMode()
@@ -901,6 +909,25 @@ namespace
     // Move the panel to the current monitor/anchor now, rather than waiting for
     // the user to drag it. Called when the Settings pickers change and when the
     // display layout does.
+    // Float above other windows, or sit in the normal z-order. SetWindowPos is
+    // the supported way to change WS_EX_TOPMOST after creation; setting the
+    // style bit directly does not re-order the window.
+    static void ApplyWidgetTopmost(bool force)
+    {
+        if (!g_hwnd || (!force && g_widgetTopmostApplied == g_widgetAlwaysOnTop)) {
+            return;
+        }
+
+        g_widgetTopmostApplied = g_widgetAlwaysOnTop;
+
+        SetWindowPos(
+            g_hwnd,
+            g_widgetAlwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST,
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+        );
+    }
+
     static void RepositionWidget()
     {
         if (!g_widgetMode || !g_hwnd) {
@@ -942,6 +969,7 @@ namespace
         }
 
         g_widgetWork = WidgetMonitorWork();
+        ApplyWidgetTopmost(false);
 
         POINT cursor{};
         const bool hovered = GetCursorPos(&cursor) && PtInRect(&rect, cursor);
@@ -1343,6 +1371,7 @@ namespace
         g_rendererState.minimizeRequest = &g_minimizeRequest;
         g_rendererState.widgetMode = &g_widgetMode;
         g_rendererState.widgetPinned = &g_widgetPinned;
+        g_rendererState.widgetAlwaysOnTop = &g_widgetAlwaysOnTop;
         g_rendererState.widgetAnchor = &g_widgetAnchor;
         g_rendererState.widgetMonitor = &g_widgetMonitor;
         g_rendererState.widgetMonitorNames = g_monitorLabelPtrs.data();

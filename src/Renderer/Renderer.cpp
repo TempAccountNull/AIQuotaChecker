@@ -4150,6 +4150,19 @@ static void DrawWidgetPlacementSettings(float contentWidth)
     }
 
     ImGui::Spacing();
+
+    if (R().widgetAlwaysOnTop) {
+        if (ImGui::Checkbox("Always on top", R().widgetAlwaysOnTop)) {
+            if (R().saveAppSettings) R().saveAppSettings();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", *R().widgetAlwaysOnTop
+                ? "The widget floats above other windows."
+                : "The widget sits in the normal z-order and can be covered.");
+        }
+    }
+
+    ImGui::Spacing();
     DrawSettingsMutedText("Parking spot");
     DrawWidgetAnchorGrid();
     DrawSettingsMutedText("Snapping and rolling away are relative to this monitor only.");

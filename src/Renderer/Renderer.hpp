@@ -21,6 +21,7 @@ namespace Renderer
         bool* minimizeRequest = nullptr;
         bool* widgetMode = nullptr;
         bool* widgetPinned = nullptr;
+        bool* widgetAlwaysOnTop = nullptr;
         // AppSettings::WidgetAnchor: which edge the panel parks against.
         int* widgetAnchor = nullptr;
         // Which monitor it parks on, plus the picker's labels.

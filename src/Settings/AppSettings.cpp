@@ -303,6 +303,8 @@ namespace AppSettings
         settings.showRemaining = ReadBool(L"UI", L"ShowRemaining", settings.showRemaining, path);
         settings.widgetMode = ReadBool(L"UI", L"WidgetMode", settings.widgetMode, path);
         settings.widgetPinned = ReadBool(L"UI", L"WidgetPinned", settings.widgetPinned, path);
+        settings.widgetAlwaysOnTop =
+            ReadBool(L"UI", L"WidgetAlwaysOnTop", settings.widgetAlwaysOnTop, path);
         settings.uiFontSize = ClampUiFontSize(ReadInt(L"UI", L"FontSize", settings.uiFontSize, path));
         // V2 key: the section list grew past the original 7 bits, so a stored
         // 0x7F would silently hide every new section. A new key lets existing
@@ -383,6 +385,7 @@ namespace AppSettings
         ok = WriteBool(L"UI", L"ShowRemaining", settings.showRemaining, path) && ok;
         ok = WriteBool(L"UI", L"WidgetMode", settings.widgetMode, path) && ok;
         ok = WriteBool(L"UI", L"WidgetPinned", settings.widgetPinned, path) && ok;
+        ok = WriteBool(L"UI", L"WidgetAlwaysOnTop", settings.widgetAlwaysOnTop, path) && ok;
         ok = WriteInt(L"UI", L"FontSize", ClampUiFontSize(settings.uiFontSize), path) && ok;
         ok = WriteInt(L"UI", L"WidgetSectionsV2", settings.widgetSections & kWidgetSectionAll, path) && ok;
         ok = WriteInt(L"UI", L"WidgetAnchor", ClampWidgetAnchor(settings.widgetAnchor), path) && ok;
