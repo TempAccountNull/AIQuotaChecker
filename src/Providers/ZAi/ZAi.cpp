@@ -8,7 +8,10 @@
 #include "Format.hpp"
 
 #include <windows.h>
+#include <bcrypt.h>
+#include <shlobj.h>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cctype>
 #include <cmath>
@@ -16,346 +19,998 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <initializer_list>
+#include <limits>
+#include <locale>
 #include <optional>
 #include <regex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include <nlohmann/json.hpp>
+
+#pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uuid.lib")
 
 using json = nlohmann::json;
 
 namespace ZAi
 {
-    static bool LooksLikeToken(const std::string& text)
+    // Credential storage, billing parsing, and requests stay private to ZAi.cpp.
+    namespace
     {
-        if (text.size() < 32 || text.size() > 8192) {
-            return false;
-        }
+        namespace Protocol
+        {
+            using Json = nlohmann::json;
+            inline constexpr const char* AppVersion = "3.14.0";
+            inline constexpr const char* BalanceUrl =
+                "https://zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=3.14.0";
+            inline constexpr const char* QuotaUrl = "https://api.z.ai/api/monitor/usage/quota/limit";
+            inline constexpr const char* SubscriptionUrl = "https://api.z.ai/api/biz/subscription/list";
+            inline constexpr const char* McpUrl = "https://zcode.z.ai/api/v1/mcp/usage";
 
-        if (text.find(' ') != std::string::npos || text.find('\n') != std::string::npos || text.find('\r') != std::string::npos) {
-            return false;
-        }
+            inline std::string Trim(std::string text)
+            {
+                const auto first = text.find_first_not_of(" \t\r\n");
+                if (first == std::string::npos) return {};
+                return text.substr(first, text.find_last_not_of(" \t\r\n") - first + 1);
+            }
 
-        if (text.rfind("Bearer ", 0) == 0) {
-            return text.size() > 40;
-        }
+            inline std::string Lower(std::string text)
+            {
+                for (char& ch : text) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                return text;
+            }
 
-        size_t dot1 = text.find('.');
-        size_t dot2 = dot1 == std::string::npos ? std::string::npos : text.find('.', dot1 + 1);
+            inline std::string String(const Json& object, const char* key)
+            {
+                if (!object.is_object()) return {};
+                const auto it = object.find(key);
+                return it != object.end() && it->is_string() ? Trim(it->get<std::string>()) : std::string{};
+            }
 
-        if (dot1 != std::string::npos && dot2 != std::string::npos) {
-            return true;
-        }
+            inline std::optional<double> Number(const Json& value)
+            {
+                double number = 0;
+                if (value.is_number()) number = value.get<double>();
+                else if (value.is_string()) {
+                    // Classic locale, full consumption, and finite-only: never turn "1junk",
+                    // booleans, null, NaN, or infinity into a quota or an integer timestamp.
+                    std::istringstream input(Trim(value.get<std::string>()));
+                    input.imbue(std::locale::classic());
+                    if (!(input >> number)) return {};
+                    input >> std::ws;
+                    if (!input.eof()) return {};
+                }
+                else return {};
+                return std::isfinite(number) ? std::optional<double>(number) : std::nullopt;
+            }
 
-        return text.size() >= 48;
-    }
+            inline std::optional<double> Number(const Json& object, const char* key)
+            {
+                if (!object.is_object()) return {};
+                const auto it = object.find(key);
+                return it == object.end() ? std::nullopt : Number(*it);
+            }
 
+            inline std::optional<double> NonNegative(const Json& object, const char* key)
+            {
+                auto n = Number(object, key);
+                return n && *n >= 0 ? n : std::nullopt;
+            }
 
-    static void CollectJsonTokens(const json& value, std::vector<std::string>& tokens)
-    {
-        if (value.is_object()) {
-            for (auto it = value.begin(); it != value.end(); ++it) {
-                std::string key = Text::get_instance()->ToLowerCopy(it.key());
+            inline long long Epoch(const Json& object, const char* key)
+            {
+                auto n = Number(object, key);
+                if (!n || *n <= 0) return 0;
+                double seconds = *n > 100000000000.0 ? *n / 1000.0 : *n;
+                // Bound to year 9999 before any floating-point -> integer conversion.
+                return seconds <= 253402300799.0 ? static_cast<long long>(seconds) : 0;
+            }
 
-                if (it.value().is_string()) {
-                    std::string text = it.value().get<std::string>();
+            inline const Json* Data(const Json& root, bool requireCodeZero = false)
+            {
+                if (!root.is_object()) return nullptr;
+                auto success = root.find("success");
+                if (success != root.end() && (!success->is_boolean() || !success->get<bool>())) return nullptr;
+                auto code = root.find("code");
+                if (code != root.end()) {
+                    const auto n = Number(*code);
+                    if (!n || (*n != 0 && (requireCodeZero || *n != 200))) return nullptr;
+                }
+                else if (requireCodeZero || success == root.end()) return nullptr;
+                auto data = root.find("data");
+                return data != root.end() && !data->is_null() ? &*data : nullptr;
+            }
 
-                    if ((key.find("zcodejwttoken") != std::string::npos ||
-                        key.find("zcode_jwt") != std::string::npos ||
-                        key.find("jwt") != std::string::npos ||
-                        key.find("access_token") != std::string::npos ||
-                        key.find("accesstoken") != std::string::npos ||
-                        key.find("api_key") != std::string::npos ||
-                        key.find("apikey") != std::string::npos ||
-                        key.find("token") != std::string::npos) && LooksLikeToken(text)) {
-                        tokens.push_back(text);
+            inline std::string ModelLabel(const Json& item, const std::string& fallback)
+            {
+                for (const char* key : { "show_name", "displayName", "model", "model_name", "modelName" }) {
+                    auto label = String(item, key);
+                    if (!label.empty()) return label;
+                }
+                std::string models;
+                auto caps = item.find("capabilities");
+                if (caps != item.end() && caps->is_array()) {
+                    std::set<std::string> seen;
+                    for (const auto& cap : *caps) {
+                        if (!cap.is_string()) continue;
+                        auto text = Trim(cap.get<std::string>());
+                        if (Lower(text).rfind("model:", 0) != 0) continue;
+                        text = Trim(text.substr(6));
+                        if (text.empty() || !seen.insert(Lower(text)).second) continue;
+                        if (!models.empty()) models += ", ";
+                        models += text;
                     }
                 }
+                if (!models.empty()) return models;
+                for (const char* key : { "name", "entitlement_id", "meter" }) {
+                    auto label = String(item, key);
+                    if (!label.empty()) return label;
+                }
+                return fallback;
+            }
 
-                CollectJsonTokens(it.value(), tokens);
+            inline std::string Count(double value)
+            {
+                // Streaming does not overflow an integer for large but finite server values.
+                std::ostringstream out;
+                out.imbue(std::locale::classic());
+                out << std::fixed << std::setprecision(0) << value;
+                std::string text = out.str();
+                for (std::ptrdiff_t pos = static_cast<std::ptrdiff_t>(text.size()) - 3; pos > 0; pos -= 3)
+                    text.insert(static_cast<size_t>(pos), ",");
+                return text;
+            }
+
+            inline void SetStyle(UsageBar& bar)
+            {
+                bar.valid = true;
+                bar.green = true;
+                bar.red = bar.white = bar.thin = false;
+            }
+
+            inline bool ExpiredPlan(const Json& plan, long long now)
+            {
+                const auto status = Lower(String(plan, "status"));
+                const auto end = Epoch(plan, "ends_at");
+                return status == "expired" || (status == "active" && end > 0 && end <= now);
+            }
+
+            inline bool StartPlan(const Json& plan, long long now)
+            {
+                if (Lower(String(plan, "status")) != "active" || ExpiredPlan(plan, now)) return false;
+                const auto id = Lower(String(plan, "plan_id"));
+                const auto name = Lower(String(plan, "name"));
+                return id.find("start-plan") != std::string::npos || id.find("start plan") != std::string::npos ||
+                    name.find("start plan") != std::string::npos || name.find("start-plan") != std::string::npos;
+            }
+
+            inline bool MatchesPlan(const Json& bucket, const Json& plan)
+            {
+                const auto user = String(bucket, "user_plan_id");
+                const auto otherUser = String(plan, "user_plan_id");
+                if (!user.empty() && !otherUser.empty()) return user == otherUser;
+                const auto id = String(bucket, "plan_id");
+                return !id.empty() && id == String(plan, "plan_id");
+            }
+
+            struct StartResult
+            {
+                bool activePlan = false;
+                bool usable = false;
+                std::string error;
+            };
+
+            inline StartResult ApplyStartPlan(Snapshot& snapshot, const Json& root,
+                long long localNow, long long httpDate = 0)
+            {
+                const auto* data = Data(root, true);
+                if (!data || !data->is_object() || !data->contains("plans") || !data->at("plans").is_array())
+                    return { false, false, "Start Plan returned an invalid billing envelope" };
+                const auto serverNow = Epoch(*data, "server_time");
+                const auto now = httpDate > 0 ? httpDate : (serverNow > 0 ? serverNow : localNow);
+                const auto& plans = data->at("plans");
+                const Json* active = nullptr;
+                for (const auto& plan : plans) {
+                    if (StartPlan(plan, now)) { active = &plan; break; }
+                }
+                if (!active) return { false, false, "No active ZCode Start Plan was returned for the signed-in account" };
+                const auto planName = String(*active, "name");
+                snapshot.plan = "Z.Ai " + (planName.empty() ? "Start Plan" : planName);
+                const auto balances = data->find("balances");
+                if (balances == data->end() || !balances->is_array())
+                    return { true, false, "The active Start Plan returned no balance array" };
+                std::set<std::string> seen;
+                const size_t before = snapshot.bars.size();
+                for (const auto& balance : *balances) {
+                    if (!balance.is_object()) continue;
+                    bool matched = false, nonExpired = false;
+                    std::string period;
+                    for (const auto& plan : plans) {
+                        if (!MatchesPlan(balance, plan)) continue;
+                        matched = true;
+                        if (!ExpiredPlan(plan, now)) nonExpired = true;
+                        const auto entries = plan.find("entitlements");
+                        if (entries == plan.end() || !entries->is_array()) continue;
+                        for (const auto& entry : *entries) {
+                            if (String(entry, "entitlement_id") == String(balance, "entitlement_id"))
+                                period = String(entry, "period");
+                        }
+                    }
+                    if (matched && !nonExpired) continue;
+                    const auto reset = Epoch(balance, "expires_at");
+                    const auto periodStart = Epoch(balance, "period_start");
+                    const auto periodEnd = Epoch(balance, "period_end");
+                    if ((reset > 0 && reset <= now) || (periodStart > 0 && periodStart > now) ||
+                        (periodEnd > 0 && periodEnd <= now)) continue;
+                    auto total = NonNegative(balance, "total_units");
+                    auto used = NonNegative(balance, "used_units");
+                    auto remaining = NonNegative(balance, "remaining_units");
+                    if (!total && used && remaining && std::isfinite(*used + *remaining)) total = *used + *remaining;
+                    if (!total || *total <= 0 || (!remaining && !used)) continue;
+                    if (!remaining) remaining = std::max(0.0, *total - *used);
+                    const double available = std::clamp(*remaining, 0.0, *total);
+                    UsageBar bar;
+                    bar.label = ModelLabel(balance, "Usage credits");
+                    // A model can have several buckets (e.g. purchased/off-peak/daily).
+                    // Do not deduplicate by display name or combine independent windows.
+                    bar.identity = "start:" + Json::array({ String(balance, "bucket_id"),
+                        String(balance, "user_plan_id"), String(balance, "plan_id"),
+                        String(balance, "entitlement_id"), String(balance, "meter"),
+                        String(balance, "unit_type"), Epoch(balance, "period_start"),
+                        Epoch(balance, "period_end"), reset, bar.label }).dump();
+                    if (!seen.insert(bar.identity).second) continue;
+                    bar.spendBalance = true;
+                    // Start balances report remaining/total. Coding quota percentage below
+                    // has the OPPOSITE meaning and scale; do not share the heuristic.
+                    bar.usedPercent = static_cast<float>(std::clamp(100.0 * (1.0 - available / *total), 0.0, 100.0));
+                    bar.sublabel = Count(available) + " / " + Count(*total) + " left";
+                    if (!period.empty()) bar.sublabel += " | " + period;
+                    bar.resetAtUnixSeconds = reset;
+                    SetStyle(bar);
+                    snapshot.bars.push_back(std::move(bar));
+                }
+                const bool usable = snapshot.bars.size() > before;
+                return { true, usable, usable ? "" : "The active Start Plan returned no usable, unexpired balances" };
+            }
+
+            inline std::string PeriodLabel(const Json& limit)
+            {
+                auto unit = Number(limit, "unit"), number = Number(limit, "number");
+                if (!unit || std::floor(*unit) != *unit) return {};
+                int count = number && *number >= 1 && *number <= 10000 && std::floor(*number) == *number
+                    ? static_cast<int>(*number) : 1;
+                if (*unit == 3) return std::to_string(count) + "-hour";
+                if (*unit == 5) return count == 1 ? "Monthly" : std::to_string(count) + "-month";
+                if (*unit == 6) return count == 1 ? "Weekly" : std::to_string(count) + "-week";
+                return {};
+            }
+
+            inline bool ApplyCodingQuota(Snapshot& snapshot, const Json& root)
+            {
+                const auto* data = Data(root);
+                if (!data || !data->is_object()) return false;
+                const auto limits = data->find("limits");
+                if (limits == data->end() || !limits->is_array()) return false;
+                size_t before = snapshot.bars.size();
+                std::set<std::string> seen;
+                for (const auto& limit : *limits) {
+                    if (!limit.is_object()) continue;
+                    const auto type = String(limit, "type");
+                    if (type.empty()) continue;
+                    // unit/number describe PERIODS, never capacities. Prefer the wire's
+                    // explicit used percentage: 1 is one percent, NOT 100% or 99% used.
+                    auto percent = Number(limit, "percentage");
+                    const auto used = NonNegative(limit, "currentValue");
+                    const auto remaining = NonNegative(limit, "remaining");
+                    if (!percent && used && remaining && std::isfinite(*used + *remaining) && *used + *remaining > 0)
+                        percent = 100.0 * (*used / (*used + *remaining));
+                    if (!percent) continue;
+                    UsageBar bar;
+                    std::string kind = type == "TIME_LIMIT" ? "Tools" :
+                        (type == "TOKENS_LIMIT" || type == "CREDIT_LIMIT") ? "Coding credits" : type;
+                    const auto period = PeriodLabel(limit);
+                    bar.label = period.empty() ? kind : period + " " + kind;
+                    bar.sharedRateLimit = type == "TOKENS_LIMIT" || type == "CREDIT_LIMIT";
+                    bar.resetAtUnixSeconds = Epoch(limit, "nextResetTime");
+                    // Reset times move on every refresh; they are display
+                    // state, not the identity of the coding window used by
+                    // widget drag/drop.
+                    bar.identity = "coding:" + Json::array({ type, Number(limit, "unit").value_or(0),
+                        Number(limit, "number").value_or(0) }).dump();
+                    if (!seen.insert(bar.identity).second) continue;
+                    bar.usedPercent = static_cast<float>(std::clamp(*percent, 0.0, 100.0));
+                    if (remaining) bar.sublabel = Count(*remaining) + " left";
+                    else if (used) bar.sublabel = Count(*used) + " used";
+                    SetStyle(bar);
+                    snapshot.bars.push_back(std::move(bar));
+                }
+                if (snapshot.bars.size() == before) return false;
+                const auto level = String(*data, "level");
+                snapshot.plan = "Z.Ai Individual Plan" + (level.empty() ? "" : " (" + level + ")");
+                return true;
+            }
+
+            inline void ApplySubscription(Snapshot& snapshot, const Json& root)
+            {
+                const auto* data = Data(root);
+                if (!data || !data->is_array()) return;
+                for (const auto& item : *data) {
+                    const auto id = String(item, "productId");
+                    const auto name = String(item, "productName");
+                    const auto current = item.find("inCurrentPeriod");
+                    if (Lower(id + " " + name).find("coding") == std::string::npos ||
+                        String(item, "status") != "VALID" || current == item.end() ||
+                        !current->is_boolean() || !current->get<bool>()) continue;
+                    snapshot.details.push_back({ name.empty() ? id : name, "Subscription", "VALID", "Status" });
+                    return;
+                }
+            }
+
+            inline bool ApplyMcpUsage(Snapshot& snapshot, const Json& root)
+            {
+                const auto* data = Data(root, true);
+                if (!data || !data->is_object()) return false;
+                const auto usage = data->find("total_usage");
+                if (usage == data->end() || !usage->is_object()) return false;
+                const auto used = NonNegative(*usage, "used"), limit = NonNegative(*usage, "limit"),
+                    remaining = NonNegative(*usage, "remaining");
+                // Exact integer counts only, with a safe conversion bound.
+                constexpr double maxCount = 9007199254740991.0;
+                if (!used || !limit || !remaining || *limit <= 0 ||
+                    *used > maxCount || *limit > maxCount || *remaining > maxCount ||
+                    std::floor(*used) != *used || std::floor(*limit) != *limit || std::floor(*remaining) != *remaining) return false;
+                McpUsage mcp;
+                mcp.valid = true;
+                mcp.used = static_cast<long long>(*used);
+                mcp.limit = static_cast<long long>(*limit);
+                mcp.remaining = static_cast<long long>(std::min(*remaining, *limit));
+                mcp.level = String(*data, "level");
+                mcp.nextRefreshAtUnixSeconds = Epoch(*data, "next_refresh_at");
+                snapshot.mcp = std::move(mcp);
+                return true;
+            }
+
+            inline void FinalizeAccess(Snapshot& snapshot)
+            {
+                size_t valid = 0, exhausted = 0;
+                bool rateLimited = false;
+                for (const auto& bar : snapshot.bars) {
+                    if (!bar.valid) continue;
+                    ++valid;
+                    if (UsageTelemetry::IsExhausted(bar.usedPercent)) {
+                        ++exhausted;
+                        rateLimited = rateLimited || bar.sharedRateLimit;
+                    }
+                }
+                if (!valid) {
+                    snapshot.access.state = UsageTelemetry::AccessState::Unavailable;
+                    snapshot.access.detail = "No usable Z.Ai quota was returned";
+                }
+                else {
+                    UsageTelemetry::SetAvailable(snapshot.access);
+                    // A depleted bucket/model must not hide an alternative live balance.
+                    if (rateLimited) {
+                        snapshot.access.state = UsageTelemetry::AccessState::RateLimited;
+                        snapshot.access.detail = "A Coding Plan request window is exhausted; wait for its reset";
+                    }
+                    else if (exhausted == valid) {
+                        snapshot.access.state = UsageTelemetry::AccessState::OutOfUsage;
+                        snapshot.access.detail = "All returned usage allocations are exhausted";
+                    }
+                    else if (exhausted) snapshot.access.detail = "Some usage allocations are exhausted";
+                }
             }
         }
-        else if (value.is_array()) {
-            for (const json& item : value) {
-                CollectJsonTokens(item, tokens);
-            }
-        }
-    }
 
-    static void CollectRegexTokens(const std::string& text, std::vector<std::string>& tokens)
-    {
-        static const std::regex tokenRegex(
-            R"rx((?:zcodejwttoken|zcodeJwtToken|zcode_jwt_token|access_token|accessToken|apiKey|api_key|token)"?\s*[:=]\s*"([^"\r\n]{32,8192})")rx",
-            std::regex_constants::icase
-        );
-
-        for (auto it = std::sregex_iterator(text.begin(), text.end(), tokenRegex); it != std::sregex_iterator(); ++it) {
-            std::string token = (*it)[1].str();
-
-            if (LooksLikeToken(token)) {
-                tokens.push_back(token);
-            }
-        }
-    }
-
-
-    static int ZCodeProviderPriority(const std::string& providerId, bool enabled)
-    {
-        std::string id = Text::get_instance()->ToLowerCopy(providerId);
-
-        if (enabled && id == "builtin:zai-start-plan") {
-            return 0;
-        }
-
-        if (enabled && id == "builtin:zai-coding-plan") {
-            return 1;
-        }
-
-        if (enabled && id.find("zai") != std::string::npos && id.find("plan") != std::string::npos) {
-            return 2;
-        }
-
-        if (enabled && id.find("zai") != std::string::npos) {
-            return 3;
-        }
-
-        if (id == "builtin:zai-start-plan") {
-            return 10;
-        }
-
-        if (id == "builtin:zai-coding-plan") {
-            return 11;
-        }
-
-        if (id.find("zai") != std::string::npos) {
-            return 12;
-        }
-
-        return 50;
-    }
-
-    static std::string FirstConfigToken(const json& object)
-    {
-        const char* keys[] = { "apiKey", "api_key", "accessToken", "access_token", "token", "zcodejwttoken" };
-
-        for (const char* key : keys) {
-            std::string value = JsonUtils::get_instance()->String(object, key);
-
-            if (LooksLikeToken(value)) {
-                return value;
-            }
-        }
-
-        return {};
-    }
-
-    static void CollectZCodeConfigTokens(std::vector<std::string>& tokens)
-    {
-        std::filesystem::path path = Network::get_instance()->UserProfilePath() / ".zcode" / "v2" / "config.json";
-        std::string text = Network::get_instance()->ReadTextFile(path);
-
-        if (text.empty()) {
-            return;
-        }
-
-        json root;
-
-        try {
-            root = JsonUtils::get_instance()->ParseRequired(text);
-        }
-        catch (...) {
-            return;
-        }
-
-        if (!root.is_object() || !root.contains("provider") || !root.at("provider").is_object()) {
-            return;
-        }
-
-        struct Candidate
+        namespace CredentialFormat
         {
-            int priority = 100;
-            std::string token;
-        };
+            using Json = nlohmann::json;
+            using Decoder = std::function<std::optional<std::string>(const std::string&)>;
 
-        std::vector<Candidate> candidates;
-        const json& providers = root.at("provider");
+            struct Envelope
+            {
+                std::vector<unsigned char> iv, tag, ciphertext;
+            };
 
-        for (auto it = providers.begin(); it != providers.end(); ++it) {
-            if (!it.value().is_object()) {
-                continue;
+            inline std::optional<std::vector<unsigned char>> Base64Url(const std::string& text)
+            {
+                if (text.empty() || text.size() > 65536) return {};
+                size_t end = text.size();
+                while (end && text[end - 1] == '=') --end;
+                if (text.size() - end > 2 || end % 4 == 1) return {};
+                if (end != text.size() && text.size() % 4 != 0) return {};
+                unsigned int bits = 0, value = 0;
+                std::vector<unsigned char> result;
+                result.reserve(end * 3 / 4);
+                for (size_t pos = 0; pos < end; ++pos) {
+                    const unsigned char c = static_cast<unsigned char>(text[pos]);
+                    const int digit = c >= 'A' && c <= 'Z' ? c - 'A' :
+                        c >= 'a' && c <= 'z' ? c - 'a' + 26 :
+                        c >= '0' && c <= '9' ? c - '0' + 52 :
+                        c == '-' || c == '+' ? 62 : c == '_' || c == '/' ? 63 : -1;
+                    if (digit < 0) return {};
+                    value = (value << 6) | static_cast<unsigned int>(digit);
+                    bits += 6;
+                    if (bits >= 8) { bits -= 8; result.push_back(static_cast<unsigned char>((value >> bits) & 255)); }
+                }
+                if (bits && (value & ((1u << bits) - 1u)) != 0) return {};
+                return result;
             }
 
-            const json& provider = it.value();
-            bool enabled = JsonUtils::get_instance()->Bool(provider, "enabled", false);
-            int priority = ZCodeProviderPriority(it.key(), enabled);
-            std::string token;
-
-            if (provider.contains("options") && provider.at("options").is_object()) {
-                token = FirstConfigToken(provider.at("options"));
+            inline std::optional<Envelope> ParseEnvelope(const std::string& text)
+            {
+                if (text.rfind("enc:v1:", 0) != 0 || text.size() > 65536) return {};
+                const size_t first = text.find('.', 7);
+                const size_t second = first == std::string::npos ? first : text.find('.', first + 1);
+                if (first == std::string::npos || second == std::string::npos || text.find('.', second + 1) != std::string::npos) return {};
+                auto iv = Base64Url(text.substr(7, first - 7));
+                auto tag = Base64Url(text.substr(first + 1, second - first - 1));
+                auto ciphertext = Base64Url(text.substr(second + 1));
+                if (!iv || iv->size() != 12 || !tag || tag->size() != 16 || !ciphertext || ciphertext->empty()) return {};
+                return Envelope{ std::move(*iv), std::move(*tag), std::move(*ciphertext) };
             }
 
-            if (!LooksLikeToken(token)) {
-                token = FirstConfigToken(provider);
+            inline std::string Token(std::string text)
+            {
+                text = Protocol::Trim(std::move(text));
+                if (text.size() > 7 && Protocol::Lower(text.substr(0, 6)) == "bearer" &&
+                    (text[6] == ' ' || text[6] == '\t')) text = Protocol::Trim(text.substr(7));
+                if (text.size() < 16 || text.size() > 16384 || Protocol::Lower(text).rfind("enc:", 0) == 0) return {};
+                for (unsigned char ch : text) if (ch < 33 || ch > 126) return {};
+                return text;
             }
 
-            if (LooksLikeToken(token)) {
-                candidates.push_back({ priority, token });
+            inline std::string EncodeComponent(const std::string& text)
+            {
+                static constexpr char hex[] = "0123456789ABCDEF";
+                std::string result;
+                for (unsigned char ch : text) {
+                    if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                        (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' || ch == '~' ||
+                        ch == '!' || ch == '*' || ch == '\'' || ch == '(' || ch == ')') result += static_cast<char>(ch);
+                    else { result += '%'; result += hex[ch >> 4]; result += hex[ch & 15]; }
+                }
+                return result;
+            }
+
+            enum class PlanPreference { Automatic, Start, Individual };
+
+            struct Selection
+            {
+                std::string startPlanJwt;
+                std::string oauthAccessToken;
+                std::vector<std::string> codingApiKeys;
+                std::string diagnostic;
+                bool currentZaiAccount = false;
+                PlanPreference preferredPlan = PlanPreference::Automatic;
+            };
+
+            inline std::string AccountIdentity(const Json& profile)
+            {
+                if (!profile.is_object()) return {};
+                // OAuthCredentialRepo persists raw Z.Ai data.user (user_id), but
+                // older stores contain the normalized id/username/displayName profile.
+                const bool normalized = profile.contains("id") && profile["id"].is_string() &&
+                    profile.contains("username") && profile["username"].is_string() &&
+                    profile.contains("displayName") && profile["displayName"].is_string();
+                const char* key = normalized || !profile.contains("user_id") ? "id" : "user_id";
+                auto identity = Protocol::String(profile, key);
+                const auto value = profile.find(key);
+                if (identity.empty() && value != profile.end() && value->is_number_integer()) identity = value->dump();
+                return identity == "unknown" ? std::string{} : identity;
+            }
+
+            inline PlanPreference ReadPlanPreference(const Json& setting)
+            {
+                if (!setting.is_object()) return PlanPreference::Automatic;
+                const auto selections = setting.find("providerFamilyConnectionSelections");
+                if (selections != setting.end()) {
+                    // The structured selection is authoritative. Do not resurrect a
+                    // stale legacy selection when this field is present but empty.
+                    if (!selections->is_object()) return PlanPreference::Automatic;
+                    const auto zai = selections->find("zai");
+                    const auto kind = zai == selections->end() ? std::string{} : Protocol::String(*zai, "kind");
+                    if (kind == "individual-coding-plan") return PlanPreference::Individual;
+                    if (kind == "start-plan") return PlanPreference::Start;
+                    return PlanPreference::Automatic;
+                }
+                const auto modes = setting.find("modelProviderFamilyModes");
+                if (modes != setting.end() && Protocol::String(*modes, "zai") == "apiKey")
+                    return PlanPreference::Automatic;
+                const auto keys = setting.find("modelProviderFamilySelectedKeys");
+                const auto key = keys == setting.end() ? std::string{} : Protocol::String(*keys, "zai");
+                if (key == "coding-plan:builtin:zai-coding-plan") return PlanPreference::Individual;
+                if (key == "coding-plan:builtin:zai-start-plan") return PlanPreference::Start;
+                return PlanPreference::Automatic;
+            }
+
+            inline bool Enabled(const Json& provider)
+            {
+                const auto it = provider.find("enabled");
+                return it != provider.end() && it->is_boolean() && it->get<bool>();
+            }
+
+            inline Selection Select(const Json& store, const Json& config, const Decoder& decode,
+                bool allowLegacyConfig = true, const Json& setting = Json::object())
+            {
+                Selection result;
+                bool decryptFailed = false;
+                auto read = [&](const std::string& key) -> std::string {
+                    if (!store.is_object()) return {};
+                    const auto it = store.find(key);
+                    if (it == store.end() || !it->is_string()) return {};
+                    auto value = decode(it->get<std::string>());
+                    if (!value) { decryptFailed = true; return {}; }
+                    return Protocol::Trim(std::move(*value));
+                };
+                const bool marker = store.is_object() && store.contains("oauth:active_provider");
+                bool modernStore = marker;
+                if (store.is_object()) {
+                    for (auto it = store.begin(); it != store.end(); ++it)
+                        modernStore = modernStore || it.key().rfind("oauth:", 0) == 0 || it.key().rfind("account-provider:", 0) == 0;
+                }
+                if (marker) {
+                    result.currentZaiAccount = read("oauth:active_provider") == "zai";
+                    if (!result.currentZaiAccount) {
+                        result.diagnostic = decryptFailed ? "Could not decrypt ZCode credentials. Run under the same Windows account and ZCODE_CREDENTIAL_SECRET as ZCode."
+                            : "The active ZCode account is not Z.Ai. Sign in to Z.Ai in ZCode.";
+                        return result;
+                    }
+                }
+                else if (modernStore) {
+                    result.diagnostic = "ZCode has no active signed-in account. Sign in to Z.Ai in ZCode.";
+                    return result; // Never resurrect a signed-out account from cached API keys/config.
+                }
+                result.startPlanJwt = Token(read("zcodejwttoken"));
+                if (!modernStore && result.startPlanJwt.empty()) result.startPlanJwt = Token(read("zcodeJwtToken"));
+                if (result.currentZaiAccount) {
+                    result.oauthAccessToken = Token(read("oauth:zai:access_token"));
+                    const auto profileText = read("oauth:zai:user_info");
+                    const auto profile = Json::parse(profileText, nullptr, false);
+                    const auto identity = AccountIdentity(profile);
+                    if (identity.empty())
+                        result.diagnostic = "The signed-in Z.Ai profile has no usable user_id/id. Reopen ZCode and refresh the Individual Plan.";
+                    if (!identity.empty()) {
+                        // Do not enumerate keys from other accounts, team projects, or providers.
+                        const auto key = "account-provider:coding-plan:account:zai-individual-coding-plan:account:" +
+                            EncodeComponent(identity) + ":api-key";
+                        const auto token = Token(read(key));
+                        if (!token.empty()) result.codingApiKeys.push_back(token);
+                    }
+                }
+                const auto providers = config.find("provider");
+                if (config.is_object() && providers != config.end() && providers->is_object()) {
+                    bool personal = false, startSelected = false;
+                    for (auto it = providers->begin(); it != providers->end(); ++it) {
+                        if (!it->is_object() || !Enabled(*it)) continue;
+                        const bool coding = it.key() == "account:zai-individual-coding-plan" || it.key() == "builtin:zai-coding-plan";
+                        const bool start = it.key() == "account:zai-start-plan" || it.key() == "builtin:zai-start-plan";
+                        personal = personal || coding;
+                        startSelected = startSelected || start;
+                        // Legacy, explicitly enabled Z.Ai providers only. Never scan arbitrary
+                        // JSON tokens, refresh tokens, transcripts, or other vendors' API keys.
+                        if (modernStore || !allowLegacyConfig || (!coding && !start)) continue;
+                        const auto options = it->find("options");
+                        const Json& values = options != it->end() && options->is_object() ? *options : *it;
+                        std::string raw = Protocol::String(values, "apiKey");
+                        if (raw.empty()) raw = Protocol::String(values, "api_key");
+                        const auto decoded = raw.empty() ? std::optional<std::string>{} : decode(raw);
+                        const auto token = decoded ? Token(*decoded) : std::string{};
+                        if (token.empty()) continue;
+                        if (start && result.startPlanJwt.empty()) result.startPlanJwt = token;
+                        if (coding && std::find(result.codingApiKeys.begin(), result.codingApiKeys.end(), token) == result.codingApiKeys.end())
+                            result.codingApiKeys.push_back(token);
+                    }
+                    // Legacy enabled flags are only an ordering hint, never proof
+                    // of a subscription and never a gate on the other plan's key.
+                    if (personal != startSelected)
+                        result.preferredPlan = personal ? PlanPreference::Individual : PlanPreference::Start;
+                }
+                if (setting.contains("providerFamilyConnectionSelections") ||
+                    setting.contains("modelProviderFamilySelectedKeys") || setting.contains("modelProviderFamilyModes"))
+                    result.preferredPlan = ReadPlanPreference(setting);
+                if (decryptFailed) result.diagnostic = "One or more ZCode credentials could not be decrypted. Check the Windows account and ZCODE_CREDENTIAL_SECRET used by ZCode.";
+                return result;
             }
         }
 
-        std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
-            return a.priority < b.priority;
-        });
+        namespace Credentials
+        {
+            namespace
+            {
+                std::wstring Environment(const wchar_t* name)
+                {
+                    DWORD count = GetEnvironmentVariableW(name, nullptr, 0);
+                    if (!count || count > 65536) return {};
+                    std::wstring value(count, L'\0');
+                    DWORD actual = GetEnvironmentVariableW(name, value.data(), count);
+                    if (!actual || actual >= count) return {};
+                    value.resize(actual);
+                    return value;
+                }
 
-        for (const Candidate& candidate : candidates) {
-            tokens.push_back(candidate.token);
+                std::string Utf8(const std::wstring& text)
+                {
+                    if (text.empty()) return {};
+                    const int count = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
+                        static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+                    if (!count) return {};
+                    std::string result(static_cast<size_t>(count), '\0');
+                    if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()),
+                        result.data(), count, nullptr, nullptr)) return {};
+                    return result;
+                }
+
+                std::wstring TrimPath(std::wstring text)
+                {
+                    const auto first = text.find_first_not_of(L" \t\r\n");
+                    return first == std::wstring::npos ? std::wstring{} :
+                        text.substr(first, text.find_last_not_of(L" \t\r\n") - first + 1);
+                }
+
+                std::filesystem::path OsHome()
+                {
+                    // Match Node os.homedir() on Windows, not HOME or a migrated data path.
+                    const auto profile = Environment(L"USERPROFILE");
+                    if (!profile.empty()) return std::filesystem::path(profile);
+                    PWSTR folder = nullptr;
+                    if (FAILED(SHGetKnownFolderPath(FOLDERID_Profile, 0, nullptr, &folder)))
+                        throw std::runtime_error("Could not resolve the Windows user profile for ZCode");
+                    std::filesystem::path result(folder);
+                    CoTaskMemFree(folder);
+                    return result;
+                }
+
+                Protocol::Json ReadObject(const std::filesystem::path& path)
+                {
+                    std::error_code ec;
+                    const bool exists = std::filesystem::exists(path, ec);
+                    if (ec) throw std::runtime_error("Could not access a ZCode settings or credential file");
+                    if (!exists) return Protocol::Json::object();
+                    const auto size = std::filesystem::file_size(path, ec);
+                    if (ec || size > 8 * 1024 * 1024) throw std::runtime_error("ZCode JSON file is unreadable or too large");
+                    std::ifstream input(path, std::ios::binary);
+                    if (!input) throw std::runtime_error("Could not read a ZCode settings or credential file");
+                    std::string text(static_cast<size_t>(size), '\0');
+                    if (!text.empty() && !input.read(text.data(), static_cast<std::streamsize>(text.size())))
+                        throw std::runtime_error("ZCode JSON file changed while reading; refresh again");
+                    auto root = Protocol::Json::parse(text, nullptr, false);
+                    if (!text.empty()) SecureZeroMemory(text.data(), text.size());
+                    if (!root.is_object()) throw std::runtime_error("ZCode settings or credentials contain invalid JSON");
+                    return root;
+                }
+
+                std::string DefaultSecret()
+                {
+                    auto overrideSecret = Environment(L"ZCODE_CREDENTIAL_SECRET");
+                    if (!overrideSecret.empty()) return Utf8(overrideSecret); // No trim: ZCode hashes the exact value.
+                    std::array<wchar_t, 257> buffer{};
+                    DWORD size = static_cast<DWORD>(buffer.size());
+                    const std::string username = GetUserNameW(buffer.data(), &size)
+                        ? Utf8(std::wstring(buffer.data())) : "unknown";
+                    return "zcode-credential-fallback:win32:" + Utf8(OsHome().wstring()) + ":" + username;
+                }
+
+                struct Algorithm
+                {
+                    BCRYPT_ALG_HANDLE handle = nullptr;
+                    ~Algorithm() { if (handle) BCryptCloseAlgorithmProvider(handle, 0); }
+                };
+                struct Hash
+                {
+                    BCRYPT_HASH_HANDLE handle = nullptr;
+                    ~Hash() { if (handle) BCryptDestroyHash(handle); }
+                };
+                struct Key
+                {
+                    BCRYPT_KEY_HANDLE handle = nullptr;
+                    ~Key() { if (handle) BCryptDestroyKey(handle); }
+                };
+                struct SecretBytes
+                {
+                    std::vector<unsigned char> value;
+                    explicit SecretBytes(size_t size) : value(size) {}
+                    ~SecretBytes() { if (!value.empty()) SecureZeroMemory(value.data(), value.size()); }
+                };
+            }
+
+            std::optional<std::string> Decrypt(const std::string& value, const std::string& secret)
+            {
+                if (value.rfind("enc:", 0) != 0) return value; // Legacy plaintext store.
+                const auto parsed = CredentialFormat::ParseEnvelope(value);
+                if (!parsed || secret.empty() || secret.size() > 65536) return {};
+                // enc:v1:base64url(iv).base64url(tag).base64url(ciphertext), SHA256(secret).
+                Algorithm sha, aes;
+                if (BCryptOpenAlgorithmProvider(&sha.handle, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0 ||
+                    BCryptOpenAlgorithmProvider(&aes.handle, BCRYPT_AES_ALGORITHM, nullptr, 0) < 0) return {};
+                DWORD hashObjectSize = 0, keyObjectSize = 0, received = 0;
+                if (BCryptGetProperty(sha.handle, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&hashObjectSize),
+                    sizeof(hashObjectSize), &received, 0) < 0) return {};
+                SecretBytes hashObject(hashObjectSize), digest(32);
+                Hash hash;
+                if (BCryptCreateHash(sha.handle, &hash.handle, hashObject.value.data(), hashObjectSize, nullptr, 0, 0) < 0 ||
+                    BCryptHashData(hash.handle, reinterpret_cast<PUCHAR>(const_cast<char*>(secret.data())),
+                        static_cast<ULONG>(secret.size()), 0) < 0 ||
+                    BCryptFinishHash(hash.handle, digest.value.data(), 32, 0) < 0) return {};
+                if (BCryptSetProperty(aes.handle, BCRYPT_CHAINING_MODE,
+                    reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)), sizeof(BCRYPT_CHAIN_MODE_GCM), 0) < 0 ||
+                    BCryptGetProperty(aes.handle, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&keyObjectSize),
+                        sizeof(keyObjectSize), &received, 0) < 0) return {};
+                SecretBytes keyObject(keyObjectSize);
+                Key key;
+                if (BCryptGenerateSymmetricKey(aes.handle, &key.handle, keyObject.value.data(), keyObjectSize,
+                    digest.value.data(), static_cast<ULONG>(digest.value.size()), 0) < 0) return {};
+                BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
+                BCRYPT_INIT_AUTH_MODE_INFO(info);
+                info.pbNonce = const_cast<PUCHAR>(parsed->iv.data());
+                info.cbNonce = static_cast<ULONG>(parsed->iv.size());
+                info.pbTag = const_cast<PUCHAR>(parsed->tag.data());
+                info.cbTag = static_cast<ULONG>(parsed->tag.size());
+                SecretBytes plaintext(parsed->ciphertext.size());
+                ULONG length = 0;
+                const auto status = BCryptDecrypt(key.handle, const_cast<PUCHAR>(parsed->ciphertext.data()),
+                    static_cast<ULONG>(parsed->ciphertext.size()), &info, nullptr, 0, plaintext.value.data(),
+                    static_cast<ULONG>(plaintext.value.size()), &length, 0);
+                // Authentication failure must never return plaintext or fall back to ciphertext.
+                if (status < 0 || length > plaintext.value.size()) return {};
+                return std::string(reinterpret_cast<const char*>(plaintext.value.data()), length);
+            }
+
+            std::filesystem::path SettingsPath()
+            {
+                auto home = TrimPath(Environment(L"ZCODE_DESKTOP_HOME_DIR"));
+                if (home.empty()) home = TrimPath(Environment(L"HOME"));
+                if (home.empty()) home = TrimPath(Environment(L"USERPROFILE"));
+                if (home.empty()) home = OsHome().wstring();
+                return std::filesystem::path(home) / L".zcode" / L"v2" / L"setting.json";
+            }
+
+            std::filesystem::path DataRoot(const Protocol::Json& setting)
+            {
+                const auto configured = Protocol::String(setting, "dataBaseDir");
+                if (!configured.empty())
+                    return std::filesystem::path(std::u8string(configured.begin(), configured.end())) / L".zcode";
+                auto base = TrimPath(Environment(L"ZCODE_DATA_BASE_DIR"));
+                if (base.empty()) base = TrimPath(Environment(L"HOME"));
+                if (base.empty()) base = OsHome().wstring();
+                return std::filesystem::path(base) / L".zcode";
+            }
+
+            std::filesystem::path DataRoot()
+            {
+                return DataRoot(ReadObject(SettingsPath()));
+            }
+
+            CredentialFormat::Selection Load()
+            {
+                CredentialFormat::Selection result;
+                try {
+                    // Read plan selection from the same home setting.json that
+                    // resolves dataBaseDir, not from the migrated credential directory.
+                    const auto setting = ReadObject(SettingsPath());
+                    const auto root = DataRoot(setting) / L"v2";
+                    const auto store = ReadObject(root / L"credentials.json");
+                    auto config = Protocol::Json::object();
+                    std::string configWarning;
+                    try { config = ReadObject(root / L"config.json"); }
+                    catch (...) { configWarning = "ZCode config.json could not be read; using only the active credential store."; }
+                    auto secret = DefaultSecret();
+                    // An existing empty store represents a signed-out desktop, not a
+                    // reason to recover stale provider keys from config.json.
+                    const bool allowLegacyConfig = !std::filesystem::exists(root / L"credentials.json");
+                    result = CredentialFormat::Select(store, config,
+                        [&](const std::string& value) { return Decrypt(value, secret); }, allowLegacyConfig, setting);
+                    if (!secret.empty()) SecureZeroMemory(secret.data(), secret.size());
+                    if (result.diagnostic.empty()) result.diagnostic = std::move(configWarning);
+                }
+                catch (const std::exception& error) { result.diagnostic = error.what(); }
+                return result;
+            }
+        }
+
+        namespace Client
+        {
+            struct Request
+            {
+                std::string url;
+                std::string token;
+                bool bearer = true;
+                std::vector<std::pair<std::string, std::string>> extraHeaders;
+            };
+            struct Response
+            {
+                int status = 0;
+                std::string body;
+                long long serverUnixSeconds = 0;
+            };
+            struct Options
+            {
+                std::string balanceUrl = Protocol::BalanceUrl;
+                // Only an explicit legacy/current URL override triggers this extra request.
+                std::string currentUrl;
+                long long now = 0;
+            };
+            using Transport = std::function<Response(const Request&)>;
+
+            inline bool Https(const std::string& url)
+            {
+                if (url.size() < 9 || Protocol::Lower(url.substr(0, 8)) != "https://") return false;
+                for (unsigned char ch : url) if (ch < 33 || ch == 127) return false;
+                return true;
+            }
+
+            inline Snapshot Fetch(const CredentialFormat::Selection& credentials, const Options& options,
+                const Transport& transport)
+            {
+                Snapshot snapshot;
+                snapshot.lastUpdated = "now";
+                std::string error;
+                std::vector<std::string> planErrors;
+                int errorRank = -1;
+                UsageTelemetry::AccessStatus failure;
+                auto fail = [&](const std::string& text, int status = 0, int rank = 1) {
+                    if (std::find(planErrors.begin(), planErrors.end(), text) == planErrors.end())
+                        planErrors.push_back(text);
+                    if (status == 401 || status == 403 || status == 429 || status == 402) rank = 3;
+                    if (rank <= errorRank) return;
+                    errorRank = rank;
+                    error = text;
+                    failure = UsageTelemetry::FromHttpFailure(status, {}, text);
+                };
+                auto request = [&](const Request& query, const std::string& name, bool optional,
+                    long long* serverTime = nullptr) -> Protocol::Json {
+                    if (!Https(query.url)) {
+                        if (!optional) fail(name + " URL must use HTTPS", 0, 2);
+                        return nullptr;
+                    }
+                    try {
+                        auto response = transport(query);
+                        if (response.status < 200 || response.status >= 300) {
+                            if (!optional) {
+                                const std::string detail = response.status == 401 || response.status == 403
+                                    ? "; credentials expired or rejected. Sign in again in ZCode."
+                                    : response.status == 429 ? "; refresh rate limited. Try again later." : "";
+                                fail(name + " HTTP " + std::to_string(response.status) + detail, response.status, 2);
+                            }
+                            return nullptr;
+                        }
+                        auto root = Protocol::Json::parse(response.body, nullptr, false);
+                        if (!root.is_object()) {
+                            if (!optional) fail(name + " returned invalid JSON", 0, 2);
+                            return nullptr;
+                        }
+                        const auto businessCode = Protocol::Number(root, "code");
+                        if (businessCode && (*businessCode == 401 || *businessCode == 403 ||
+                            *businessCode == 402 || *businessCode == 429)) {
+                            const int code = static_cast<int>(*businessCode);
+                            if (!optional) fail(name + " failed (API code " + std::to_string(code) + ")" +
+                                (code == 401 || code == 403 ? "; sign in again in ZCode." : ""), code);
+                            return nullptr;
+                        }
+                        if (serverTime) *serverTime = response.serverUnixSeconds;
+                        return root;
+                    }
+                    catch (...) {
+                        // Transport errors may contain URLs/headers; do not surface secrets.
+                        if (!optional) fail(name + " request failed. Check the connection and refresh again.", 0, 2);
+                        return nullptr;
+                    }
+                };
+                auto officialMcp = [&](Snapshot& result) {
+                    // Called only after this account's Individual Plan quota succeeds.
+                    // Bind MCP to that PERSONAL scope, including a fallback from Start;
+                    // legacy provider enabled flags must not hide its quota. Never combine
+                    // cached OAuth credentials with another account's explicit key/JWT.
+                    if (!credentials.currentZaiAccount || credentials.startPlanJwt.empty() ||
+                        credentials.oauthAccessToken.empty()) return;
+                    Request query{ Protocol::McpUrl, credentials.startPlanJwt, true, {
+                        { "X-Bigmodel-Authorization", "Bearer " + credentials.oauthAccessToken },
+                        { "Bigmodel-Target-Type", "PERSONAL" }
+                    } };
+                    Protocol::ApplyMcpUsage(result, request(query, "MCP usage", true));
+                };
+                auto start = [&]() -> bool {
+                    if (credentials.startPlanJwt.empty()) return false;
+                    long long serverTime = 0;
+                    auto root = request({ options.balanceUrl, credentials.startPlanJwt, true, {} },
+                        "Start Plan balance", false, &serverTime);
+                    if (!root.is_object()) return false;
+                    // Legacy installations may supply plans through an explicitly configured
+                    // current URL. Never call the obsolete /billing endpoints by default.
+                    auto* data = Protocol::Data(root, true);
+                    if (data && data->is_object() && !data->contains("plans") && !options.currentUrl.empty()) {
+                        const auto current = request({ options.currentUrl, credentials.startPlanJwt, true, {} },
+                            "Start Plan current", false);
+                        const auto* currentData = Protocol::Data(current, true);
+                        if (currentData && currentData->is_object() && currentData->contains("plans") &&
+                            currentData->at("plans").is_array()) root["data"]["plans"] = currentData->at("plans");
+                    }
+                    Snapshot candidate;
+                    candidate.lastUpdated = "now";
+                    const auto parsed = Protocol::ApplyStartPlan(candidate, root, options.now, serverTime);
+                    if (!parsed.usable) { fail(parsed.error, 0, Protocol::Data(root, true) ? 1 : 2); return false; }
+                    candidate.statusText = "Source: active ZCode Start Plan";
+                    Protocol::FinalizeAccess(candidate);
+                    snapshot = std::move(candidate);
+                    return true;
+                };
+                auto coding = [&]() -> bool {
+                    if (credentials.codingApiKeys.empty()) {
+                        if (credentials.currentZaiAccount || !credentials.startPlanJwt.empty())
+                            fail("Individual Plan API key was not found for the signed-in account. Open Individual Plan in ZCode and refresh.");
+                        return false;
+                    }
+                    for (const auto& apiKey : credentials.codingApiKeys) {
+                        const auto root = request({ Protocol::QuotaUrl, apiKey, false, {} }, "Individual Plan quota", false);
+                        if (!root.is_object()) continue;
+                        Snapshot candidate;
+                        candidate.lastUpdated = "now";
+                        if (!Protocol::ApplyCodingQuota(candidate, root)) {
+                            fail(Protocol::Data(root) ? "Individual Plan returned no usable quota windows"
+                                : "Individual Plan returned an unsuccessful quota envelope", 0, Protocol::Data(root) ? 1 : 2);
+                            continue;
+                        }
+                        Protocol::ApplySubscription(candidate, request({ Protocol::SubscriptionUrl, apiKey, false, {} },
+                            "Individual Plan subscription", true));
+                        candidate.statusText = "Source: Z.Ai Individual Plan quota";
+                        officialMcp(candidate);
+                        Protocol::FinalizeAccess(candidate);
+                        snapshot = std::move(candidate);
+                        return true;
+                    }
+                    return false;
+                };
+                // A selected plan is an ordering hint, not an exclusive entitlement.
+                // Probe the other supported plan after HTTP/API errors, an inactive plan,
+                // missing credentials, or an empty/unusable quota response. Prefer the
+                // Individual Plan when no explicit Start Plan selection exists.
+                if (credentials.preferredPlan == CredentialFormat::PlanPreference::Start) {
+                    if (start()) return snapshot;
+                    if (coding()) return snapshot;
+                }
+                else {
+                    if (coding()) return snapshot;
+                    if (start()) return snapshot;
+                }
+                if (error.empty()) {
+                    error = credentials.diagnostic.empty()
+                        ? "Z.Ai credentials not found. Sign in and open the plan in ZCode, or set ZCODE_JWT_TOKEN / ZAI_CODING_API_KEY."
+                        : credentials.diagnostic;
+                    failure.state = UsageTelemetry::AccessState::Unavailable;
+                    failure.detail = error;
+                }
+                else {
+                    // Report both failed paths instead of letting the first Start Plan
+                    // HTTP 400 mask why the Individual Plan could not be loaded.
+                    error.clear();
+                    for (const auto& detail : planErrors) {
+                        if (!error.empty()) error += "; ";
+                        error += detail;
+                    }
+                    if (!credentials.diagnostic.empty()) error += " " + credentials.diagnostic;
+                }
+                failure.detail = error;
+                snapshot.statusText = "Z.Ai usage unavailable: " + error;
+                snapshot.access = std::move(failure);
+                return snapshot;
+            }
         }
     }
+}
 
-    static std::vector<std::filesystem::path> CandidateCredentialFiles()
-    {
-        std::vector<std::filesystem::path> paths;
-        std::filesystem::path home = Network::get_instance()->UserProfilePath();
-
-        paths.push_back(home / ".zcode" / "v2" / "config.json");
-        paths.push_back(home / ".zcode" / "cli" / "config.json");
-        paths.push_back(home / ".zcode" / "v2" / "credential.json");
-        paths.push_back(home / ".zcode" / "v2" / "credentials.json");
-        paths.push_back(home / ".zcode" / "v2" / "setting.json");
-
-        std::string appData = Network::get_instance()->GetEnvText("APPDATA");
-
-        if (!appData.empty()) {
-            std::filesystem::path roaming(appData);
-            paths.push_back(roaming / "ZCode" / "User" / "globalStorage" / "storage.json");
-            paths.push_back(roaming / "ZCode" / "User" / "settings.json");
-        }
-
-        std::filesystem::path zcodeRoot = home / ".zcode";
-
-        if (std::filesystem::exists(zcodeRoot)) {
-            std::error_code ec;
-            size_t count = 0;
-
-            for (const auto& entry : std::filesystem::recursive_directory_iterator(
-                zcodeRoot,
-                std::filesystem::directory_options::skip_permission_denied,
-                ec
-            )) {
-                if (ec || count++ > 200) {
-                    break;
-                }
-
-                if (!entry.is_regular_file(ec) || ec) {
-                    continue;
-                }
-
-                std::filesystem::path p = entry.path();
-                std::string ext = Text::get_instance()->ToLowerCopy(p.extension().string());
-
-                if (ext != ".json" && ext != ".yaml" && ext != ".yml" && ext != ".txt") {
-                    continue;
-                }
-
-                uintmax_t size = entry.file_size(ec);
-
-                if (ec || size > 512 * 1024) {
-                    continue;
-                }
-
-                paths.push_back(p);
-            }
-        }
-
-        return paths;
-    }
-
-    static std::vector<std::string> LoadCandidateTokens()
-    {
-        std::vector<std::string> tokens;
-
-        // Prefer the enabled provider in the active ZCode config, then other
-        // credential files. Environment tokens are fallback-only because an old
-        // process environment survives account changes.
-        CollectZCodeConfigTokens(tokens);
-
-        for (const std::filesystem::path& path : CandidateCredentialFiles()) {
-            std::error_code ec;
-
-            if (!std::filesystem::exists(path, ec) || ec) {
-                continue;
-            }
-
-            if (std::filesystem::is_regular_file(path, ec)) {
-                uintmax_t size = std::filesystem::file_size(path, ec);
-
-                if (ec || size > 1024 * 1024) {
-                    continue;
-                }
-            }
-
-            std::string text = Network::get_instance()->ReadTextFile(path);
-
-            if (text.empty()) {
-                continue;
-            }
-
-            try {
-                CollectJsonTokens(JsonUtils::get_instance()->ParseRequired(text), tokens);
-            }
-            catch (...) {
-            }
-
-            CollectRegexTokens(text, tokens);
-        }
-
-        const char* envNames[] = {
-            "ZCODE_JWT_TOKEN",
-            "ZCODEJWTTOKEN",
-            "ZAI_ZCODE_JWT_TOKEN",
-            "ZAI_ACCESS_TOKEN",
-            "ZCODE_ACCESS_TOKEN",
-            "ZAI_TOKEN"
-        };
-
-        for (const char* name : envNames) {
-            std::string value = Network::get_instance()->GetEnvText(name);
-
-            if (LooksLikeToken(value)) {
-                tokens.push_back(value);
-            }
-        }
-
-        std::vector<std::string> unique;
-        std::set<std::string> seen;
-
-        for (std::string token : tokens) {
-            token = Network::get_instance()->StripHeaderValue(token);
-
-            if (!LooksLikeToken(token)) {
-                continue;
-            }
-
-            if (token.rfind("Bearer ", 0) == 0) {
-                token = token.substr(7);
-            }
-
-            if (seen.insert(token).second) {
-                unique.push_back(token);
-            }
-        }
-
-        return unique;
-    }
-
-
-
-
-
+namespace ZAi
+{
     static std::string CompactLower(std::string text)
     {
         return Text::get_instance()->CompactLower(text);
@@ -834,7 +1489,7 @@ namespace ZAi
             return 0;
         }
         const std::filesystem::path path =
-            Network::get_instance()->UserProfilePath() / ".zcode" / "v2" / "config.json";
+            Credentials::DataRoot() / "v2" / "config.json";
         const std::string text = Network::get_instance()->ReadTextFile(path);
         if (text.empty()) {
             return 0;
@@ -884,7 +1539,7 @@ namespace ZAi
     {
         ZCodeLocalTelemetry local;
         const std::filesystem::path dbPath =
-            Network::get_instance()->UserProfilePath() / ".zcode" / "cli" / "db" / "db.sqlite";
+            Credentials::DataRoot() / "cli" / "db" / "db.sqlite";
         std::error_code ec;
         if (!std::filesystem::is_regular_file(dbPath, ec) || ec) {
             return local;
@@ -1105,7 +1760,9 @@ namespace ZAi
 
     LocalTelemetry ReadLocalTelemetry()
     {
-        const ZCodeLocalTelemetry local = ReadZCodeLocalTelemetry();
+        ZCodeLocalTelemetry local;
+        try { local = ReadZCodeLocalTelemetry(); }
+        catch (...) { return {}; } // Local telemetry is optional.
         LocalTelemetry result;
         result.context = local.context;
         result.run = local.run;
@@ -1121,843 +1778,49 @@ namespace ZAi
     }
 
 
-    static std::string NormalizeModelName(std::string label)
-    {
-        const std::string compact = CompactLower(label);
-
-        if (compact.find("turbo") != std::string::npos &&
-            compact.find("glm") != std::string::npos) {
-            return "GLM-5-Turbo";
-        }
-        if (compact.find("glm53") != std::string::npos ||
-            compact.find("glm5.3") != std::string::npos) {
-            return "GLM-5.3";
-        }
-        if (compact.find("glm52") != std::string::npos ||
-            compact.find("glm5.2") != std::string::npos) {
-            return "GLM-5.2";
-        }
-
-        return label;
-    }
-
-    static bool IsZaiModelLabel(const std::string& label)
-    {
-        const std::string normalized = NormalizeModelName(label);
-        const std::string compact = CompactLower(normalized);
-        // Keep future/new GLM models instead of dropping them merely because
-        // AQC did not know their name at compile time.
-        return compact.rfind("glm", 0) == 0;
-    }
-
-    static int ModelSortRank(const std::string& label)
-    {
-        const std::string normalized = NormalizeModelName(label);
-        if (normalized == "GLM-5.3") return 0;
-        if (normalized == "GLM-5.2") return 1;
-        if (normalized == "GLM-5-Turbo") return 2;
-        return 10;
-    }
-
-    static std::string PickUsageLabel(const json& object, const std::string& fallback)
-    {
-        std::string label = Text::get_instance()->FirstNonEmpty({
-            JsonUtils::get_instance()->String(object, "model"),
-            JsonUtils::get_instance()->String(object, "model_name"),
-            JsonUtils::get_instance()->String(object, "modelName"),
-            JsonUtils::get_instance()->String(object, "show_name"),
-            JsonUtils::get_instance()->String(object, "showName"),
-            JsonUtils::get_instance()->String(object, "display_name"),
-            JsonUtils::get_instance()->String(object, "displayName"),
-            JsonUtils::get_instance()->String(object, "name"),
-            JsonUtils::get_instance()->String(object, "type"),
-            JsonUtils::get_instance()->String(object, "meter"),
-            JsonUtils::get_instance()->String(object, "entitlement_id"),
-            fallback
-        });
-
-        std::replace(label.begin(), label.end(), '_', ' ');
-        return NormalizeModelName(label);
-    }
-
-    static void ApplyZaiBarStyle(UsageBar& bar)
-    {
-        bar.valid = true;
-        bar.red = false;
-        bar.white = false;
-        bar.green = true;
-        bar.thin = false;
-    }
-
-    static void FinalizeZaiBars(Snapshot& snapshot)
-    {
-        std::vector<UsageBar> unique;
-        std::set<std::string> seenModels;
-
-        for (UsageBar bar : snapshot.bars) {
-            bar.label = NormalizeModelName(bar.label);
-            ApplyZaiBarStyle(bar);
-
-            std::string modelKey = IsZaiModelLabel(bar.label) ? bar.label : "";
-
-            if (!modelKey.empty()) {
-                if (!seenModels.insert(modelKey).second) {
-                    continue;
-                }
-            }
-
-            unique.push_back(bar);
-        }
-
-        snapshot.bars = unique;
-
-
-        std::stable_sort(snapshot.bars.begin(), snapshot.bars.end(), [](const UsageBar& a, const UsageBar& b) {
-            return ModelSortRank(a.label) < ModelSortRank(b.label);
-        });
-    }
-
-    static void AddDetail(Snapshot& snapshot, const std::string& leftValue, const std::string& leftLabel, const std::string& rightValue = {}, const std::string& rightLabel = {})
-    {
-        if (leftValue.empty() && rightValue.empty()) {
-            return;
-        }
-
-        DetailRow row;
-        row.leftValue = leftValue;
-        row.leftLabel = leftLabel;
-        row.rightValue = rightValue;
-        row.rightLabel = rightLabel;
-        snapshot.details.push_back(row);
-    }
-
-    static void AddBalanceBar(Snapshot& snapshot, const json& balance)
-    {
-        if (!balance.is_object()) {
-            return;
-        }
-
-        std::optional<double> total = JsonUtils::get_instance()->NumberAny(balance, {
-            "total_units", "total", "total_tokens", "quota", "limit", "max"
-        });
-
-        std::optional<double> used = JsonUtils::get_instance()->NumberAny(balance, {
-            "used_units", "used", "usage", "used_tokens", "currentValue", "current", "consumed"
-        });
-
-        std::optional<double> remaining = JsonUtils::get_instance()->NumberAny(balance, {
-            "remaining_units", "available_units", "remaining", "remain", "left", "available", "available_tokens", "balance"
-        });
-
-        if (!total && used && remaining) {
-            total = *used + *remaining;
-        }
-
-        if (!used && total && remaining) {
-            used = std::max(0.0, *total - *remaining);
-        }
-
-        if (!total && !used && !remaining) {
-            return;
-        }
-
-        UsageBar bar;
-        bar.spendBalance = true;
-        bar.label = PickUsageLabel(balance, "Usage credits");
-
-        if (total && *total > 0.0 && used) {
-            bar.usedPercent = Math::get_instance()->PercentUsed(*used, *total);
-        }
-        else {
-            bar.usedPercent = 0.0f;
-        }
-
-        bar.resetAtUnixSeconds = JsonUtils::get_instance()->UnixSecondsField(balance, "period_end", "expires_at", "reset_at");
-
-        if (bar.resetAtUnixSeconds == 0) {
-            bar.resetAtUnixSeconds = JsonUtils::get_instance()->UnixSecondsField(balance, "expire_at", "expiresAt", "resetAt");
-        }
-
-        if (bar.resetAtUnixSeconds == 0) {
-            bar.resetAtUnixSeconds = JsonUtils::get_instance()->UnixSecondsField(balance, "expire_time", "expiration", "endTime");
-        }
-
-        bar.resetText = Format::get_instance()->ResetShort(bar.resetAtUnixSeconds);
-        ApplyZaiBarStyle(bar);
-
-        if (remaining && total) {
-            bar.sublabel = Format::get_instance()->IntegerWithCommas(*remaining) + " / " + Format::get_instance()->IntegerWithCommas(*total);
-        }
-        else if (used && total) {
-            bar.sublabel = Format::get_instance()->IntegerWithCommas(*used) + " / " + Format::get_instance()->IntegerWithCommas(*total) + " used";
-        }
-        else if (remaining) {
-            bar.sublabel = Format::get_instance()->IntegerWithCommas(*remaining) + " left";
-        }
-
-        snapshot.bars.push_back(bar);
-    }
-
-    // ZCode describes a window's PERIOD with `unit` (an enum) and `number` (a
-    // multiplier) - `unit 3 / number 5` is the five-hour pool, `unit 6` the
-    // weekly one, `unit 5 / number 1` the monthly tool allowance. They are not
-    // quota amounts: reading them as the total made a five-hour bar compute
-    // used/5*100 and peg at 100%.
-    static std::string ZAiPeriodLabel(const json& limit)
-    {
-        const std::optional<double> unit =
-            JsonUtils::get_instance()->NumberAny(limit, { "unit" });
-
-        if (!unit) {
-            return {};
-        }
-
-        const std::optional<double> number =
-            JsonUtils::get_instance()->NumberAny(limit, { "number" });
-        const int count = number ? static_cast<int>(*number) : 0;
-
-        switch (static_cast<int>(*unit)) {
-        case 3:
-            return count > 0 ? std::to_string(count) + "-hour" : "Hourly";
-        case 5:
-            return count > 1 ? std::to_string(count) + "-month" : "Monthly";
-        case 6:
-            return count > 1 ? std::to_string(count) + "-week" : "Weekly";
-        default:
-            return {};
-        }
-    }
-
-    static void AddQuotaLimitBar(Snapshot& snapshot, const json& limit)
-    {
-        if (!limit.is_object()) {
-            return;
-        }
-
-        std::optional<double> total = JsonUtils::get_instance()->NumberAny(limit, {
-            "total", "total_tokens", "quota", "limit", "max", "total_units"
-        });
-
-        std::optional<double> used = JsonUtils::get_instance()->NumberAny(limit, {
-            "usage", "currentValue", "used", "used_tokens", "consumed", "used_units", "current"
-        });
-
-        std::optional<double> remaining = JsonUtils::get_instance()->NumberAny(limit, {
-            "remaining", "remain", "left", "available", "available_tokens", "remaining_units", "available_units", "balance"
-        });
-
-        if (!total && used && remaining) {
-            total = *used + *remaining;
-        }
-
-        if (!used && total && remaining) {
-            used = std::max(0.0, *total - *remaining);
-        }
-
-        bool hasPercentage = limit.contains("percentage") && limit.at("percentage").is_number();
-
-        if (!total && !used && !remaining && !hasPercentage) {
-            return;
-        }
-
-        UsageBar bar;
-        bar.label = PickUsageLabel(limit, "Quota");
-
-        // Prefer the period the server describes over whatever generic name
-        // PickUsageLabel settled on - it is what tells two bars apart.
-        const std::string period = ZAiPeriodLabel(limit);
-
-        if (!period.empty()) {
-            const std::string lower = Text::get_instance()->ToLowerCopy(bar.label);
-
-            if (bar.label.empty() || lower == "quota" || lower == "usage") {
-                bar.label = period;
-            }
-            else if (lower.find(Text::get_instance()->ToLowerCopy(period)) == std::string::npos) {
-                bar.sublabel = period;
-            }
-        }
-
-        if (total && *total > 0.0 && used) {
-            bar.usedPercent = Math::get_instance()->PercentUsed(*used, *total);
-        }
-        else if (hasPercentage) {
-            double pct = limit.at("percentage").get<double>();
-
-            if (pct <= 1.0) {
-                pct *= 100.0;
-            }
-
-            // ZCode percentage values generally represent remaining balance.
-            // Convert to used percent so the global Show remaining toggle still works.
-            bar.usedPercent = Math::get_instance()->ClampPercentFloat(static_cast<float>(100.0 - pct));
-        }
-        else {
-            bar.usedPercent = 0.0f;
-        }
-
-        bar.resetAtUnixSeconds = JsonUtils::get_instance()->UnixSecondsField(limit, "nextResetTime", "reset_at", "expires_at");
-
-        if (bar.resetAtUnixSeconds == 0) {
-            bar.resetAtUnixSeconds = JsonUtils::get_instance()->UnixSecondsField(limit, "expire_at", "expiresAt", "resetAt");
-        }
-
-        if (bar.resetAtUnixSeconds == 0) {
-            bar.resetAtUnixSeconds = JsonUtils::get_instance()->UnixSecondsField(limit, "expire_time", "expiration", "endTime");
-        }
-
-        bar.resetText = Format::get_instance()->ResetShort(bar.resetAtUnixSeconds);
-        ApplyZaiBarStyle(bar);
-
-        if (remaining && total) {
-            bar.sublabel = Format::get_instance()->IntegerWithCommas(*remaining) + " / " + Format::get_instance()->IntegerWithCommas(*total);
-        }
-        else if (used && total) {
-            bar.sublabel = Format::get_instance()->IntegerWithCommas(*used) + " / " + Format::get_instance()->IntegerWithCommas(*total) + " used";
-        }
-        else if (remaining) {
-            bar.sublabel = Format::get_instance()->IntegerWithCommas(*remaining) + " left";
-        }
-
-        snapshot.bars.push_back(bar);
-    }
-
-
-
-
-    static bool HasAnyField(const json& object, std::initializer_list<const char*> keys)
-    {
-        if (!object.is_object()) {
-            return false;
-        }
-
-        for (const char* key : keys) {
-            if (object.contains(key)) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    static bool LooksLikeBalanceObject(const json& object)
-    {
-        return HasAnyField(object, { "total_units", "used_units", "remaining_units", "available_units", "reserved_units" });
-    }
-
-    static bool LooksLikeQuotaLimitObject(const json& object)
-    {
-        return HasAnyField(object, { "number", "usage", "currentValue", "remaining", "nextResetTime", "percentage" });
-    }
-
-    static bool AddUsageObject(Snapshot& snapshot, const json& object)
-    {
-        size_t before = snapshot.bars.size();
-
-        if (LooksLikeBalanceObject(object)) {
-            AddBalanceBar(snapshot, object);
-        }
-        else if (LooksLikeQuotaLimitObject(object)) {
-            AddQuotaLimitBar(snapshot, object);
-        }
-
-        return snapshot.bars.size() > before;
-    }
-
-    static void ScanUsageJson(Snapshot& snapshot, const json& value, size_t maxAdded, size_t& added)
-    {
-        if (added >= maxAdded) {
-            return;
-        }
-
-        if (value.is_object()) {
-            if (AddUsageObject(snapshot, value)) {
-                ++added;
-
-                if (added >= maxAdded) {
-                    return;
-                }
-            }
-
-            const char* arrayKeys[] = { "balances", "limits", "quotas", "items", "data" };
-
-            for (const char* key : arrayKeys) {
-                if (!value.contains(key)) {
-                    continue;
-                }
-
-                const json& child = value.at(key);
-
-                if (child.is_array()) {
-                    for (const json& item : child) {
-                        ScanUsageJson(snapshot, item, maxAdded, added);
-
-                        if (added >= maxAdded) {
-                            return;
-                        }
-                    }
-                }
-                else if (child.is_object()) {
-                    ScanUsageJson(snapshot, child, maxAdded, added);
-                }
-            }
-
-            for (auto it = value.begin(); it != value.end(); ++it) {
-                if (std::string(it.key()) == "balances" || std::string(it.key()) == "limits" || std::string(it.key()) == "quotas" || std::string(it.key()) == "items" || std::string(it.key()) == "data") {
-                    continue;
-                }
-
-                if (it.value().is_object() || it.value().is_array()) {
-                    ScanUsageJson(snapshot, it.value(), maxAdded, added);
-
-                    if (added >= maxAdded) {
-                        return;
-                    }
-                }
-            }
-        }
-        else if (value.is_array()) {
-            for (const json& item : value) {
-                ScanUsageJson(snapshot, item, maxAdded, added);
-
-                if (added >= maxAdded) {
-                    return;
-                }
-            }
-        }
-    }
-
-    static bool EnvelopeSucceeded(const json& root)
-    {
-        if (!root.is_object()) {
-            return false;
-        }
-
-        if (root.contains("success") && root.at("success").is_boolean() &&
-            !root.at("success").get<bool>()) {
-            return false;
-        }
-
-        if (root.contains("code") && root.at("code").is_number()) {
-            const int code = root.at("code").get<int>();
-            return code == 0 || code == 200;
-        }
-
-        return true;
-    }
-
-    static bool ApplyCurrentResponse(Snapshot& snapshot, const json& root)
-    {
-        const json* data = JsonUtils::get_instance()->UnwrapData(root);
-
-        if (!EnvelopeSucceeded(root) || !data || !data->is_object() ||
-            !data->contains("plans") || !data->at("plans").is_array()) {
-            return false;
-        }
-
-        const json& plans = data->at("plans");
-        const json* selected = nullptr;
-
-        for (const json& plan : plans) {
-            std::string status = Text::get_instance()->ToLowerCopy(JsonUtils::get_instance()->String(plan, "status"));
-            std::string planId = Text::get_instance()->ToLowerCopy(JsonUtils::get_instance()->String(plan, "plan_id"));
-            std::string name = Text::get_instance()->ToLowerCopy(JsonUtils::get_instance()->String(plan, "name"));
-
-            if (status == "active" && (planId.find("start-plan") != std::string::npos || name.find("start plan") != std::string::npos)) {
-                selected = &plan;
-                break;
-            }
-        }
-
-        // Match ZCode itself: only an active Start Plan is authoritative.
-        // Never select the first arbitrary/inactive plan as a fallback.
-        if (!selected) {
-            return false;
-        }
-
-        std::string name = Text::get_instance()->FirstNonEmpty({ JsonUtils::get_instance()->String(*selected, "name"), JsonUtils::get_instance()->String(*selected, "plan_id") });
-
-        if (!name.empty()) {
-            snapshot.plan = "Z.Ai " + name;
-        }
-
-        AddDetail(snapshot, Text::get_instance()->FirstNonEmpty({ JsonUtils::get_instance()->String(*selected, "status"), "unknown" }), "Plan status", Text::get_instance()->FirstNonEmpty({ JsonUtils::get_instance()->String(*selected, "plan_id"), JsonUtils::get_instance()->String(*selected, "user_plan_id") }), "Plan ID");
-        return true;
-    }
-
-    static bool ApplyBalanceResponse(Snapshot& snapshot, const json& root)
-    {
-        if (!EnvelopeSucceeded(root)) {
-            return false;
-        }
-
-        const json* data = JsonUtils::get_instance()->UnwrapData(root);
-        size_t before = snapshot.bars.size();
-
-        if (data && data->is_object() && data->contains("balances") && data->at("balances").is_array()) {
-            for (const json& balance : data->at("balances")) {
-                AddBalanceBar(snapshot, balance);
-
-                if (snapshot.bars.size() - before >= 6) {
-                    break;
-                }
-            }
-        }
-
-        if (snapshot.bars.size() == before) {
-            size_t added = 0;
-            ScanUsageJson(snapshot, data ? *data : root, 6, added);
-        }
-
-        return snapshot.bars.size() > before;
-    }
-
-    // /api/v1/mcp/usage -> data.total_usage {used,limit,remaining} plus
-    // next_refresh_at and level. Absent or malformed simply leaves it hidden.
-    static bool ApplyMcpUsageResponse(Snapshot& snapshot, const json& root)
-    {
-        if (!root.is_object() || !root.contains("data") || !root.at("data").is_object()) {
-            return false;
-        }
-
-        const json& data = root.at("data");
-        const json* usage = nullptr;
-
-        if (data.contains("total_usage") && data.at("total_usage").is_object()) {
-            usage = &data.at("total_usage");
-        }
-        else if (data.contains("used") && data.contains("limit")) {
-            usage = &data;
-        }
-
-        if (!usage) {
-            return false;
-        }
-
-        auto number = [](const json& object, const char* key) -> long long {
-            const auto it = object.find(key);
-            return (it != object.end() && it->is_number())
-                ? static_cast<long long>(it->get<double>())
-                : 0;
-        };
-
-        McpUsage mcp;
-        mcp.used = number(*usage, "used");
-        mcp.limit = number(*usage, "limit");
-        mcp.remaining = number(*usage, "remaining");
-
-        if (mcp.limit <= 0 && mcp.used <= 0) {
-            return false;
-        }
-
-        const auto level = data.find("level");
-        if (level != data.end() && level->is_string()) {
-            mcp.level = level->get<std::string>();
-        }
-
-        const long long nextRefresh = number(data, "next_refresh_at");
-        if (nextRefresh > 0) {
-            // The service reports seconds; tolerate milliseconds.
-            mcp.nextRefreshAtUnixSeconds = nextRefresh > 100000000000LL
-                ? nextRefresh / 1000
-                : nextRefresh;
-        }
-
-        mcp.valid = true;
-        snapshot.mcp = std::move(mcp);
-        return true;
-    }
-
-    static bool ApplyQuotaResponse(Snapshot& snapshot, const json& root)
-    {
-        if (!EnvelopeSucceeded(root)) {
-            return false;
-        }
-
-        const json* data = JsonUtils::get_instance()->UnwrapData(root);
-
-        if (!data || !data->is_object()) {
-            return false;
-        }
-
-        std::string level = JsonUtils::get_instance()->String(*data, "level");
-
-        if (!level.empty() && snapshot.plan == "Z.Ai") {
-            snapshot.plan = "Z.Ai GLM Coding " + level;
-        }
-
-        size_t before = snapshot.bars.size();
-
-        if (data->contains("limits") && data->at("limits").is_array()) {
-            for (const json& limit : data->at("limits")) {
-                AddQuotaLimitBar(snapshot, limit);
-
-                if (snapshot.bars.size() - before >= 6) {
-                    break;
-                }
-            }
-        }
-
-        if (snapshot.bars.size() == before) {
-            size_t added = 0;
-            ScanUsageJson(snapshot, *data, 6, added);
-        }
-
-        return snapshot.bars.size() > before;
-    }
-
-    static void ApplySubscriptionList(Snapshot& snapshot, const json& root)
-    {
-        const json* data = JsonUtils::get_instance()->UnwrapData(root);
-
-        if (!data || !data->is_array()) {
-            return;
-        }
-
-        for (const json& item : *data) {
-            std::string status = JsonUtils::get_instance()->String(item, "status");
-            std::string product = Text::get_instance()->FirstNonEmpty({ JsonUtils::get_instance()->String(item, "productName"), JsonUtils::get_instance()->String(item, "productId") });
-
-            if (!product.empty()) {
-                AddDetail(snapshot, product, "Subscription", status, "Status");
-                return;
-            }
-        }
-    }
-
-    static bool ResponseOk(const Network::HttpResponse& response)
-    {
-        return response.statusCode >= 200 && response.statusCode < 300 && !response.body.empty();
-    }
-
-    static void FinalizeZAiAccess(Snapshot& snapshot)
-    {
-        if (snapshot.bars.empty()) {
-            snapshot.access.state = UsageTelemetry::AccessState::Unavailable;
-            snapshot.access.detail = "No usable Z.Ai usage data was returned";
-            return;
-        }
-
-        UsageTelemetry::SetAvailable(snapshot.access);
-
-        std::vector<std::string> exhaustedBalances;
-        std::vector<std::string> exhaustedRateLimits;
-        size_t rateLimitCount = 0;
-
-        for (const UsageBar& bar : snapshot.bars) {
-            if (!bar.valid) {
-                continue;
-            }
-
-            if (!bar.spendBalance) {
-                ++rateLimitCount;
-            }
-
-            if (!UsageTelemetry::IsExhausted(bar.usedPercent)) {
-                continue;
-            }
-
-            std::vector<std::string>& target = bar.spendBalance
-                ? exhaustedBalances
-                : exhaustedRateLimits;
-            target.push_back(bar.label.empty() ? "Usage" : bar.label);
-        }
-
-        auto join = [](const std::vector<std::string>& values) {
-            std::string text;
-
-            for (size_t i = 0; i < values.size(); ++i) {
-                if (i != 0) text += ", ";
-                text += values[i];
-            }
-
-            return text;
-        };
-
-        if (!exhaustedBalances.empty()) {
-            snapshot.access.state = UsageTelemetry::AccessState::OutOfUsage;
-            snapshot.access.detail = "Usage balance exhausted: " + join(exhaustedBalances);
-        }
-        else if (rateLimitCount > 0 && exhaustedRateLimits.size() == rateLimitCount) {
-            snapshot.access.state = UsageTelemetry::AccessState::OutOfUsage;
-            snapshot.access.detail = "All returned usage allocations are exhausted";
-        }
-        else if (!exhaustedRateLimits.empty()) {
-            snapshot.access.detail = "Some usage allocations are exhausted: " + join(exhaustedRateLimits);
-        }
-    }
-
     Snapshot FetchSnapshot()
     {
-        Snapshot snapshot;
-        snapshot.lastUpdated = "now";
-        const ZCodeLocalTelemetry local = ReadZCodeLocalTelemetry();
-        ApplyLocalTelemetryToSnapshot(snapshot, local);
-
-        std::vector<std::string> tokens = LoadCandidateTokens();
-
-        if (tokens.empty()) {
-            snapshot.statusText = "Z.Ai credentials not found. Sign in to ZCode or set ZCODE_JWT_TOKEN.";
-            snapshot.access = UsageTelemetry::FromText(snapshot.statusText);
-            return snapshot;
-        }
-
-        std::vector<std::pair<std::string, const char*>> urls;
-        std::set<std::string> seenUrls;
-
-        auto addUrl = [&](const std::string& url, const char* kind) {
-            if (!url.empty() && seenUrls.insert(url).second) {
-                urls.push_back({ url, kind });
+        auto credentials = Credentials::Load();
+        auto* network = Network::get_instance();
+        auto environmentToken = [&](std::initializer_list<const char*> names) {
+            for (const auto* name : names) {
+                auto token = CredentialFormat::Token(network->GetEnvText(name));
+                if (!token.empty()) return token;
             }
+            return std::string{};
         };
-
-        std::string currentUrl = Network::get_instance()->GetEnvText("ZCODE_PLAN_BILLING_CURRENT_URL");
-        std::string balanceUrl = Network::get_instance()->GetEnvText("ZCODE_PLAN_BILLING_BALANCE_URL");
-
-        if (!currentUrl.empty()) {
-            addUrl(currentUrl, "current");
+        const auto jwt = environmentToken({ "ZCODE_JWT_TOKEN", "ZCODEJWTTOKEN", "ZAI_ZCODE_JWT_TOKEN", "ZCODE_ACCESS_TOKEN" });
+        const auto key = environmentToken({ "ZAI_CODING_API_KEY", "ZAI_API_KEY" });
+        // Explicit overrides win, but never combine another identity's token with
+        // the locally cached OAuth token when constructing MCP authorization.
+        if (!jwt.empty()) {
+            if (jwt != credentials.startPlanJwt) credentials.currentZaiAccount = false;
+            credentials.startPlanJwt = jwt;
+            credentials.preferredPlan = CredentialFormat::PlanPreference::Start;
         }
-
-        if (!balanceUrl.empty()) {
-            addUrl(balanceUrl, "balance");
+        if (!key.empty()) {
+            if (std::find(credentials.codingApiKeys.begin(), credentials.codingApiKeys.end(), key) == credentials.codingApiKeys.end())
+                credentials.currentZaiAccount = false;
+            credentials.codingApiKeys = { key };
+            if (jwt.empty()) credentials.preferredPlan = CredentialFormat::PlanPreference::Individual;
         }
-
-        addUrl("https://zcode.z.ai/api/v1/billing/current?app_version=1.0.0", "current");
-        addUrl("https://zcode.z.ai/api/v1/billing/balance?app_version=1.0.0", "balance");
-        addUrl("https://zcode.z.ai/api/v1/zcode-plan/billing/current?app_version=1.0.0", "current");
-        addUrl("https://zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=1.0.0", "balance");
-        addUrl("https://api.z.ai/api/monitor/usage/quota/limit", "quota");
-        addUrl("https://api.z.ai/api/biz/subscription/list", "subscription");
-        addUrl("https://api.z.ai/api/v1/mcp/usage", "mcp");
-
-        std::string lastError;
-        std::string bestUnavailableReason;
-        UsageTelemetry::AccessStatus strongestFailure;
-
-        for (const std::string& token : tokens) {
-            Snapshot candidate;
-            candidate.lastUpdated = "now";
-            ApplyLocalTelemetryToSnapshot(candidate, local);
-            bool activeStartPlan = false;
-            bool usableUsageData = false;
-            bool receivedSuccessfulResponse = false;
-
-            for (const auto& item : urls) {
-                try {
-                    std::wstring headers = (std::string(item.second) == "quota" ||
-                        std::string(item.second) == "subscription" ||
-                        std::string(item.second) == "mcp")
-                        ? Network::get_instance()->RawAuthorizationJsonHeaders(token, "https://zcode.z.ai", "https://zcode.z.ai/")
-                        : Network::get_instance()->BearerJsonHeaders(token, "https://zcode.z.ai", "https://zcode.z.ai/");
-
-                    Network::HttpResponse response = Network::get_instance()->RequestUrl(item.first, "GET", headers);
-
-                    if (!ResponseOk(response)) {
-                        std::ostringstream ss;
-                        ss << item.second << " HTTP " << response.statusCode;
-                        lastError = ss.str();
-
-                        UsageTelemetry::AccessStatus failure = UsageTelemetry::FromHttpFailure(
-                            response.statusCode,
-                            response.body,
-                            lastError
-                        );
-
-                        auto rank = [](UsageTelemetry::AccessState state) {
-                            switch (state) {
-                            case UsageTelemetry::AccessState::OutOfUsage: return 4;
-                            case UsageTelemetry::AccessState::RateLimited: return 3;
-                            case UsageTelemetry::AccessState::Unavailable: return 2;
-                            default: return 1;
-                            }
-                        };
-
-                        if (rank(failure.state) > rank(strongestFailure.state)) {
-                            strongestFailure = std::move(failure);
-                        }
-                        continue;
-                    }
-
-                    json root = JsonUtils::get_instance()->ParseOrNull(response.body);
-
-                    if (root.is_discarded() || root.is_null()) {
-                        lastError = std::string(item.second) + " returned invalid JSON";
-                        continue;
-                    }
-
-                    if (!EnvelopeSucceeded(root)) {
-                        lastError = std::string(item.second) + " returned an unsuccessful envelope";
-                        continue;
-                    }
-
-                    receivedSuccessfulResponse = true;
-                    std::string kind = item.second;
-
-                    if (kind == "current") {
-                        activeStartPlan = ApplyCurrentResponse(candidate, root) || activeStartPlan;
-                    }
-                    else if (kind == "balance") {
-                        // The current ZCode balance envelope can include both
-                        // plans and balances, so inspect both sections.
-                        activeStartPlan = ApplyCurrentResponse(candidate, root) || activeStartPlan;
-                        usableUsageData = ApplyBalanceResponse(candidate, root) || usableUsageData;
-                    }
-                    else if (kind == "quota") {
-                        usableUsageData = ApplyQuotaResponse(candidate, root) || usableUsageData;
-                    }
-                    else if (kind == "subscription") {
-                        ApplySubscriptionList(candidate, root);
-                    }
-                    else if (kind == "mcp") {
-                        ApplyMcpUsageResponse(candidate, root);
-                    }
-                }
-                catch (const std::exception& e) {
-                    lastError = e.what();
-                    UsageTelemetry::AccessStatus failure = UsageTelemetry::FromText(lastError);
-
-                    if (strongestFailure.state == UsageTelemetry::AccessState::Unknown) {
-                        strongestFailure = std::move(failure);
-                    }
-                }
-            }
-
-            if (receivedSuccessfulResponse) {
-                FinalizeZaiBars(candidate);
-                usableUsageData = usableUsageData || !candidate.bars.empty();
-
-                if (!usableUsageData || candidate.bars.empty()) {
-                    bestUnavailableReason = activeStartPlan
-                        ? "Z.Ai usage unavailable: the active plan returned no usage balances"
-                        : "Z.Ai usage unavailable: no active ZCode Start Plan or usable quota was returned";
-                    continue;
-                }
-
-                candidate.statusText = activeStartPlan
-                    ? "Source: active ZCode Start Plan"
-                    : "Source: Z.Ai quota endpoint";
-                FinalizeZAiAccess(candidate);
-                return candidate;
-            }
-        }
-
-        snapshot.statusText = bestUnavailableReason.empty()
-            ? "Z.Ai usage unavailable"
-            : bestUnavailableReason;
-
-        if (bestUnavailableReason.empty() && !lastError.empty()) {
-            snapshot.statusText += ": " + lastError;
-        }
-
-        if (!bestUnavailableReason.empty()) {
-            snapshot.access.state = UsageTelemetry::AccessState::Unavailable;
-            snapshot.access.detail = snapshot.statusText;
-        }
-        else {
-            snapshot.access = strongestFailure.state == UsageTelemetry::AccessState::Unknown
-                ? UsageTelemetry::FromText(snapshot.statusText)
-                : strongestFailure;
-        }
+        Client::Options options;
+        options.now = static_cast<long long>(std::time(nullptr));
+        const auto customBalance = Protocol::Trim(network->GetEnvText("ZCODE_PLAN_BILLING_BALANCE_URL"));
+        if (!customBalance.empty()) options.balanceUrl = customBalance;
+        options.currentUrl = Protocol::Trim(network->GetEnvText("ZCODE_PLAN_BILLING_CURRENT_URL"));
+        Snapshot snapshot = Client::Fetch(credentials, options, [&](const Client::Request& query) {
+            auto headers = query.bearer
+                ? network->BearerJsonHeaders(query.token, "https://zcode.z.ai", "https://zcode.z.ai/")
+                : network->RawAuthorizationJsonHeaders(query.token, "https://zcode.z.ai", "https://zcode.z.ai/");
+            for (const auto& extra : query.extraHeaders)
+                headers += network->Utf8ToWide(extra.first + ": " + extra.second + "\r\n");
+            const auto response = network->RequestUrl(query.url, "GET", headers, {}, false);
+            return Client::Response{ response.statusCode, response.body, response.serverUnixSeconds };
+        });
+        try { ApplyLocalTelemetryToSnapshot(snapshot, ReadZCodeLocalTelemetry()); }
+        catch (...) {} // A moved/locked telemetry database cannot invalidate live quota.
+        for (auto& bar : snapshot.bars) bar.resetText = Format::get_instance()->ResetShort(bar.resetAtUnixSeconds);
         return snapshot;
     }
 }

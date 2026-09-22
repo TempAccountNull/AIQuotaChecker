@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <cstring>
@@ -2839,6 +2840,43 @@ static void PanelBarSection(
     ImGui::Dummy(ImVec2(w, 0.0f));
 }
 
+// ZCode 3.14.0 reports the Coding Plan windows as "5-hour Coding credits"
+// and "Weekly Coding credits".  Those are useful provider labels in the
+// detail panel, but they are needlessly long and changed between ZCode
+// releases.  Keep the widget names stable and human-readable while retaining
+// the provider's identity as the drag/drop key.
+static std::string ZAiWidgetDisplayLabel(const ZAi::UsageBar& bar)
+{
+    std::string compact;
+    compact.reserve(bar.label.size());
+    for (unsigned char c : bar.label) {
+        if (std::isalnum(c)) compact.push_back(static_cast<char>(std::tolower(c)));
+    }
+
+    if (compact.find("codingcredits") != std::string::npos) {
+        if (compact.find("week") != std::string::npos) return "ZAi - Weekly";
+        if (compact.find("hour") != std::string::npos || compact.find("session") != std::string::npos)
+            return "ZAi - Session";
+    }
+
+    return bar.label.empty() ? bar.sublabel : bar.label;
+}
+
+static std::string ZAiWidgetKey(const ZAi::UsageBar& bar, const std::string& fallbackLabel)
+{
+    // WidgetBarRows is comma-delimited. The former identity was a JSON array
+    // containing commas, so one Z.Ai pin was split into several "No data"
+    // rows. Use a stable display-derived key that is safe for that setting.
+    const std::string& label = bar.label.empty() ? fallbackLabel : bar.label;
+    std::string compact;
+    compact.reserve(label.size());
+    for (unsigned char c : label) {
+        if (std::isalnum(c)) compact.push_back(static_cast<char>(std::tolower(c)));
+    }
+
+    return "Z.Ai:bar-" + (compact.empty() ? std::string("usage") : compact);
+}
+
 static void PanelInfoSection(const char* title, const std::vector<std::string>& lines)
 {
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -3366,11 +3404,10 @@ static void RenderZAiSections(const ZAi::Snapshot& snapshot)
 
     for (const ZAi::UsageBar& bar : snapshot.bars) {
         if (!bar.valid || !PanelShows(AppSettings::WidgetSectionQuota)) continue;
-        const char* title = !bar.label.empty() ? bar.label.c_str()
-            : (!bar.sublabel.empty() ? bar.sublabel.c_str() : "Usage");
-        PanelBarSection(title, true, bar.usedPercent,
-            PanelReset(bar.resetAtUnixSeconds, bar.resetText), std::string{},
-            true, std::string("Z.Ai:") + title);
+        const std::string title = ZAiWidgetDisplayLabel(bar);
+        PanelBarSection(title.c_str(), true, bar.usedPercent,
+            PanelReset(bar.resetAtUnixSeconds, bar.resetText), bar.sublabel,
+            true, ZAiWidgetKey(bar, bar.label.empty() ? title : bar.label));
         PanelRule();
     }
 
@@ -3405,7 +3442,8 @@ static void RenderZAiSections(const ZAi::Snapshot& snapshot)
             sub += "  ·  " + snapshot.mcp.level;
         }
 
-        PanelBarSection("MCP usage", snapshot.mcp.limit > 0, used, right, sub);
+        PanelBarSection("MCP Usage", snapshot.mcp.limit > 0, used, right, sub,
+            true, "Z.Ai:MCP");
         PanelRule();
     }
 
@@ -4385,11 +4423,74 @@ struct WidgetPeek
     LiveState liveState;
     // "<provider>:<window>", stable across restarts.
     std::string key;
+    // Previous versions used the visible Z.Ai label as the key. Keep it as an
+    // alias so an existing settings.ini pin resolves after the identity-based
+    // drag/drop key fix.
+    std::string legacyKey;
 };
 
 static WidgetPeek WidgetPeekSummary();
 static std::vector<WidgetPeek> WidgetPeekCandidates();
 static const std::vector<WidgetPeek>& WidgetPeekRows();
+static std::vector<std::string> WidgetBarKeys();
+
+// Older builds included the moving reset timestamp in Z.Ai coding identities,
+// so a refresh turned an already-pinned row into a permanent "No data"
+// placeholder. Compare the stable portion of those legacy keys as an alias;
+// new keys no longer contain that timestamp.
+static std::string StableZAiKeyPart(const std::string& key)
+{
+    const std::string prefix = "Z.Ai:coding:[";
+    if (key.rfind(prefix, 0) != 0 || key.back() != ']') return key;
+
+    size_t commas = 0;
+    for (size_t i = prefix.size(); i + 1 < key.size(); ++i) {
+        if (key[i] == ',') ++commas;
+    }
+
+    // The old shape was [type, unit, number, resetAt]. Keep the first three
+    // fields when resolving a key written by that build.
+    if (commas < 3) return key;
+    const size_t lastComma = key.rfind(',');
+    return lastComma == std::string::npos ? key : key.substr(0, lastComma) + "]";
+}
+
+static bool WidgetPeekKeyMatches(const WidgetPeek& candidate, const std::string& key)
+{
+    if (candidate.key == key || (!candidate.legacyKey.empty() && candidate.legacyKey == key)) {
+        return true;
+    }
+
+    const std::string stableCandidate = StableZAiKeyPart(candidate.key);
+    const std::string stableKey = StableZAiKeyPart(key);
+    // The candidate now has the stable three-field form, while a row saved by
+    // an older build has one additional reset timestamp. The normalized parts
+    // can therefore match even though only the incoming key is legacy.
+    if (stableCandidate == stableKey && candidate.key != key) return true;
+
+    // Some earlier builds serialized the coding identity with a different
+    // JSON number format. Decode the period field as a final compatibility
+    // fallback instead of allowing that formatting detail to strand a pin.
+    const std::string codingPrefix = "Z.Ai:coding:[\"CREDIT_LIMIT\",";
+    if (key.rfind(codingPrefix, 0) == 0 &&
+        (candidate.host == "Z.Ai" || candidate.host == "ZAi - Session" ||
+            candidate.host == "ZAi - Weekly")) {
+        const size_t unitBegin = codingPrefix.size();
+        const size_t unitEnd = key.find(',', unitBegin);
+        if (unitEnd != std::string::npos) {
+            const std::string unit = key.substr(unitBegin, unitEnd - unitBegin);
+            const std::string candidateText = candidate.window;
+            const bool session = unit.find('3') != std::string::npos &&
+                candidateText.find("5-hour") != std::string::npos;
+            const bool weekly = unit.find('6') != std::string::npos &&
+                candidateText.find("Weekly") != std::string::npos;
+            if (session || weekly) return true;
+        }
+    }
+
+    return !candidate.legacyKey.empty() &&
+        StableZAiKeyPart(candidate.legacyKey) == stableKey;
+}
 
 // The collapsed bar's contents: tick the windows you want, drag to reorder.
 // Candidates come from whatever the hosts are actually reporting right now, so
@@ -4403,17 +4504,7 @@ static void DrawWidgetBarRowPicker(float contentWidth)
     // The current selection, in order. Keys are kept even when their host is
     // not reporting right now - a host that has not refreshed yet, or is signed
     // out, must not silently delete a pick and then save the deletion.
-    std::vector<std::string> chosen;
-    {
-        std::stringstream stream(*R().widgetBarRows);
-        std::string key;
-        while (std::getline(stream, key, ',')) {
-            if (key.empty()) continue;
-            if (std::find(chosen.begin(), chosen.end(), key) == chosen.end()) {
-                chosen.push_back(key);
-            }
-        }
-    }
+    std::vector<std::string> chosen = WidgetBarKeys();
 
     if (candidates.empty() && chosen.empty()) {
         DrawSettingsMutedText("No quota windows reported yet - refresh a host first.");
@@ -4422,7 +4513,7 @@ static void DrawWidgetBarRowPicker(float contentWidth)
 
     const auto reporting = [&candidates](const std::string& key) {
         for (const WidgetPeek& c : candidates) {
-            if (c.key == key) return true;
+            if (WidgetPeekKeyMatches(c, key)) return true;
         }
         return false;
     };
@@ -4483,7 +4574,8 @@ static void DrawWidgetBarRowPicker(float contentWidth)
 
         ImGui::PushID(candidate.key.c_str());
         bool on = false;
-        std::string label = candidate.host + "  " + candidate.window;
+        std::string label = candidate.window.empty()
+            ? candidate.host : candidate.host + "  " + candidate.window;
         if (ImGui::Checkbox(label.c_str(), &on)) {
             chosen.push_back(candidate.key);
             changed = true;
@@ -5137,8 +5229,9 @@ static std::vector<WidgetPeek> WidgetPeekCandidates()
     const auto add = [&out, &liveState, &liveModel](const std::string& host, const std::string& window,
         bool valid, float used, long long resetAt, const std::string& resetText,
         const std::string& plan, const std::string& detail = std::string{},
-        bool resets = true) {
-        if (!valid || window.empty()) return;
+        bool resets = true, const std::string& stableKey = std::string{},
+        const std::string& legacyKey = std::string{}) {
+        if (!valid || (host.empty() && window.empty())) return;
 
         WidgetPeek peek;
         peek.valid = true;
@@ -5151,7 +5244,8 @@ static std::vector<WidgetPeek> WidgetPeekCandidates()
         peek.usedPercent = used;
         peek.resetAtUnixSeconds = resetAt;
         peek.resetText = resetText;
-        peek.key = host + ":" + window;
+        peek.key = stableKey.empty() ? host + ":" + window : stableKey;
+        peek.legacyKey = legacyKey;
 
         // Providers can report the same window twice (a server-driven limit
         // plus its legacy named field); first one wins.
@@ -5198,8 +5292,23 @@ static std::vector<WidgetPeek> WidgetPeekCandidates()
         liveModel = g_zaiState.context.model;
         for (const ZAi::UsageBar& b : g_zaiState.bars) {
             if (b.spendBalance) continue;
-            add("Z.Ai", !b.label.empty() ? b.label : b.sublabel,
-                b.valid, b.usedPercent, b.resetAtUnixSeconds, b.resetText, plan);
+            const std::string rawLabel = !b.label.empty() ? b.label : b.sublabel;
+            const std::string stableKey = ZAiWidgetKey(b, rawLabel);
+            const std::string displayLabel = ZAiWidgetDisplayLabel(b);
+            const bool renamed = displayLabel == "ZAi - Session" || displayLabel == "ZAi - Weekly";
+            add(renamed ? displayLabel : "Z.Ai",
+                renamed ? std::string{} : rawLabel,
+                b.valid, b.usedPercent, b.resetAtUnixSeconds, b.resetText,
+                renamed ? std::string{} : plan, std::string{}, true,
+                stableKey, "Z.Ai:" + rawLabel);
+        }
+        if (g_zaiState.mcp.valid && g_zaiState.mcp.limit > 0) {
+            const float used = Math::get_instance()->PercentUsed(
+                static_cast<double>(g_zaiState.mcp.used),
+                static_cast<double>(g_zaiState.mcp.limit));
+            add("MCP Usage", std::string{}, true, used,
+                g_zaiState.mcp.nextRefreshAtUnixSeconds, std::string{},
+                std::string{}, std::string{}, true, "Z.Ai:MCP");
         }
         AddContextCandidate(out, "Z.Ai", plan, g_zaiState.context);
     }
@@ -5244,6 +5353,11 @@ static std::vector<std::string> WidgetBarKeys()
     std::string key;
     while (std::getline(stream, key, ',')) {
         if (key.empty()) continue;
+        // Old comma-containing Z.Ai identities were split into fragments.
+        // Valid persisted widget keys always contain a provider separator;
+        // discard the orphan numeric/JSON fragments during migration.
+        if (key.find(':') == std::string::npos) continue;
+        if (key.rfind("Z.Ai:coding:[", 0) == 0 && key.find(']') == std::string::npos) continue;
         if (std::find(keys.begin(), keys.end(), key) == keys.end()) keys.push_back(key);
     }
     return keys;
@@ -5289,21 +5403,17 @@ static std::vector<WidgetPeek> WidgetPeekRowsUncached()
 {
     std::vector<WidgetPeek> rows;
 
-    const std::string spec = R().widgetBarRows ? *R().widgetBarRows : std::string{};
+    const std::vector<std::string> storedKeys = WidgetBarKeys();
 
-    if (!spec.empty()) {
+    if (!storedKeys.empty()) {
         const std::vector<WidgetPeek> all = WidgetPeekCandidates();
 
-        std::stringstream stream(spec);
-        std::string key;
-        while (std::getline(stream, key, ',')) {
-            while (!key.empty() && (key.front() == ' ' || key.front() == '	')) key.erase(key.begin());
-            while (!key.empty() && (key.back() == ' ' || key.back() == '	')) key.pop_back();
-            if (key.empty()) continue;
+        for (const std::string& storedKey : storedKeys) {
+            const std::string& key = storedKey;
 
             const WidgetPeek* found = nullptr;
             for (const WidgetPeek& candidate : all) {
-                if (candidate.key == key) { found = &candidate; break; }
+                if (WidgetPeekKeyMatches(candidate, key)) { found = &candidate; break; }
             }
 
             // Keys embed the window's display name, so relabelling a window
@@ -5314,7 +5424,12 @@ static std::vector<WidgetPeek> WidgetPeekRowsUncached()
             if (!found) {
                 const std::string wanted = CompactKey(key);
                 for (const WidgetPeek& candidate : all) {
-                    if (CompactKey(candidate.key) == wanted) { found = &candidate; break; }
+                    if (WidgetPeekKeyMatches(candidate, key) ||
+                        CompactKey(candidate.key) == wanted ||
+                        (!candidate.legacyKey.empty() && CompactKey(candidate.legacyKey) == wanted)) {
+                        found = &candidate;
+                        break;
+                    }
                 }
             }
 
@@ -5392,11 +5507,29 @@ static WidgetPeek WidgetPeekSummary()
         for (const ZAi::UsageBar& b : g_zaiState.bars) {
             if (!b.valid || b.spendBalance) continue;
             peek.valid = true;
-            peek.window = !b.label.empty() ? b.label : b.sublabel;
+            const std::string displayLabel = ZAiWidgetDisplayLabel(b);
+            if (displayLabel == "ZAi - Session" || displayLabel == "ZAi - Weekly") {
+                peek.host = displayLabel;
+                peek.window.clear();
+                peek.plan.clear();
+            }
+            else {
+                peek.window = !b.label.empty() ? b.label : b.sublabel;
+            }
             peek.usedPercent = b.usedPercent;
             peek.resetAtUnixSeconds = b.resetAtUnixSeconds;
             peek.resetText = b.resetText;
             break;
+        }
+        if (!peek.valid && g_zaiState.mcp.valid && g_zaiState.mcp.limit > 0) {
+            peek.valid = true;
+            peek.host = "MCP Usage";
+            peek.window.clear();
+            peek.plan.clear();
+            peek.usedPercent = Math::get_instance()->PercentUsed(
+                static_cast<double>(g_zaiState.mcp.used),
+                static_cast<double>(g_zaiState.mcp.limit));
+            peek.resetAtUnixSeconds = g_zaiState.mcp.nextRefreshAtUnixSeconds;
         }
         break;
     }
@@ -5678,10 +5811,18 @@ static void DrawWidgetPeekStrip(float width, bool onTop)
     if (!dropKey.empty()) {
         // Dropping onto the implicit "follow the open tab" bar makes the list
         // explicit, starting with what was just dropped.
-        std::vector<std::string>::iterator existing =
-            std::find(keys.begin(), keys.end(), dropKey);
+        const std::vector<WidgetPeek> candidates = WidgetPeekCandidates();
+        const WidgetPeek* dropped = nullptr;
+        for (const WidgetPeek& candidate : candidates) {
+            if (WidgetPeekKeyMatches(candidate, dropKey)) {
+                dropped = &candidate;
+                break;
+            }
+        }
 
-        if (existing != keys.end()) keys.erase(existing);
+        keys.erase(std::remove_if(keys.begin(), keys.end(), [&](const std::string& key) {
+            return key == dropKey || (dropped && WidgetPeekKeyMatches(*dropped, key));
+        }), keys.end());
 
         const size_t at = std::min(static_cast<size_t>(std::max(0, dropAt)), keys.size());
         keys.insert(keys.begin() + static_cast<long long>(at), dropKey);

@@ -1012,26 +1012,27 @@ namespace Codex {
             return;
         }
 
-        std::string label = bar.label;
-        std::string sublabel = bar.sublabel;
+        // Different Codex response paths spell the same reserve name as
+        // "GPT-reserve" and "GPT Reserve". Compare display text by its
+        // alphanumeric form so punctuation/case differences cannot create a
+        // second copy of the same weekly reserve.
+        const auto comparable = [](const std::string& value) {
+            std::string result;
+            result.reserve(value.size());
+            for (unsigned char c : value) {
+                if (std::isalnum(c)) {
+                    result.push_back(static_cast<char>(std::tolower(c)));
+                }
+            }
+            return result;
+        };
 
-        std::transform(label.begin(), label.end(), label.begin(), [](unsigned char c) {
-            return static_cast<char>(std::tolower(c));
-        });
-        std::transform(sublabel.begin(), sublabel.end(), sublabel.begin(), [](unsigned char c) {
-            return static_cast<char>(std::tolower(c));
-        });
+        const std::string label = comparable(bar.label);
+        const std::string sublabel = comparable(bar.sublabel);
 
         for (const UsageBar& existing : snapshot.bars) {
-            std::string existingLabel = existing.label;
-            std::string existingSublabel = existing.sublabel;
-
-            std::transform(existingLabel.begin(), existingLabel.end(), existingLabel.begin(), [](unsigned char c) {
-                return static_cast<char>(std::tolower(c));
-            });
-            std::transform(existingSublabel.begin(), existingSublabel.end(), existingSublabel.begin(), [](unsigned char c) {
-                return static_cast<char>(std::tolower(c));
-            });
+            const std::string existingLabel = comparable(existing.label);
+            const std::string existingSublabel = comparable(existing.sublabel);
 
             if (existingLabel == label &&
                 existingSublabel == sublabel &&
@@ -1939,6 +1940,10 @@ namespace Codex {
         std::sort(snapshot.resetCreditLedger.begin(), snapshot.resetCreditLedger.end(), byExpiry);
     }
 
+    // Defined below with the legacy response parser. App-server payloads can
+    // publish reserve pools such as Luna Reserve in this same shape.
+    static void ParseLegacyAdditionalRateLimits(const json& usageJson, Snapshot& snapshot);
+
     static Snapshot ParseAppServerSnapshot(
         const json& accountResult,
         const json& result
@@ -1978,6 +1983,11 @@ namespace Codex {
                 ParseCodexMonthlyUsage(*entry.value, snapshot);
             }
         }
+
+        // Newer Codex app-server payloads may publish additional reserve pools
+        // outside the canonical rate-limit map. Reuse the compatibility parser
+        // so Luna Reserve enters Snapshot::bars and the widget picker.
+        ParseLegacyAdditionalRateLimits(result, snapshot);
 
         if (mainRateLimit) {
             snapshot.plan = FormatCodexPlanToken(ExtractAppServerPlanType(accountResult, *mainRateLimit));

@@ -182,7 +182,8 @@ namespace Network
         const std::string& url,
         const std::string& method,
         const std::wstring& headers,
-        const std::string& body
+        const std::string& body,
+        bool followRedirects
     ) const
     {
         std::wstring wideUrl = Utf8ToWide(url);
@@ -248,6 +249,18 @@ namespace Network
             throw std::runtime_error("WinHttpOpenRequest failed");
         }
 
+        if (!followRedirects) {
+            // ZCode sends two account-scoped authorization headers. A quota
+            // redirect must not forward either credential to another endpoint.
+            DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+            if (!WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy))) {
+                WinHttpCloseHandle(request);
+                WinHttpCloseHandle(connect);
+                WinHttpCloseHandle(session);
+                throw std::runtime_error("Could not disable HTTP redirects");
+            }
+        }
+
         DWORD decompressionFlags = WINHTTP_DECOMPRESSION_FLAG_GZIP | WINHTTP_DECOMPRESSION_FLAG_DEFLATE;
         WinHttpSetOption(request, WINHTTP_OPTION_DECOMPRESSION, &decompressionFlags, sizeof(decompressionFlags));
 
@@ -289,6 +302,22 @@ namespace Network
             WINHTTP_NO_HEADER_INDEX
         );
 
+        long long serverUnixSeconds = 0;
+        SYSTEMTIME serverDate{};
+        DWORD dateSize = sizeof(serverDate);
+        if (WinHttpQueryHeaders(request, WINHTTP_QUERY_DATE | WINHTTP_QUERY_FLAG_SYSTEMTIME,
+            WINHTTP_HEADER_NAME_BY_INDEX, &serverDate, &dateSize, WINHTTP_NO_HEADER_INDEX)) {
+            FILETIME fileTime{};
+            if (SystemTimeToFileTime(&serverDate, &fileTime)) {
+                ULARGE_INTEGER ticks{};
+                ticks.LowPart = fileTime.dwLowDateTime;
+                ticks.HighPart = fileTime.dwHighDateTime;
+                constexpr ULONGLONG epoch = 116444736000000000ULL;
+                if (ticks.QuadPart >= epoch)
+                    serverUnixSeconds = static_cast<long long>((ticks.QuadPart - epoch) / 10000000ULL);
+            }
+        }
+
         std::string responseBody;
 
         for (;;) {
@@ -313,7 +342,7 @@ namespace Network
         WinHttpCloseHandle(connect);
         WinHttpCloseHandle(session);
 
-        return { static_cast<int>(status), responseBody };
+        return { static_cast<int>(status), responseBody, serverUnixSeconds };
     }
     Client* get_instance()
     {
@@ -332,5 +361,5 @@ namespace Network
     std::wstring JsonHeaders(const std::string& authorizationHeader, const std::string& origin, const std::string& referer) { return get_instance()->JsonHeaders(authorizationHeader, origin, referer); }
     std::wstring BearerJsonHeaders(const std::string& token, const std::string& origin, const std::string& referer) { return get_instance()->BearerJsonHeaders(token, origin, referer); }
     std::wstring RawAuthorizationJsonHeaders(const std::string& token, const std::string& origin, const std::string& referer) { return get_instance()->RawAuthorizationJsonHeaders(token, origin, referer); }
-    HttpResponse RequestUrl(const std::string& url, const std::string& method, const std::wstring& headers, const std::string& body) { return get_instance()->RequestUrl(url, method, headers, body); }
+    HttpResponse RequestUrl(const std::string& url, const std::string& method, const std::wstring& headers, const std::string& body, bool followRedirects) { return get_instance()->RequestUrl(url, method, headers, body, followRedirects); }
 }

@@ -9,6 +9,7 @@ namespace Network
     {
         int statusCode = 0;
         std::string body;
+        long long serverUnixSeconds = 0; // Optional HTTP Date; used for server-clock expiry.
     };
 
     class Client final
@@ -46,7 +47,8 @@ namespace Network
             const std::string& url,
             const std::string& method,
             const std::wstring& headers,
-            const std::string& body = {}
+            const std::string& body = {},
+            bool followRedirects = true
         ) const;
     };
 
@@ -64,5 +66,5 @@ namespace Network
     std::wstring JsonHeaders(const std::string& authorizationHeader, const std::string& origin, const std::string& referer);
     std::wstring BearerJsonHeaders(const std::string& token, const std::string& origin, const std::string& referer);
     std::wstring RawAuthorizationJsonHeaders(const std::string& token, const std::string& origin, const std::string& referer);
-    HttpResponse RequestUrl(const std::string& url, const std::string& method, const std::wstring& headers, const std::string& body = {});
+    HttpResponse RequestUrl(const std::string& url, const std::string& method, const std::wstring& headers, const std::string& body = {}, bool followRedirects = true);
 }

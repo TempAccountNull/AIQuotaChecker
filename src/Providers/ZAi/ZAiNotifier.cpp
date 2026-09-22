@@ -236,12 +236,18 @@ namespace ZAiNotifier
                 return;
             }
 
+            g_watches.erase(std::remove_if(g_watches.begin(), g_watches.end(), [&](const WatchState& watch) {
+                return std::none_of(snapshot.bars.begin(), snapshot.bars.end(), [&](const ZAi::UsageBar& bar) {
+                    return (bar.identity.empty() ? bar.label : bar.identity) == watch.key;
+                });
+            }), g_watches.end());
+
             for (const ZAi::UsageBar& bar : snapshot.bars) {
                 if (!bar.valid) {
                     continue;
                 }
 
-                WatchState& watch = GetWatchLocked(bar.label, static_cast<LONGLONG>(bar.resetAtUnixSeconds));
+                WatchState& watch = GetWatchLocked(bar.identity.empty() ? bar.label : bar.identity, static_cast<LONGLONG>(bar.resetAtUnixSeconds));
                 ZAiNotifier::QuotaWarningRule rule = GetRuleForBar(config, bar);
                 bool exhausted = bar.usedPercent >= 100.0f;
 

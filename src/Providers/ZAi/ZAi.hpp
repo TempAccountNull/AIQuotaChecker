@@ -9,6 +9,7 @@ namespace ZAi
 {
     struct UsageBar
     {
+        std::string identity; // Stable bucket/window key; distinct from the display label.
         std::string label;
         std::string sublabel;
         std::string resetText;
@@ -20,6 +21,7 @@ namespace ZAi
         bool green = false;
         bool thin = false;
         bool spendBalance = false;
+        bool sharedRateLimit = false; // Coding windows that all gate the same requests.
     };
 
     struct DetailRow

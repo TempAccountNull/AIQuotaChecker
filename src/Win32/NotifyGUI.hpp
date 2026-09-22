@@ -2,7 +2,7 @@
 #include <cstdint>
 
 // ---------------------------------------------------------------------------
-// NotifyGUI — lightweight ImGui overlay notification system.
+// NotifyGUI - lightweight ImGui overlay notification system.
 //
 // Thread-safe: Add() may be called from any thread (background scanner, etc.).
 // Render() must be called from the main/render thread each frame, after
@@ -40,10 +40,10 @@ namespace NotifyGUI
     bool GetInsideWindow();
 
     // Enqueue a notification. Thread-safe.
-    //   message  — text to display (truncated to 255 chars)
-    //   position — corner to stack notifications in
-    //   duration — seconds before the notification disappears (fades last 1 s)
-    //   color    — text color; build with NOTIFY_COL32(r,g,b,a)
+    //   message  - text to display (truncated to 255 chars)
+    //   position - corner to stack notifications in
+    //   duration - seconds before the notification disappears (fades last 1 s)
+    //   color    - text color; build with NOTIFY_COL32(r,g,b,a)
     void Add(const char* message,
         NotifyPosition position = NotifyPosition::BOTTOM_RIGHT,
         float          duration = 5.0f,
