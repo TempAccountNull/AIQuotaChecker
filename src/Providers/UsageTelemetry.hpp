@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "Text.hpp"
+
 namespace UsageTelemetry
 {
     enum class AccessState
@@ -148,14 +150,6 @@ namespace UsageTelemetry
         std::vector<std::string> sessionDetails;
     };
 
-    inline std::string LowerCopy(std::string text)
-    {
-        std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
-            return static_cast<char>(std::tolower(c));
-        });
-        return text;
-    }
-
     inline bool ContainsAny(const std::string& lower, std::initializer_list<const char*> values)
     {
         for (const char* value : values) {
@@ -168,7 +162,7 @@ namespace UsageTelemetry
 
     inline AccessState ClassifyText(const std::string& text)
     {
-        const std::string lower = LowerCopy(text);
+        const std::string lower = Text::get_instance()->ToLowerCopy(text);
 
         if (ContainsAny(lower, {
             "out of usage", "out of extra usage", "out of usage credits",

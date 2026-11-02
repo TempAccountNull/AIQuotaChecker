@@ -1,5 +1,8 @@
-$authPath = "$env:USERPROFILE\.codex\auth.json"
-$auth = Get-Content $authPath -Raw | ConvertFrom-Json
+# Read-only: two GETs with the token in auth.json, which is never refreshed here.
+# CODEX_HOME moves the Codex home, as it does for Codex and AIQuotaChecker.
+$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }
+$authPath = Join-Path $codexHome "auth.json"
+$auth = Get-Content -LiteralPath $authPath -Raw | ConvertFrom-Json
 
 $token = $auth.tokens.access_token
 $accountId = $auth.tokens.account_id
@@ -48,5 +51,8 @@ $ledgerUsable = @(
   BankedFromUsage = $banked
   LedgerTotal = $credits.Count
   LedgerUsable = $ledgerUsable
+  LedgerAvailableCount = $ledger.available_count
+  TotalEarned = $ledger.total_earned_count
+  HistoryEnabled = $ledger.history_enabled
   NotReflectedYet = [Math]::Max($ledgerUsable - $banked, 0)
 } | Format-List

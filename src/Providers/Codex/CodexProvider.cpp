@@ -1,8 +1,8 @@
 #include "Global.hpp"
 #include "CodexProvider.hpp"
 
-#include "CodexNotifier.hpp"
 #include "Network.hpp"
+#include "Text.hpp"
 
 #include <exception>
 #include <string>
@@ -10,13 +10,41 @@
 
 namespace
 {
+    constexpr std::uint32_t kNotifyCyan = NOTIFY_COL32(0, 220, 255, 255);
 
-    static CodexNotifier::QuotaWarningRule ToNotifierRule(const AppSettings::QuotaWarningRule& src)
+    // A bar's toast wording, warning rule and watch identity.
+    QuotaNotifier::Point CodexPoint(const Codex::UsageBar& bar, const AppSettings::CodexQuotaWarnings& rules)
     {
-        CodexNotifier::QuotaWarningRule rule;
-        rule.enabled = src.enabled;
-        rule.percent = src.percent;
-        return rule;
+        QuotaNotifier::Point point;
+        point.usedPercent = bar.usedPercent;
+        point.resetAtUnixSeconds = bar.resetAtUnixSeconds;
+        point.rule = rules.weekly;
+
+        const std::string& label = bar.label;
+        const auto has = [&](const char* word) { return label.find(word) != std::string::npos; };
+
+        if (has("Session") || has("session") || has("5-hour") || has("5h")) {
+            point.name = "5-hour limit/session";
+            point.rule = rules.fiveHour;
+        }
+        // Free plans get a 30-day main window; it is not the weekly quota.
+        else if (has("Monthly")) {
+            point.name = "monthly limit";
+        }
+        else if (has("Daily")) {
+            point.name = "daily limit";
+        }
+        else if (label == "Weekly" && bar.sublabel.empty()) {
+            point.name = "weekly - all models";
+        }
+        else {
+            point.name = bar.sublabel.empty() ? label : label + " (" + bar.sublabel + ")";
+        }
+
+        // Every bar is its own window. Bars that shared one key flipped the
+        // watch between their reset times on each poll and toasted every frame.
+        point.key = Text::get_instance()->CompactLower(label + "|" + bar.sublabel, false);
+        return point;
     }
 }
 
@@ -101,17 +129,6 @@ void CodexProvider::SetAccountSource(int source, const std::string& customAuthPa
     m_snapshot = switching;
 }
 
-int CodexProvider::AccountSource() const
-{
-    return AppSettings::ClampCodexAccountSource(m_accountSource.load());
-}
-
-std::string CodexProvider::CustomAuthPath() const
-{
-    std::lock_guard<std::mutex> lock(m_sourceMutex);
-    return m_customAuthPath;
-}
-
 void CodexProvider::SetRateLimitCallback(RateLimitCallback callback)
 {
     m_rateLimitCallback = callback;
@@ -131,19 +148,7 @@ void CodexProvider::SaveSettings(AppSettings::Settings& settings) const
 
 void CodexProvider::ApplyRuntime(NotifyPosition position, int quotaRepeatSeconds)
 {
-    CodexNotifier::SetPosition(position);
-
-    CodexNotifier::Config cfg;
-    cfg.enabled = m_notifySettings.enabled;
-    cfg.resetCredits = m_notifySettings.resetCredits;
-    cfg.prepareReset = m_notifySettings.prepareReset;
-    cfg.exactReset = m_notifySettings.exactReset;
-    cfg.prepareMinutes = m_notifySettings.prepareMinutes;
-    cfg.fiveHour = ToNotifierRule(m_quotaWarnings.fiveHour);
-    cfg.weekly = ToNotifierRule(m_quotaWarnings.weekly);
-
-    CodexNotifier::SetConfig(cfg);
-    CodexNotifier::SetQuotaNotificationRepeatSeconds(quotaRepeatSeconds);
+    m_notifier.Configure(position, m_notifySettings, quotaRepeatSeconds);
 }
 
 void CodexProvider::HandleRateLimit(const std::string& detail)
@@ -151,11 +156,6 @@ void CodexProvider::HandleRateLimit(const std::string& detail)
     if (m_rateLimitCallback) {
         m_rateLimitCallback("Codex", detail);
     }
-}
-
-void CodexProvider::RefreshThunk()
-{
-    CodexProvider::get_instance()->RefreshAsync();
 }
 
 void CodexProvider::RefreshAsync()
@@ -225,7 +225,10 @@ void CodexProvider::RefreshAsync()
 
         *self->Loading() = false;
 
-        if (sourceChanged) {
+        // Re-read after clearing Loading: a switch that landed in between saw
+        // a refresh in flight, skipped its own, and would otherwise leave the
+        // old account on screen until the next auto refresh.
+        if (sourceChanged || self->m_sourceGeneration.load() != sourceGeneration) {
             self->RefreshAsync();
         }
     }).detach();
@@ -273,12 +276,37 @@ void CodexProvider::RefreshContextAsync()
 
 void CodexProvider::PollNotifications()
 {
-    Codex::Snapshot snapshot;
+    std::vector<QuotaNotifier::Point> points;
+    size_t resetCredits = 0;
 
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        snapshot = m_snapshot;
+
+        for (const Codex::UsageBar& bar : m_snapshot.bars) {
+            if (bar.valid && bar.quotaNotificationEligible) {
+                points.push_back(CodexPoint(bar, m_quotaWarnings));
+            }
+        }
+
+        resetCredits = m_snapshot.resetCreditsAvailableCount >= 0
+            ? static_cast<size_t>(m_snapshot.resetCreditsAvailableCount)
+            : m_snapshot.resetCredits.size();
     }
 
-    CodexNotifier::Poll(snapshot, &CodexProvider::RefreshThunk);
+    if (m_notifier.Poll(points)) {
+        RefreshAsync();
+    }
+
+    // Once per new count, so it reminds again when another reset is earned.
+    if (resetCredits == 0) {
+        m_resetCreditsNoticed = 0;
+    }
+    else if (m_notifySettings.resetCredits && resetCredits != m_resetCreditsNoticed) {
+        m_notifier.Notify("Codex reset credits: You have " + std::to_string(resetCredits) +
+            (resetCredits == 1
+                ? " reset available to use in Codex. Make sure to use it!"
+                : " resets available to use in Codex. Make sure to use them!"),
+            kNotifyCyan, 8.0f);
+        m_resetCreditsNoticed = resetCredits;
+    }
 }

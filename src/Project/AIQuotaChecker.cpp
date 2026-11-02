@@ -8,10 +8,11 @@
 #include <algorithm>
 #include <cstdlib>
 #include <atomic>
-#include <cctype>
+#include <ctime>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <string>
 
@@ -23,25 +24,16 @@
 #include "AppSettings.hpp"
 #include "CodexProvider.hpp"
 #include "ClaudeProvider.hpp"
-#include "KSharedClock.hpp"
 #include "NotifyGUI.hpp"
 #include "JsonUtils.hpp"
-#include "Network.hpp"
 #include "Renderer.hpp"
 #include "ResetTime.hpp"
-#include "Text.hpp"
-#include "Math.hpp"
-#include "Format.hpp"
 #include "GrokProvider.hpp"
 #include "ZAiProvider.hpp"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 
 #pragma comment(lib, "d3d11.lib")
-
-#ifndef IDI_AIQUOTACHECKER
-#define IDI_AIQUOTACHECKER 107
-#endif
 
 namespace
 {
@@ -62,13 +54,6 @@ namespace
     static ImGuiContext* g_mainImGuiContext = nullptr;
     static ImGuiContext* g_settingsImGuiContext = nullptr;
 
-    static constexpr int kTitleBarHeight = 38;
-    static constexpr int kResizeBorder = 6;
-    // Width of the [-][widget][X] strip drawn by Renderer::DrawCustomTitleBar.
-    // Everything else in the title bar is HTCAPTION, and Windows consumes those
-    // clicks for dragging before ImGui can see them.
-    static constexpr int kTitleBarButtonStrip = 120;
-
     static constexpr int kWidgetWidth = 360;
     static constexpr int kWidgetHeight = 620;
     static constexpr int kWidgetMargin = 12;
@@ -88,23 +73,19 @@ namespace
     static constexpr int kWidgetMinHeight = 190;
     static constexpr int kWidgetResizeDeadband = 3;
 
-    // Keep in sync with the pill row drawn by Renderer::DrawWidgetUi.
+    // Height of the draggable header, and the width of its pill row (pin /
+    // refresh / settings / close) at the right edge. Keep in sync with
+    // Renderer::DrawWidgetUi.
+    static constexpr int kWidgetCaptionHeight = 34;
     static constexpr int kWidgetButtonStrip = 136;
     static constexpr double kWidgetRetractAfterSeconds = 1.2;
-    // Retracting is a deliberate, watchable slide; dropping back down has to
-    // feel immediate because the pointer is already reaching for the panel.
-    static constexpr double kWidgetRetractPixelsPerSecond = 170.0;
+    // Rolling up is instant; dropping back down is a quick slide.
     static constexpr double kWidgetExpandPixelsPerSecond = 2600.0;
 
-    static bool g_minimizeRequest = false;
-    static bool g_widgetMode = false;
     // Pinned keeps the panel down: no auto-retract, only the hover slide is
     // suppressed - the pill still toggles it back.
     static bool g_widgetPinned = false;
     static bool g_widgetAlwaysOnTop = true;
-    // Last topmost state actually applied to the window, so a Settings change
-    // can be detected and applied without touching z-order every frame.
-    static bool g_widgetTopmostApplied = true;
     // True once the slide has reached its target, so a later position change
     // can be attributed to the user dragging the panel rather than to us.
     static bool g_widgetSettled = false;
@@ -220,7 +201,6 @@ namespace
         }
         return ClampWidgetMonitor(g_widgetMonitor);
     }
-    static std::string g_widgetOrder = "codex,claude,zai,grok";
     static std::string g_widgetBarRows;
     static int g_uiFontSize = 14;
     static int g_widgetSections = AppSettings::kWidgetSectionAll;
@@ -249,6 +229,10 @@ namespace
     };
 
     static std::atomic_uint g_autoRefreshDisableMask = 0;
+    // Providers switched off by a rate limit this session. Settings shows
+    // them off, but settings.ini keeps the user's own choice, so one 429 does
+    // not disable auto refresh for good.
+    static unsigned int g_rateLimitPausedMask = 0;
     static std::mutex g_autoRefreshWarningMutex;
     static std::string g_autoRefreshWarning;
 
@@ -324,6 +308,7 @@ namespace
             return;
         }
 
+        g_rateLimitPausedMask |= mask;
         if ((mask & AutoRefreshProviderCodex) != 0) g_codexAutoRefreshEnabled = false;
         if ((mask & AutoRefreshProviderClaude) != 0) g_claudeAutoRefreshEnabled = false;
         if ((mask & AutoRefreshProviderZAi) != 0) g_zaiAutoRefreshEnabled = false;
@@ -365,18 +350,12 @@ namespace
         AppSettings::Load(settings);
 
         g_showRemaining = settings.showRemaining;
-#if defined(GUI_AND_WIDGET)
-        g_widgetMode = settings.widgetMode;
-#elif defined(GUI_ONLY)
-        g_widgetMode = false;
-#else
-        g_widgetMode = true;
-#endif
         g_widgetPinned = settings.widgetPinned;
         g_widgetAlwaysOnTop = settings.widgetAlwaysOnTop;
         g_widgetAnchor = AppSettings::ClampWidgetAnchor(settings.widgetAnchor);
-        g_widgetMonitor = ClampWidgetMonitor(settings.widgetMonitor);
-        g_widgetOrder = settings.widgetOrder;
+        // Kept as saved: layout clamps it, so an undocked monitor is still
+        // remembered once it comes back.
+        g_widgetMonitor = settings.widgetMonitor;
         g_widgetBarRows = settings.widgetBarRows;
         g_uiFontSize = AppSettings::ClampUiFontSize(settings.uiFontSize);
         g_widgetSections = settings.widgetSections;
@@ -409,12 +388,10 @@ namespace
     {
         AppSettings::Settings settings;
         settings.showRemaining = g_showRemaining;
-        settings.widgetMode = g_widgetMode;
         settings.widgetPinned = g_widgetPinned;
         settings.widgetAlwaysOnTop = g_widgetAlwaysOnTop;
         settings.widgetAnchor = AppSettings::ClampWidgetAnchor(g_widgetAnchor);
         settings.widgetMonitor = g_widgetMonitor;
-        settings.widgetOrder = g_widgetOrder;
         settings.widgetBarRows = g_widgetBarRows;
         settings.uiFontSize = AppSettings::ClampUiFontSize(g_uiFontSize);
         settings.widgetSections = g_widgetSections;
@@ -424,10 +401,10 @@ namespace
         settings.notificationPositionIndex = g_notifyPositionIndex;
         settings.autoRefreshEnabled = g_autoRefreshEnabled;
         settings.autoRefreshMinutes = AppSettings::ClampAutoRefreshMinutes(g_autoRefreshMinutes);
-        settings.codexAutoRefreshEnabled = g_codexAutoRefreshEnabled;
-        settings.claudeAutoRefreshEnabled = g_claudeAutoRefreshEnabled;
-        settings.zaiAutoRefreshEnabled = g_zaiAutoRefreshEnabled;
-        settings.grokAutoRefreshEnabled = g_grokAutoRefreshEnabled;
+        settings.codexAutoRefreshEnabled = g_codexAutoRefreshEnabled || (g_rateLimitPausedMask & AutoRefreshProviderCodex);
+        settings.claudeAutoRefreshEnabled = g_claudeAutoRefreshEnabled || (g_rateLimitPausedMask & AutoRefreshProviderClaude);
+        settings.zaiAutoRefreshEnabled = g_zaiAutoRefreshEnabled || (g_rateLimitPausedMask & AutoRefreshProviderZAi);
+        settings.grokAutoRefreshEnabled = g_grokAutoRefreshEnabled || (g_rateLimitPausedMask & AutoRefreshProviderGrok);
         settings.claudeAccountSource = AppSettings::ClampClaudeAccountSource(g_claudeAccountSource);
         settings.claudeThinkingShimmerSpeedPercent = AppSettings::ClampClaudeThinkingShimmerSpeedPercent(
             g_claudeThinkingShimmerSpeedPercent
@@ -441,26 +418,6 @@ namespace
         GrokProvider::get_instance()->SaveSettings(settings);
 
         return AppSettings::Save(settings);
-    }
-
-    static void RefreshCodexAsync()
-    {
-        CodexProvider::get_instance()->RefreshAsync();
-    }
-
-    static void RefreshClaudeAsync()
-    {
-        ClaudeProvider::get_instance()->RefreshAsync();
-    }
-
-    static void RefreshZAiAsync()
-    {
-        ZAiProvider::get_instance()->RefreshAsync();
-    }
-
-    static void RefreshGrokAsync()
-    {
-        GrokProvider::get_instance()->RefreshAsync();
     }
 
     static bool CreateRenderTarget()
@@ -554,21 +511,31 @@ namespace
         }
     }
 
-    static void DestroySettingsWindow();
     static void RepositionWidget();
     static RECT WidgetRestRect(bool retracted, int fullHeight);
+    static LRESULT HandleWindowMessage(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 
+    // Two windows, two ImGui contexts: the backend reads state from the
+    // CURRENT context, so select the one that owns this hwnd - and restore
+    // the caller's afterwards. Messages arrive synchronously from inside a
+    // frame (SetWindowPos from the Settings pickers, the file dialog's modal
+    // loop), and leaving the other context current there crashed the next
+    // ImGui call of that frame.
     static LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
     {
-        // Two windows, two ImGui contexts: the backend reads state from the
-        // CURRENT context, so select the one that owns this hwnd first.
-        if (hwnd == g_settingsHwnd && g_settingsImGuiContext) {
-            ImGui::SetCurrentContext(g_settingsImGuiContext);
-        }
-        else if (g_mainImGuiContext) {
-            ImGui::SetCurrentContext(g_mainImGuiContext);
-        }
+        ImGuiContext* const previous = ImGui::GetCurrentContext();
+        ImGui::SetCurrentContext(hwnd == g_settingsHwnd && g_settingsImGuiContext
+            ? g_settingsImGuiContext
+            : g_mainImGuiContext);
 
+        const LRESULT result = HandleWindowMessage(hwnd, msg, wparam, lparam);
+
+        ImGui::SetCurrentContext(previous);
+        return result;
+    }
+
+    static LRESULT HandleWindowMessage(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
+    {
         if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam)) {
             return true;
         }
@@ -624,39 +591,17 @@ namespace
             RECT rc{};
             GetWindowRect(hwnd, &rc);
 
-            int x = pt.x - rc.left;
-            int y = pt.y - rc.top;
+            const int x = pt.x - rc.left;
+            const int y = pt.y - rc.top;
+            const int w = rc.right - rc.left;
 
-            int w = rc.right - rc.left;
-            int h = rc.bottom - rc.top;
-
-            bool left = x >= 0 && x < kResizeBorder;
-            bool right = x <= w && x >= w - kResizeBorder;
-            bool top = y >= 0 && y < kResizeBorder;
-            bool bottom = y <= h && y >= h - kResizeBorder;
-
-            if (top && left) return HTTOPLEFT;
-            if (top && right) return HTTOPRIGHT;
-            if (bottom && left) return HTBOTTOMLEFT;
-            if (bottom && right) return HTBOTTOMRIGHT;
-            if (left) return HTLEFT;
-            if (right) return HTRIGHT;
-            if (top) return HTTOP;
-            if (bottom) return HTBOTTOM;
-
-            const int captionHeight = g_widgetMode ? 34 : kTitleBarHeight;
-            // The widget header carries four pills (pin / refresh / restore /
-            // close) spanning ~114px from the right edge. Anything narrower
-            // reports HTCAPTION over them and Windows consumes the click as a
-            // window drag before ImGui ever sees a button press.
-            const int buttonStrip = g_widgetMode ? kWidgetButtonStrip : kTitleBarButtonStrip;
-            bool inButtonArea = y >= 0 && y < captionHeight && x >= w - buttonStrip && x < w;
-
-            if (!inButtonArea && y >= 0 && y < captionHeight) {
-                return HTCAPTION;
-            }
-
-            return HTCLIENT;
+            // The header drags the widget, except over its pill row: reporting
+            // HTCAPTION there would let Windows take the click as a drag before
+            // ImGui saw the button. No resize borders - the widget sizes itself
+            // to its content, and borders only stole the header's drag area.
+            const bool inHeader = y >= 0 && y < kWidgetCaptionHeight;
+            const bool inButtonArea = inHeader && x >= w - kWidgetButtonStrip && x < w;
+            return inHeader && !inButtonArea ? HTCAPTION : HTCLIENT;
         }
 
         case WM_SIZE:
@@ -685,11 +630,18 @@ namespace
             }
             break;
 
+        case WM_SETTINGCHANGE:
+            // The taskbar moved, resized or toggled auto-hide.
+            if (wparam != SPI_SETWORKAREA) {
+                break;
+            }
+            [[fallthrough]];
+
         case WM_DISPLAYCHANGE:
-            // Monitors added, removed or rearranged: the stored index and the
-            // cached work area both go stale, so rebuild and re-park.
+            // Monitors added, removed or rearranged: the cached work areas go
+            // stale, so rebuild and re-park. The chosen monitor index is kept;
+            // layout clamps it while that monitor is missing.
             RefreshMonitors();
-            g_widgetMonitor = ClampWidgetMonitor(g_widgetMonitor);
             g_rendererState.widgetMonitorNames = g_monitorLabelPtrs.data();
             g_rendererState.widgetMonitorCount = static_cast<int>(g_monitorLabelPtrs.size());
             RepositionWidget();
@@ -715,8 +667,6 @@ namespace
     // leaving a hoverable sliver behind. Hover is polled from the cursor
     // position rather than WM_MOUSELEAVE so it also works unfocused.
     // -----------------------------------------------------------------------
-    static RECT g_widgetRestoreRect{};
-    static bool g_widgetRestoreValid = false;
     static bool g_widgetApplied = false;
     static bool g_widgetRetracted = false;
     static double g_widgetLastHoverSeconds = 0.0;
@@ -781,10 +731,6 @@ namespace
 
     static void EnterWidgetMode()
     {
-        if (GetWindowRect(g_hwnd, &g_widgetRestoreRect)) {
-            g_widgetRestoreValid = true;
-        }
-
         SetWindowLongPtrW(
             g_hwnd,
             GWL_EXSTYLE,
@@ -812,33 +758,6 @@ namespace
             rest.bottom - rest.top,
             SWP_SHOWWINDOW | SWP_FRAMECHANGED
         );
-
-        g_widgetTopmostApplied = g_widgetAlwaysOnTop;
-    }
-
-    static void LeaveWidgetMode()
-    {
-        SetWindowLongPtrW(
-            g_hwnd,
-            GWL_EXSTYLE,
-            GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE) & ~(WS_EX_TOOLWINDOW | WS_EX_TOPMOST)
-        );
-
-        const RECT r = g_widgetRestoreValid
-            ? g_widgetRestoreRect
-            : RECT{ 100, 100, 1140, 860 };
-
-        SetWindowPos(
-            g_hwnd,
-            HWND_NOTOPMOST,
-            r.left,
-            r.top,
-            r.right - r.left,
-            r.bottom - r.top,
-            SWP_SHOWWINDOW | SWP_FRAMECHANGED
-        );
-
-        g_widgetRetracted = false;
     }
 
     // Where the panel goes when it rolls away.
@@ -906,19 +825,27 @@ namespace
         }
     }
 
-    // Move the panel to the current monitor/anchor now, rather than waiting for
-    // the user to drag it. Called when the Settings pickers change and when the
-    // display layout does.
     // Float above other windows, or sit in the normal z-order. SetWindowPos is
     // the supported way to change WS_EX_TOPMOST after creation; setting the
     // style bit directly does not re-order the window.
-    static void ApplyWidgetTopmost(bool force)
+    //
+    // Compared against the window's real style, not a remembered value:
+    // WS_EX_TOPMOST can be dropped behind our back (another app inserting us
+    // after a non-topmost window; an owned non-topmost window un-topping its
+    // owner, which is why Settings is no longer owned), and a cached "already
+    // applied" flag then left the widget buried until the setting was toggled.
+    // Only a real mismatch re-asserts, so toasts are not buried every frame.
+    static void ApplyWidgetTopmost()
     {
-        if (!g_hwnd || (!force && g_widgetTopmostApplied == g_widgetAlwaysOnTop)) {
+        if (!g_hwnd) {
             return;
         }
 
-        g_widgetTopmostApplied = g_widgetAlwaysOnTop;
+        const bool topmost = (GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+
+        if (topmost == g_widgetAlwaysOnTop) {
+            return;
+        }
 
         SetWindowPos(
             g_hwnd,
@@ -928,9 +855,12 @@ namespace
         );
     }
 
+    // Move the panel to the current monitor/anchor now, rather than waiting for
+    // the user to drag it. Called when the Settings pickers change and when the
+    // display layout does.
     static void RepositionWidget()
     {
-        if (!g_widgetMode || !g_hwnd) {
+        if (!g_widgetApplied || !g_hwnd) {
             return;
         }
 
@@ -947,19 +877,14 @@ namespace
 
     static void PollWidgetWindow()
     {
-        if (g_widgetMode != g_widgetApplied) {
-            g_widgetApplied = g_widgetMode;
-
-            if (g_widgetMode) {
-                EnterWidgetMode();
-            }
-            else {
-                LeaveWidgetMode();
-            }
+        // The first frame parks the window as the widget; it stays one.
+        if (!g_widgetApplied) {
+            g_widgetApplied = true;
+            EnterWidgetMode();
             return;
         }
 
-        if (!g_widgetMode || IsIconic(g_hwnd)) {
+        if (IsIconic(g_hwnd)) {
             return;
         }
 
@@ -969,11 +894,12 @@ namespace
         }
 
         g_widgetWork = WidgetMonitorWork();
-        ApplyWidgetTopmost(false);
+        ApplyWidgetTopmost();
 
         POINT cursor{};
         const bool hovered = GetCursorPos(&cursor) && PtInRect(&rect, cursor);
         const double now = MonotonicSeconds();
+        const bool wasRetracted = g_widgetRetracted;
 
         if (hovered || g_widgetPinned) {
             g_widgetLastHoverSeconds = now;
@@ -982,6 +908,11 @@ namespace
         else if (!g_widgetRetracted &&
             now - g_widgetLastHoverSeconds >= kWidgetRetractAfterSeconds) {
             g_widgetRetracted = true;
+        }
+
+        // A roll in either direction is ours, not a user drag.
+        if (g_widgetRetracted != wasRetracted) {
+            g_widgetSettled = false;
         }
 
         // Dragging the panel by its header moves the window out from under us.
@@ -1021,19 +952,17 @@ namespace
 
         g_widgetSettled = false;
 
-        // Time-scaled so the roll runs at a real speed rather than a fraction
-        // of the remaining distance - a proportional step is fast at the start
-        // and crawls at the end, which is the opposite of what reads well here.
+        // Time-scaled so the roll-down runs at a real speed rather than a
+        // fraction of the remaining distance - a proportional step is fast at
+        // the start and crawls at the end. Rolling up jumps straight there.
         const double elapsed = g_widgetLastAnimationSeconds > 0.0
             ? std::min(0.1, now - g_widgetLastAnimationSeconds)
             : 1.0 / 60.0;
         g_widgetLastAnimationSeconds = now;
 
-        const double speed = g_widgetRetracted
-            ? kWidgetRetractPixelsPerSecond
-            : kWidgetExpandPixelsPerSecond;
-
-        const int travel = (std::max)(1, static_cast<int>(speed * elapsed + 0.5));
+        const int travel = g_widgetRetracted
+            ? (std::numeric_limits<int>::max)()
+            : (std::max)(1, static_cast<int>(kWidgetExpandPixelsPerSecond * elapsed + 0.5));
 
         const auto step = [travel](LONG from, LONG to) {
             const LONG delta = to - from;
@@ -1067,13 +996,12 @@ namespace
             return;
         }
 
-        ImGuiContext* previous = ImGui::GetCurrentContext();
         ImGui::SetCurrentContext(g_settingsImGuiContext);
         ImGui_ImplDX11_Shutdown();
         ImGui_ImplWin32_Shutdown();
         ImGui::DestroyContext(g_settingsImGuiContext);
         g_settingsImGuiContext = nullptr;
-        ImGui::SetCurrentContext(previous == nullptr ? g_mainImGuiContext : g_mainImGuiContext);
+        ImGui::SetCurrentContext(g_mainImGuiContext);
 
         if (g_settingsRenderTarget) {
             g_settingsRenderTarget->Release();
@@ -1090,41 +1018,27 @@ namespace
 
     static bool CreateSettingsWindow(HINSTANCE instance)
     {
-        if (g_settingsHwnd) {
-            // Already open but possibly buried: raise and restore it.
-            if (IsIconic(g_settingsHwnd)) {
-                ShowWindow(g_settingsHwnd, SW_RESTORE);
-            }
-            BringWindowToTop(g_settingsHwnd);
-            SetForegroundWindow(g_settingsHwnd);
-            return true;
-        }
-
         const RECT work = WorkAreaForWindow(g_hwnd);
         const int width = 900;
         const int height = 660;
         const int x = work.left + ((work.right - work.left) - width) / 2;
         const int y = work.top + ((work.bottom - work.top) - height) / 2;
 
-        // Owned by the widget and given a taskbar button.
+        // Unowned, with a taskbar button.
         //
-        // Unowned, it sank behind whatever was clicked next with no way back -
-        // the widget is WS_EX_TOPMOST so it could not even be raised by
-        // clicking that. The owner keeps it above the widget; WS_EX_APPWINDOW
-        // gives a popup a taskbar entry it would not otherwise get, so it can
-        // be brought forward again from anywhere.
+        // Owning it to the widget kept it above the widget, but Windows ties
+        // owner and owned z-order together: making the owned window
+        // non-topmost (so it did not float over every app) also un-topped the
+        // widget, which then sank behind other windows. Unowned, the widget
+        // stays topmost; WS_EX_APPWINDOW gives this popup a taskbar entry, so
+        // it can always be brought forward again.
         g_settingsHwnd = CreateWindowExW(
             WS_EX_APPWINDOW, L"AIQuotaCheckerDX11", L"AI Quota Checker - Settings",
-            WS_POPUP, x, y, width, height, g_hwnd, nullptr, instance, nullptr);
+            WS_POPUP, x, y, width, height, nullptr, nullptr, instance, nullptr);
 
         if (!g_settingsHwnd) {
             return false;
         }
-
-        // An owner that is topmost would otherwise drag this along with it and
-        // float the settings window over every other application.
-        SetWindowPos(g_settingsHwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
         DXGI_SWAP_CHAIN_DESC sd{};
         sd.BufferCount = 2;
@@ -1169,7 +1083,7 @@ namespace
         g_settingsImGuiContext = ImGui::CreateContext();
         ImGui::SetCurrentContext(g_settingsImGuiContext);
         ImGui::GetIO().IniFilename = nullptr;
-        Renderer::ApplyStyleColorsOnly();
+        Renderer::ApplyStyle();
         Renderer::LoadSettingsFont(g_uiFontSize);
         ImGui_ImplWin32_Init(g_settingsHwnd);
         ImGui_ImplDX11_Init(g_device, g_context);
@@ -1208,110 +1122,69 @@ namespace
         ImGui::SetCurrentContext(g_mainImGuiContext);
     }
 
-    static void PollMinimizeRequest()
+    struct AutoRefreshProvider
     {
-        if (!g_minimizeRequest) {
-            return;
-        }
-
-        g_minimizeRequest = false;
-        ShowWindow(g_hwnd, SW_MINIMIZE);
-    }
+        bool* enabled;
+        unsigned int mask;
+        std::atomic_bool* (*loading)();
+        void (*refresh)();
+        long long next = 0;
+    };
 
     static void PollAutoRefresh()
     {
-        static LONGLONG nextCodexRefresh = 0;
-        static LONGLONG nextClaudeRefresh = 0;
-        static LONGLONG nextZAiRefresh = 0;
-        static LONGLONG nextGrokRefresh = 0;
+        static AutoRefreshProvider providers[] = {
+            { &g_codexAutoRefreshEnabled, AutoRefreshProviderCodex,
+                [] { return CodexProvider::get_instance()->Loading(); },
+                [] { CodexProvider::get_instance()->RefreshAsync(); } },
+            { &g_claudeAutoRefreshEnabled, AutoRefreshProviderClaude,
+                [] { return ClaudeProvider::get_instance()->Loading(); },
+                [] { ClaudeProvider::get_instance()->RefreshAsync(); } },
+            { &g_zaiAutoRefreshEnabled, AutoRefreshProviderZAi,
+                [] { return ZAiProvider::get_instance()->Loading(); },
+                [] { ZAiProvider::get_instance()->RefreshAsync(); } },
+            { &g_grokAutoRefreshEnabled, AutoRefreshProviderGrok,
+                [] { return GrokProvider::get_instance()->Loading(); },
+                [] { GrokProvider::get_instance()->RefreshAsync(); } },
+        };
 
-        if (!g_autoRefreshEnabled) {
-            nextCodexRefresh = 0;
-            nextClaudeRefresh = 0;
-            nextZAiRefresh = 0;
-            nextGrokRefresh = 0;
-            return;
-        }
+        const long long now = static_cast<long long>(std::time(nullptr));
+        const long long interval = AutoRefreshIntervalSeconds();
 
-        if (!g_codexAutoRefreshEnabled) nextCodexRefresh = 0;
-        if (!g_claudeAutoRefreshEnabled) nextClaudeRefresh = 0;
-        if (!g_zaiAutoRefreshEnabled) nextZAiRefresh = 0;
-        if (!g_grokAutoRefreshEnabled) nextGrokRefresh = 0;
-
-        LONGLONG now = KSharedClock::SystemUnixSeconds();
-
-        if (now <= 0) {
-            return;
-        }
-
-        LONGLONG intervalSeconds = static_cast<LONGLONG>(AutoRefreshIntervalSeconds());
-
-        if (g_codexAutoRefreshEnabled && (nextCodexRefresh == 0 || nextCodexRefresh - now > intervalSeconds)) {
-            nextCodexRefresh = now + intervalSeconds;
-        }
-
-        if (g_claudeAutoRefreshEnabled && (nextClaudeRefresh == 0 || nextClaudeRefresh - now > intervalSeconds)) {
-            nextClaudeRefresh = now + intervalSeconds;
-        }
-
-        if (g_zaiAutoRefreshEnabled && (nextZAiRefresh == 0 || nextZAiRefresh - now > intervalSeconds)) {
-            nextZAiRefresh = now + intervalSeconds;
-        }
-
-        if (g_grokAutoRefreshEnabled && (nextGrokRefresh == 0 || nextGrokRefresh - now > intervalSeconds)) {
-            nextGrokRefresh = now + intervalSeconds;
-        }
-
-        CodexProvider* codex = CodexProvider::get_instance();
-        ClaudeProvider* claude = ClaudeProvider::get_instance();
-        ZAiProvider* zai = ZAiProvider::get_instance();
-        GrokProvider* grok = GrokProvider::get_instance();
-
-        if (g_codexAutoRefreshEnabled && nextCodexRefresh > 0 && now >= nextCodexRefresh) {
-            if (!codex->Loading()->load()) {
-                codex->RefreshAsync();
-                nextCodexRefresh = now + intervalSeconds;
+        for (AutoRefreshProvider& provider : providers) {
+            // Re-ticked in Settings after a rate limit: the user's choice again.
+            if (*provider.enabled) {
+                g_rateLimitPausedMask &= ~provider.mask;
             }
-            else {
-                nextCodexRefresh = now + 5;
-            }
-        }
 
-        if (g_claudeAutoRefreshEnabled && nextClaudeRefresh > 0 && now >= nextClaudeRefresh) {
-            if (!claude->Loading()->load()) {
-                claude->RefreshAsync();
-                nextClaudeRefresh = now + intervalSeconds;
+            if (!g_autoRefreshEnabled || !*provider.enabled) {
+                provider.next = 0;
+                continue;
             }
-            else {
-                nextClaudeRefresh = now + 5;
-            }
-        }
 
-        if (g_zaiAutoRefreshEnabled && nextZAiRefresh > 0 && now >= nextZAiRefresh) {
-            if (!zai->Loading()->load()) {
-                zai->RefreshAsync();
-                nextZAiRefresh = now + intervalSeconds;
+            // First tick, or the interval was shortened: start a fresh wait.
+            if (provider.next == 0 || provider.next - now > interval) {
+                provider.next = now + interval;
             }
-            else {
-                nextZAiRefresh = now + 5;
-            }
-        }
 
-        if (g_grokAutoRefreshEnabled && nextGrokRefresh > 0 && now >= nextGrokRefresh) {
-            if (!grok->Loading()->load()) {
-                grok->RefreshAsync();
-                nextGrokRefresh = now + intervalSeconds;
+            if (now < provider.next) {
+                continue;
             }
-            else {
-                nextGrokRefresh = now + 5;
+
+            if (provider.loading()->load()) {
+                provider.next = now + 5;
+                continue;
             }
+
+            provider.refresh();
+            provider.next = now + interval;
         }
     }
 
     static void PollLocalContextTelemetry()
     {
-        static LONGLONG nextContextRefresh = 0;
-        const LONGLONG now = KSharedClock::SystemUnixSeconds();
+        static long long nextContextRefresh = 0;
+        const long long now = static_cast<long long>(std::time(nullptr));
 
         if (now <= 0 || (nextContextRefresh > 0 && now < nextContextRefresh)) {
             return;
@@ -1329,7 +1202,6 @@ namespace
     static void PollAppNotifications()
     {
         ApplyPendingAutoRefreshDisable();
-        PollMinimizeRequest();
         PollWidgetWindow();
         PollAutoRefresh();
         PollLocalContextTelemetry();
@@ -1338,16 +1210,6 @@ namespace
         ClaudeProvider::get_instance()->PollNotifications();
         ZAiProvider::get_instance()->PollNotifications();
         GrokProvider::get_instance()->PollNotifications();
-    }
-
-    static void InitializeCoreServices()
-    {
-        Math::get_instance();
-        Text::get_instance();
-        Format::get_instance();
-        Network::get_instance();
-        JsonUtils::get_instance();
-        ResetTime::get_instance();
     }
 
     static void InitializeProviders()
@@ -1370,8 +1232,6 @@ namespace
         RefreshMonitors();
 
         g_rendererState.shouldClose = &g_shouldClose;
-        g_rendererState.minimizeRequest = &g_minimizeRequest;
-        g_rendererState.widgetMode = &g_widgetMode;
         g_rendererState.widgetPinned = &g_widgetPinned;
         g_rendererState.widgetAlwaysOnTop = &g_widgetAlwaysOnTop;
         g_rendererState.widgetAnchor = &g_widgetAnchor;
@@ -1379,7 +1239,6 @@ namespace
         g_rendererState.widgetMonitorNames = g_monitorLabelPtrs.data();
         g_rendererState.widgetMonitorCount = static_cast<int>(g_monitorLabelPtrs.size());
         g_rendererState.repositionWidget = RepositionWidget;
-        g_rendererState.widgetOrder = &g_widgetOrder;
         g_rendererState.widgetBarRows = &g_widgetBarRows;
         g_rendererState.uiFontSize = &g_uiFontSize;
         g_rendererState.widgetSections = &g_widgetSections;
@@ -1421,7 +1280,6 @@ namespace
         g_rendererState.notifyPosition = &g_notifyPosition;
         g_rendererState.notifyPositionNames = g_notifyPositionNames;
         g_rendererState.notifyPositionCount = static_cast<int>(sizeof(g_notifyPositionNames) / sizeof(g_notifyPositionNames[0]));
-        g_rendererState.notifyPositions = g_notifyPositions;
 
         g_rendererState.codexNotifySettings = codex->NotifySettings();
         g_rendererState.claudeNotifySettings = claude->NotifySettings();
@@ -1432,10 +1290,10 @@ namespace
         g_rendererState.zaiQuotaWarnings = zai->QuotaWarnings();
         g_rendererState.grokQuotaWarnings = grok->QuotaWarnings();
 
-        g_rendererState.refreshCodexAsync = RefreshCodexAsync;
-        g_rendererState.refreshClaudeAsync = RefreshClaudeAsync;
-        g_rendererState.refreshZAiAsync = RefreshZAiAsync;
-        g_rendererState.refreshGrokAsync = RefreshGrokAsync;
+        g_rendererState.refreshCodexAsync = [] { CodexProvider::get_instance()->RefreshAsync(); };
+        g_rendererState.refreshClaudeAsync = [] { ClaudeProvider::get_instance()->RefreshAsync(); };
+        g_rendererState.refreshZAiAsync = [] { ZAiProvider::get_instance()->RefreshAsync(); };
+        g_rendererState.refreshGrokAsync = [] { GrokProvider::get_instance()->RefreshAsync(); };
         g_rendererState.saveAppSettings = SaveAppSettings;
         g_rendererState.applySettingsToRuntime = ApplySettingsToRuntime;
     }
@@ -1500,8 +1358,10 @@ namespace
         std::filesystem::create_directories(path.parent_path(), ec);
 
         // Write beside the target and rename, so a reader never sees a
-        // half-written document.
-        const std::filesystem::path temporary = path.string() + ".tmp";
+        // half-written document. Appended as a path: string() throws on
+        // characters outside the ANSI code page.
+        std::filesystem::path temporary = path;
+        temporary += L".tmp";
 
         {
             std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
@@ -1526,39 +1386,21 @@ namespace
         }
 
         // Claude Code renders whatever this prints as the status line, so emit
-        // something useful rather than leaving it blank. Naive extraction keeps
-        // this path dependency-free.
-        auto findString = [&](const char* key) -> std::string {
-            const std::string needle = std::string("\"") + key + "\":\"";
-            const size_t at = payload.find(needle);
-            if (at == std::string::npos) return {};
-            const size_t begin = at + needle.size();
-            const size_t end = payload.find('"', begin);
-            return end == std::string::npos ? std::string{} : payload.substr(begin, end - begin);
-        };
+        // something useful rather than leaving it blank: "<model>  |  ctx N%".
+        const JsonUtils::Json status = JsonUtils::get_instance()->ParseOrNull(payload);
+        std::string line;
 
-        auto findNumber = [&](const char* key) -> std::string {
-            const std::string needle = std::string("\"") + key + "\":";
-            const size_t at = payload.find(needle);
-            if (at == std::string::npos) return {};
-            size_t begin = at + needle.size();
-            while (begin < payload.size() && payload[begin] == ' ') ++begin;
-            size_t end = begin;
-            while (end < payload.size() &&
-                (std::isdigit(static_cast<unsigned char>(payload[end])) || payload[end] == '.')) {
-                ++end;
+        if (status.is_object()) {
+            if (const auto model = status.find("model"); model != status.end()) {
+                line = JsonUtils::get_instance()->String(*model, "display_name");
             }
-            return end > begin ? payload.substr(begin, end - begin) : std::string{};
-        };
 
-        std::string line = findString("display_name");
-        const std::string used = findNumber("used_percentage");
-
-        if (!used.empty()) {
-            const size_t dot = used.find('.');
-            const std::string whole = dot == std::string::npos ? used : used.substr(0, dot);
-            line += line.empty() ? "" : "  |  ";
-            line += "ctx " + whole + "%";
+            if (const auto context = status.find("context_window"); context != status.end()) {
+                if (const auto used = JsonUtils::get_instance()->NumberOpt(*context, "used_percentage")) {
+                    line += line.empty() ? "" : "  |  ";
+                    line += "ctx " + std::to_string(static_cast<int>(*used)) + "%";
+                }
+            }
         }
 
         if (!line.empty()) {
@@ -1620,21 +1462,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 
     RegisterClassExW(&wc);
 
-    #if defined(GUI_ONLY)
-    const int startWidth = 1040;
-    const int startHeight = 760;
-#else
-    const int startWidth = kWidgetWidth;
-    const int startHeight = kWidgetHeight;
-#endif
-
-    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"AI Quota Checker", WS_POPUP | WS_MINIMIZEBOX, 100, 100, startWidth, startHeight, nullptr, nullptr, wc.hInstance, nullptr);
+    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"AI Quota Checker", WS_POPUP | WS_MINIMIZEBOX,
+        100, 100, kWidgetWidth, kWidgetHeight, nullptr, nullptr, wc.hInstance, nullptr);
 
     if (!CreateDeviceD3D(g_hwnd)) {
         CleanupDeviceD3D();
         UnregisterClassW(wc.lpszClassName, wc.hInstance);
         return 1;
     }
+
+    NotifyGUI::SetAnchorWindow(g_hwnd);
 
     ShowWindow(g_hwnd, SW_SHOWDEFAULT);
     UpdateWindow(g_hwnd);
@@ -1647,7 +1484,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
-    InitializeCoreServices();
     InitializeProviders();
     InitializeRendererState();
     Renderer::ApplyStyle();
@@ -1671,6 +1507,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
     if (g_autoRefreshEnabled && g_grokAutoRefreshEnabled) GrokProvider::get_instance()->RefreshAsync();
 
     bool done = false;
+    // The last Present found the widget occluded (minimised, or the session
+    // locked). A blt-model swap chain then returns at once instead of waiting
+    // for vsync, and the loop spun a whole core (measured: 109% minimised).
+    bool occluded = false;
 
     while (!done) {
         MSG msg{};
@@ -1701,17 +1541,25 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
             DestroySettingsWindow();
         }
 
+        // While occluded, keep the refresh timers, toasts and the Settings
+        // window going, but draw no widget frames until it can be seen.
+        if (occluded && g_swapChain->Present(0, DXGI_PRESENT_TEST) == DXGI_STATUS_OCCLUDED) {
+            PollAppNotifications();
+            RenderSettingsWindow();
+            Sleep(10);
+            continue;
+        }
+
+        // The widget's context for the font reload and its frame. WndProc
+        // restores whatever context it found, so nothing above can leak in;
+        // this is the explicit statement of which context the frame uses.
+        ImGui::SetCurrentContext(g_mainImGuiContext);
+
         if (Renderer::ConsumeFontReloadRequest()) {
             ImGui_ImplDX11_InvalidateDeviceObjects();
             Renderer::ReloadFonts();
             ImGui_ImplDX11_CreateDeviceObjects();
         }
-
-        // Anything above can dispatch window messages (window creation and
-        // destruction both do), and WndProc leaves the current context set to
-        // whichever window received them. Select the widget's context here,
-        // immediately before its frame, so that can never leak in.
-        ImGui::SetCurrentContext(g_mainImGuiContext);
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
@@ -1743,7 +1591,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
-        g_swapChain->Present(1, 0);
+        occluded = g_swapChain->Present(1, 0) == DXGI_STATUS_OCCLUDED;
 
         RenderSettingsWindow();
     }
@@ -1760,5 +1608,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
     CoUninitialize();
 
-    return 0;
+    // Refresh threads are detached and may still be writing provider state.
+    // ExitProcess ends them before any static destructor frees that state,
+    // which a plain return would not.
+    ExitProcess(0);
 }

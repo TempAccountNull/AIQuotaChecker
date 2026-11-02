@@ -7,7 +7,6 @@
 #include <winhttp.h>
 
 #include <algorithm>
-#include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -24,6 +23,190 @@
 #ifndef WINHTTP_DECOMPRESSION_FLAG_DEFLATE
 #define WINHTTP_DECOMPRESSION_FLAG_DEFLATE 0x00000002
 #endif
+
+namespace
+{
+    constexpr int kMaxRedirects = 10;
+
+    class InternetHandle final
+    {
+    public:
+        explicit InternetHandle(HINTERNET handle) : m_handle(handle) {}
+        InternetHandle(const InternetHandle&) = delete;
+        InternetHandle& operator=(const InternetHandle&) = delete;
+        ~InternetHandle()
+        {
+            if (m_handle) {
+                WinHttpCloseHandle(m_handle);
+            }
+        }
+
+        HINTERNET get() const { return m_handle; }
+
+    private:
+        HINTERNET m_handle = nullptr;
+    };
+
+    struct UrlParts
+    {
+        std::wstring scheme;
+        std::wstring host;
+        std::wstring path; // path plus query
+        INTERNET_PORT port = 0;
+        bool secure = false;
+    };
+
+    bool CrackUrl(const std::wstring& url, UrlParts& out)
+    {
+        URL_COMPONENTS parts{};
+        parts.dwStructSize = sizeof(parts);
+        parts.dwSchemeLength = static_cast<DWORD>(-1);
+        parts.dwHostNameLength = static_cast<DWORD>(-1);
+        parts.dwUrlPathLength = static_cast<DWORD>(-1);
+        parts.dwExtraInfoLength = static_cast<DWORD>(-1);
+
+        if (!WinHttpCrackUrl(url.c_str(), 0, 0, &parts)) {
+            return false;
+        }
+
+        out.scheme.assign(parts.lpszScheme, parts.dwSchemeLength);
+        out.host.assign(parts.lpszHostName, parts.dwHostNameLength);
+        out.path.assign(parts.lpszUrlPath, parts.dwUrlPathLength);
+        out.path.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
+        out.port = parts.nPort;
+        out.secure = parts.nScheme == INTERNET_SCHEME_HTTPS;
+
+        if (out.path.empty()) {
+            out.path = L"/";
+        }
+
+        return true;
+    }
+
+    std::wstring QueryLocation(HINTERNET request)
+    {
+        DWORD size = 0;
+        WinHttpQueryHeaders(request, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX,
+            WINHTTP_NO_OUTPUT_BUFFER, &size, WINHTTP_NO_HEADER_INDEX);
+
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || size == 0) {
+            return {};
+        }
+
+        std::wstring location(size / sizeof(wchar_t), L'\0');
+
+        if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX,
+                location.data(), &size, WINHTTP_NO_HEADER_INDEX)) {
+            return {};
+        }
+
+        location.resize(size / sizeof(wchar_t));
+        return location;
+    }
+
+    // Absolute, scheme-relative, root-relative or path-relative Location.
+    std::wstring ResolveLocation(const UrlParts& base, const std::wstring& location)
+    {
+        if (location.find(L"://") != std::wstring::npos) {
+            return location;
+        }
+
+        if (location.starts_with(L"//")) {
+            return base.scheme + L":" + location;
+        }
+
+        const bool defaultPort = base.port == (base.secure ? INTERNET_DEFAULT_HTTPS_PORT : INTERNET_DEFAULT_HTTP_PORT);
+        const std::wstring origin = base.scheme + L"://" + base.host + (defaultPort ? L"" : L":" + std::to_wstring(base.port));
+
+        if (location.starts_with(L"/")) {
+            return origin + location;
+        }
+
+        const std::wstring directory = base.path.substr(0, base.path.find_last_of(L'/', base.path.find(L'?')) + 1);
+        return origin + directory + location;
+    }
+
+    // A redirect to another host drops credentials, as browsers do: the
+    // bearer token or session cookie belongs to the host it was meant for.
+    std::wstring StripCredentialHeaders(const std::wstring& headers)
+    {
+        std::wstring kept;
+
+        for (size_t start = 0; start < headers.size();) {
+            size_t end = headers.find(L"\r\n", start);
+            end = end == std::wstring::npos ? headers.size() : end;
+
+            std::wstring line = headers.substr(start, end - start);
+            std::wstring lower = line;
+            CharLowerBuffW(lower.data(), static_cast<DWORD>(lower.size()));
+
+            if (!line.empty() && !lower.starts_with(L"authorization:") && !lower.starts_with(L"cookie:")) {
+                kept += line + L"\r\n";
+            }
+
+            start = end + 2;
+        }
+
+        return kept;
+    }
+
+    long long ServerUnixSeconds(HINTERNET request)
+    {
+        SYSTEMTIME serverDate{};
+        DWORD dateSize = sizeof(serverDate);
+
+        if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_DATE | WINHTTP_QUERY_FLAG_SYSTEMTIME,
+                WINHTTP_HEADER_NAME_BY_INDEX, &serverDate, &dateSize, WINHTTP_NO_HEADER_INDEX)) {
+            return 0;
+        }
+
+        FILETIME fileTime{};
+
+        if (!SystemTimeToFileTime(&serverDate, &fileTime)) {
+            return 0;
+        }
+
+        ULARGE_INTEGER ticks{};
+        ticks.LowPart = fileTime.dwLowDateTime;
+        ticks.HighPart = fileTime.dwHighDateTime;
+        constexpr ULONGLONG epoch = 116444736000000000ULL;
+        return ticks.QuadPart >= epoch ? static_cast<long long>((ticks.QuadPart - epoch) / 10000000ULL) : 0;
+    }
+
+    std::string ReadBody(HINTERNET request)
+    {
+        std::string body;
+
+        for (;;) {
+            DWORD available = 0;
+
+            // A failure here is a dropped connection, not the end of the
+            // body: returning what arrived would pass a truncated document
+            // off as a complete 200.
+            if (!WinHttpQueryDataAvailable(request, &available)) {
+                throw std::runtime_error("The connection dropped while reading the response");
+            }
+
+            if (available == 0) {
+                return body;
+            }
+
+            const size_t offset = body.size();
+            body.resize(offset + available);
+            DWORD read = 0;
+
+            if (!WinHttpReadData(request, body.data() + offset, available, &read)) {
+                throw std::runtime_error("The connection dropped while reading the response");
+            }
+
+            body.resize(offset + read);
+
+            if (read == 0) {
+                return body;
+            }
+        }
+    }
+}
 
 namespace Network
 {
@@ -56,19 +239,39 @@ namespace Network
         return out;
     }
 
-    std::filesystem::path Client::UserProfilePath() const
+    std::filesystem::path Client::EnvPath(const char* name) const
     {
-        std::string userProfile = GetEnvText("USERPROFILE");
+        const std::wstring wideName = Text::get_instance()->Utf8ToWide(name ? name : "");
+        wchar_t* value = nullptr;
+        size_t length = 0;
 
-        if (!userProfile.empty()) {
-            return std::filesystem::path(userProfile);
+        if (wideName.empty() || _wdupenv_s(&value, &length, wideName.c_str()) != 0 || !value) {
+            return {};
         }
 
-        std::string homeDrive = GetEnvText("HOMEDRIVE");
-        std::string homePath = GetEnvText("HOMEPATH");
+        std::filesystem::path path(value);
+        free(value);
+        return path;
+    }
 
-        if (!homeDrive.empty() && !homePath.empty()) {
-            return std::filesystem::path(homeDrive + homePath);
+    std::string Client::EnvText(const char* name) const
+    {
+        return Text::get_instance()->WideToUtf8(EnvPath(name).wstring());
+    }
+
+    std::filesystem::path Client::UserProfilePath() const
+    {
+        // Wide environment: a profile folder outside the ANSI code page would
+        // otherwise come back with '?' in it and every credential path breaks.
+        if (std::filesystem::path profile = EnvPath("USERPROFILE"); !profile.empty()) {
+            return profile;
+        }
+
+        const std::filesystem::path drive = EnvPath("HOMEDRIVE");
+        const std::filesystem::path home = EnvPath("HOMEPATH");
+
+        if (!drive.empty() && !home.empty()) {
+            return std::filesystem::path(drive.wstring() + home.wstring());
         }
 
         throw std::runtime_error("Could not resolve USERPROFILE");
@@ -92,7 +295,7 @@ namespace Network
         std::string text = ReadTextFile(path);
 
         if (text.empty()) {
-            throw std::runtime_error("Could not open file: " + path.string());
+            throw std::runtime_error("Could not open file: " + Text::get_instance()->WideToUtf8(path.wstring()));
         }
 
         return text;
@@ -100,31 +303,7 @@ namespace Network
 
     std::wstring Client::Utf8ToWide(const std::string& value) const
     {
-        if (value.empty()) {
-            return {};
-        }
-
-        int needed = MultiByteToWideChar(
-            CP_UTF8,
-            0,
-            value.data(),
-            static_cast<int>(value.size()),
-            nullptr,
-            0
-        );
-
-        std::wstring out(needed, L'\0');
-
-        MultiByteToWideChar(
-            CP_UTF8,
-            0,
-            value.data(),
-            static_cast<int>(value.size()),
-            out.data(),
-            needed
-        );
-
-        return out;
+        return Text::get_instance()->Utf8ToWide(value);
     }
 
     std::string Client::StripHeaderValue(std::string value) const
@@ -150,11 +329,11 @@ namespace Network
         headers += "Content-Type: application/json\r\n";
 
         if (!origin.empty()) {
-            headers += "Origin: " + origin + "\r\n";
+            headers += "Origin: " + StripHeaderValue(origin) + "\r\n";
         }
 
         if (!referer.empty()) {
-            headers += "Referer: " + referer + "\r\n";
+            headers += "Referer: " + StripHeaderValue(referer) + "\r\n";
         }
 
         return Utf8ToWide(headers);
@@ -186,180 +365,121 @@ namespace Network
         bool followRedirects
     ) const
     {
-        std::wstring wideUrl = Utf8ToWide(url);
+        std::wstring currentUrl = Utf8ToWide(url);
+        std::wstring currentMethod = Utf8ToWide(method);
+        std::wstring currentHeaders = headers;
+        std::string currentBody = body;
 
-        URL_COMPONENTS parts{};
-        parts.dwStructSize = sizeof(parts);
-        parts.dwSchemeLength = static_cast<DWORD>(-1);
-        parts.dwHostNameLength = static_cast<DWORD>(-1);
-        parts.dwUrlPathLength = static_cast<DWORD>(-1);
-        parts.dwExtraInfoLength = static_cast<DWORD>(-1);
+        for (int hop = 0;; ++hop) {
+            UrlParts parts;
 
-        if (!WinHttpCrackUrl(wideUrl.c_str(), 0, 0, &parts)) {
-            throw std::runtime_error("Could not parse URL");
-        }
+            if (!CrackUrl(currentUrl, parts)) {
+                throw std::runtime_error("Could not parse URL");
+            }
 
-        std::wstring host(parts.lpszHostName, parts.dwHostNameLength);
-        std::wstring path(parts.lpszUrlPath, parts.dwUrlPathLength);
+            // Automatic proxy: the system's own settings (including PAC and
+            // per-user proxies), where DEFAULT_PROXY only honoured netsh.
+            InternetHandle session(WinHttpOpen(L"AIQuotaChecker/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
 
-        if (parts.dwExtraInfoLength > 0) {
-            path.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
-        }
+            if (!session.get()) {
+                throw std::runtime_error("WinHttpOpen failed");
+            }
 
-        if (path.empty()) {
-            path = L"/";
-        }
+            WinHttpSetTimeouts(session.get(), 10000, 10000, 10000, 20000);
 
-        HINTERNET session = WinHttpOpen(
-            L"AIQuotaChecker/1.0",
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-            WINHTTP_NO_PROXY_NAME,
-            WINHTTP_NO_PROXY_BYPASS,
-            0
-        );
+            InternetHandle connect(WinHttpConnect(session.get(), parts.host.c_str(), parts.port, 0));
 
-        if (!session) {
-            throw std::runtime_error("WinHttpOpen failed");
-        }
+            if (!connect.get()) {
+                throw std::runtime_error("WinHttpConnect failed");
+            }
 
-        WinHttpSetTimeouts(session, 10000, 10000, 10000, 20000);
+            InternetHandle request(WinHttpOpenRequest(connect.get(), currentMethod.c_str(), parts.path.c_str(),
+                nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, parts.secure ? WINHTTP_FLAG_SECURE : 0));
 
-        HINTERNET connect = WinHttpConnect(session, host.c_str(), parts.nPort, 0);
+            if (!request.get()) {
+                throw std::runtime_error("WinHttpOpenRequest failed");
+            }
 
-        if (!connect) {
-            WinHttpCloseHandle(session);
-            throw std::runtime_error("WinHttpConnect failed");
-        }
-
-        std::wstring wideMethod = Utf8ToWide(method);
-
-        HINTERNET request = WinHttpOpenRequest(
-            connect,
-            wideMethod.c_str(),
-            path.c_str(),
-            nullptr,
-            WINHTTP_NO_REFERER,
-            WINHTTP_DEFAULT_ACCEPT_TYPES,
-            parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0
-        );
-
-        if (!request) {
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
-            throw std::runtime_error("WinHttpOpenRequest failed");
-        }
-
-        if (!followRedirects) {
-            // ZCode sends two account-scoped authorization headers. A quota
-            // redirect must not forward either credential to another endpoint.
+            // Redirects are followed by hand below, so credentials never go to
+            // another host. ZCode passes followRedirects = false: it sends two
+            // account-scoped headers and treats a redirect as an error.
             DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
-            if (!WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy))) {
-                WinHttpCloseHandle(request);
-                WinHttpCloseHandle(connect);
-                WinHttpCloseHandle(session);
+
+            if (!WinHttpSetOption(request.get(), WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy))) {
                 throw std::runtime_error("Could not disable HTTP redirects");
             }
-        }
 
-        DWORD decompressionFlags = WINHTTP_DECOMPRESSION_FLAG_GZIP | WINHTTP_DECOMPRESSION_FLAG_DEFLATE;
-        WinHttpSetOption(request, WINHTTP_OPTION_DECOMPRESSION, &decompressionFlags, sizeof(decompressionFlags));
+            DWORD decompressionFlags = WINHTTP_DECOMPRESSION_FLAG_GZIP | WINHTTP_DECOMPRESSION_FLAG_DEFLATE;
+            WinHttpSetOption(request.get(), WINHTTP_OPTION_DECOMPRESSION, &decompressionFlags, sizeof(decompressionFlags));
 
-        if (!headers.empty()) {
-            WinHttpAddRequestHeaders(
-                request,
-                headers.c_str(),
-                static_cast<DWORD>(-1),
-                WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE
-            );
-        }
-
-        const void* bodyPtr = body.empty() ? nullptr : body.data();
-        DWORD bodySize = static_cast<DWORD>(body.size());
-
-        if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, const_cast<void*>(bodyPtr), bodySize, bodySize, 0)) {
-            WinHttpCloseHandle(request);
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
-            throw std::runtime_error("WinHttpSendRequest failed");
-        }
-
-        if (!WinHttpReceiveResponse(request, nullptr)) {
-            WinHttpCloseHandle(request);
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
-            throw std::runtime_error("WinHttpReceiveResponse failed");
-        }
-
-        DWORD status = 0;
-        DWORD statusSize = sizeof(status);
-
-        WinHttpQueryHeaders(
-            request,
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX,
-            &status,
-            &statusSize,
-            WINHTTP_NO_HEADER_INDEX
-        );
-
-        long long serverUnixSeconds = 0;
-        SYSTEMTIME serverDate{};
-        DWORD dateSize = sizeof(serverDate);
-        if (WinHttpQueryHeaders(request, WINHTTP_QUERY_DATE | WINHTTP_QUERY_FLAG_SYSTEMTIME,
-            WINHTTP_HEADER_NAME_BY_INDEX, &serverDate, &dateSize, WINHTTP_NO_HEADER_INDEX)) {
-            FILETIME fileTime{};
-            if (SystemTimeToFileTime(&serverDate, &fileTime)) {
-                ULARGE_INTEGER ticks{};
-                ticks.LowPart = fileTime.dwLowDateTime;
-                ticks.HighPart = fileTime.dwHighDateTime;
-                constexpr ULONGLONG epoch = 116444736000000000ULL;
-                if (ticks.QuadPart >= epoch)
-                    serverUnixSeconds = static_cast<long long>((ticks.QuadPart - epoch) / 10000000ULL);
-            }
-        }
-
-        std::string responseBody;
-
-        for (;;) {
-            DWORD available = 0;
-
-            if (!WinHttpQueryDataAvailable(request, &available) || available == 0) {
-                break;
+            if (!currentHeaders.empty()) {
+                WinHttpAddRequestHeaders(request.get(), currentHeaders.c_str(), static_cast<DWORD>(-1),
+                    WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
             }
 
-            std::string chunk(available, '\0');
-            DWORD read = 0;
+            const DWORD bodySize = static_cast<DWORD>(currentBody.size());
 
-            if (!WinHttpReadData(request, chunk.data(), available, &read) || read == 0) {
-                break;
+            if (!WinHttpSendRequest(request.get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                    currentBody.empty() ? nullptr : currentBody.data(), bodySize, bodySize, 0)) {
+                throw std::runtime_error("WinHttpSendRequest failed");
             }
 
-            chunk.resize(read);
-            responseBody += chunk;
+            if (!WinHttpReceiveResponse(request.get(), nullptr)) {
+                throw std::runtime_error("WinHttpReceiveResponse failed");
+            }
+
+            DWORD status = 0;
+            DWORD statusSize = sizeof(status);
+            WinHttpQueryHeaders(request.get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, WINHTTP_NO_HEADER_INDEX);
+
+            const bool redirect = status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+
+            if (followRedirects && redirect && hop < kMaxRedirects) {
+                const std::wstring next = ResolveLocation(parts, QueryLocation(request.get()));
+                UrlParts target;
+
+                // Never downgrade https to http (WinHTTP's own default policy).
+                if (!next.empty() && CrackUrl(next, target) && (target.secure || !parts.secure)) {
+                    if (_wcsicmp(target.host.c_str(), parts.host.c_str()) != 0) {
+                        currentHeaders = StripCredentialHeaders(currentHeaders);
+                    }
+
+                    if (status == 303 || ((status == 301 || status == 302) && currentMethod == L"POST")) {
+                        currentMethod = L"GET";
+                        currentBody.clear();
+                    }
+
+                    currentUrl = next;
+                    continue;
+                }
+            }
+
+            const long long serverUnixSeconds = ServerUnixSeconds(request.get());
+            return { static_cast<int>(status), ReadBody(request.get()), serverUnixSeconds };
         }
-
-        WinHttpCloseHandle(request);
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
-
-        return { static_cast<int>(status), responseBody, serverUnixSeconds };
     }
+
+    HttpResponse Client::TryRequestUrl(
+        const std::string& url,
+        const std::string& method,
+        const std::wstring& headers,
+        const std::string& body,
+        bool followRedirects
+    ) const
+    {
+        try {
+            return RequestUrl(url, method, headers, body, followRedirects);
+        }
+        catch (const std::exception&) {
+            return {};
+        }
+    }
+
     Client* get_instance()
     {
         static Client client;
         return &client;
     }
-
-    std::string ToLowerCopy(std::string text) { return get_instance()->ToLowerCopy(text); }
-    bool IsRateLimitText(const std::string& text) { return get_instance()->IsRateLimitText(text); }
-    std::string GetEnvText(const char* name) { return get_instance()->GetEnvText(name); }
-    std::filesystem::path UserProfilePath() { return get_instance()->UserProfilePath(); }
-    std::string ReadTextFile(const std::filesystem::path& path) { return get_instance()->ReadTextFile(path); }
-    std::string ReadRequiredTextFile(const std::filesystem::path& path) { return get_instance()->ReadRequiredTextFile(path); }
-    std::wstring Utf8ToWide(const std::string& value) { return get_instance()->Utf8ToWide(value); }
-    std::string StripHeaderValue(std::string value) { return get_instance()->StripHeaderValue(value); }
-    std::wstring JsonHeaders(const std::string& authorizationHeader, const std::string& origin, const std::string& referer) { return get_instance()->JsonHeaders(authorizationHeader, origin, referer); }
-    std::wstring BearerJsonHeaders(const std::string& token, const std::string& origin, const std::string& referer) { return get_instance()->BearerJsonHeaders(token, origin, referer); }
-    std::wstring RawAuthorizationJsonHeaders(const std::string& token, const std::string& origin, const std::string& referer) { return get_instance()->RawAuthorizationJsonHeaders(token, origin, referer); }
-    HttpResponse RequestUrl(const std::string& url, const std::string& method, const std::wstring& headers, const std::string& body, bool followRedirects) { return get_instance()->RequestUrl(url, method, headers, body, followRedirects); }
 }

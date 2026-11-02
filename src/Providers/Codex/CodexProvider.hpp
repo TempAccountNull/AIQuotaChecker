@@ -8,6 +8,7 @@
 #include "AppSettings.hpp"
 #include "Codex.hpp"
 #include "NotifyGUI.hpp"
+#include "QuotaNotifier.hpp"
 
 class CodexProvider
 {
@@ -24,8 +25,6 @@ public:
     AppSettings::CodexQuotaWarnings* QuotaWarnings();
 
     void SetAccountSource(int source, const std::string& customAuthPath);
-    int AccountSource() const;
-    std::string CustomAuthPath() const;
 
     void SetRateLimitCallback(RateLimitCallback callback);
 
@@ -40,7 +39,6 @@ public:
 private:
     CodexProvider() = default;
 
-    static void RefreshThunk();
     void HandleRateLimit(const std::string& detail);
 
     std::mutex m_mutex;
@@ -50,6 +48,8 @@ private:
 
     AppSettings::ProviderNotifications m_notifySettings;
     AppSettings::CodexQuotaWarnings m_quotaWarnings;
+    QuotaNotifier m_notifier{ "Codex" };
+    size_t m_resetCreditsNoticed = 0; // reset-credit count last toasted
 
     std::atomic_int m_accountSource = 0;
     std::atomic<std::uint64_t> m_sourceGeneration = 0;

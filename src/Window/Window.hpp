@@ -20,12 +20,4 @@ namespace UsageWindowModel
     private:
         Claude::UsageWindow window_;
     };
-
-    Claude::UsageWindow Placeholder(
-        const std::string& title,
-        const std::string& subtitle,
-        bool valid = false
-    );
-
-    Claude::UsageWindow FablePlaceholder();
 }

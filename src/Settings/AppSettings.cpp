@@ -3,6 +3,7 @@
 #include "AppSettings.hpp"
 #include "Math.hpp"
 #include "ResetTime.hpp"
+#include "Text.hpp"
 
 #include <algorithm>
 #include <windows.h>
@@ -37,75 +38,45 @@ namespace AppSettings
         WritePrivateProfileStringW(section, key, nullptr, path.c_str());
     }
 
-    static std::string WideToUtf8(const std::wstring& value)
+    // WritePrivateProfileStringW keeps a file in the ANSI code page unless it
+    // starts with a UTF-16LE byte-order mark, and a custom auth path or bar row
+    // outside that code page then comes back as "?". Start the file as UTF-16,
+    // converting an existing ANSI one in place.
+    static void EnsureUnicodeIni(const std::wstring& path)
     {
-        if (value.empty()) {
-            return {};
+        std::string bytes;
+
+        if (std::ifstream in(path, std::ios::binary); in) {
+            bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
         }
 
-        int size = WideCharToMultiByte(
-            CP_UTF8,
-            0,
-            value.data(),
-            static_cast<int>(value.size()),
-            nullptr,
-            0,
-            nullptr,
-            nullptr
-        );
-
-        if (size <= 0) {
-            return {};
+        if (bytes.size() >= 2 && static_cast<unsigned char>(bytes[0]) == 0xFF && static_cast<unsigned char>(bytes[1]) == 0xFE) {
+            return;
         }
 
-        std::string result(static_cast<size_t>(size), '\0');
-        WideCharToMultiByte(
-            CP_UTF8,
-            0,
-            value.data(),
-            static_cast<int>(value.size()),
-            result.data(),
-            size,
-            nullptr,
-            nullptr
-        );
-        return result;
-    }
+        std::wstring text;
+        const int length = bytes.empty() ? 0
+            : MultiByteToWideChar(CP_ACP, 0, bytes.data(), static_cast<int>(bytes.size()), nullptr, 0);
 
-    static std::wstring Utf8ToWide(const std::string& value)
-    {
-        if (value.empty()) {
-            return {};
+        if (length > 0) {
+            text.resize(static_cast<size_t>(length));
+            MultiByteToWideChar(CP_ACP, 0, bytes.data(), static_cast<int>(bytes.size()), text.data(), length);
         }
 
-        int size = MultiByteToWideChar(
-            CP_UTF8,
-            MB_ERR_INVALID_CHARS,
-            value.data(),
-            static_cast<int>(value.size()),
-            nullptr,
-            0
-        );
+        const std::wstring temporary = path + L".tmp";
+        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+        out.write("\xFF\xFE", 2);
+        out.write(reinterpret_cast<const char*>(text.data()), static_cast<std::streamsize>(text.size() * sizeof(wchar_t)));
+        out.close();
 
-        if (size <= 0) {
-            return {};
+        if (!out || !MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            DeleteFileW(temporary.c_str());
         }
-
-        std::wstring result(static_cast<size_t>(size), L'\0');
-        MultiByteToWideChar(
-            CP_UTF8,
-            MB_ERR_INVALID_CHARS,
-            value.data(),
-            static_cast<int>(value.size()),
-            result.data(),
-            size
-        );
-        return result;
     }
 
     static std::string ReadUtf8(const wchar_t* section, const wchar_t* key, const std::string& fallback, const std::wstring& path)
     {
-        std::wstring fallbackWide = Utf8ToWide(fallback);
+        std::wstring fallbackWide = Text::get_instance()->Utf8ToWide(fallback);
         std::wstring buffer(32768, L'\0');
 
         DWORD copied = GetPrivateProfileStringW(
@@ -118,12 +89,12 @@ namespace AppSettings
         );
 
         buffer.resize(static_cast<size_t>(copied));
-        return WideToUtf8(buffer);
+        return Text::get_instance()->WideToUtf8(buffer);
     }
 
     static bool WriteUtf8(const wchar_t* section, const wchar_t* key, const std::string& value, const std::wstring& path)
     {
-        std::wstring wide = Utf8ToWide(value);
+        std::wstring wide = Text::get_instance()->Utf8ToWide(value);
         return WritePrivateProfileStringW(section, key, wide.c_str(), path.c_str()) != 0;
     }
 
@@ -247,6 +218,9 @@ namespace AppSettings
         }
 
         path += L"settings.ini";
+
+        static std::once_flag unicode;
+        std::call_once(unicode, [&] { EnsureUnicodeIni(path); });
         return path;
     }
 
@@ -308,7 +282,6 @@ namespace AppSettings
         std::wstring path = GetSettingsIniPath();
 
         settings.showRemaining = ReadBool(L"UI", L"ShowRemaining", settings.showRemaining, path);
-        settings.widgetMode = ReadBool(L"UI", L"WidgetMode", settings.widgetMode, path);
         settings.widgetPinned = ReadBool(L"UI", L"WidgetPinned", settings.widgetPinned, path);
         settings.widgetAlwaysOnTop =
             ReadBool(L"UI", L"WidgetAlwaysOnTop", settings.widgetAlwaysOnTop, path);
@@ -323,7 +296,6 @@ namespace AppSettings
         settings.widgetMonitor = (std::max)(0,
             ReadInt(L"UI", L"WidgetMonitor", settings.widgetMonitor, path));
         settings.widgetBarRows = ReadUtf8(L"UI", L"WidgetBarRows", settings.widgetBarRows, path);
-        settings.widgetOrder = ReadUtf8(L"UI", L"WidgetOrder", settings.widgetOrder, path);
         settings.showResetDateDetails = ReadBool(L"UI", L"ShowResetDateDetails", settings.showResetDateDetails, path);
         settings.resetDisplayMode = ClampResetDisplayMode(ReadInt(L"UI", L"ResetDisplayMode", settings.resetDisplayMode, path));
         settings.notificationsInsideWindow = ReadBool(L"Notifications", L"InsideWindow", settings.notificationsInsideWindow, path);
@@ -390,17 +362,19 @@ namespace AppSettings
         bool ok = true;
 
         ok = WriteBool(L"UI", L"ShowRemaining", settings.showRemaining, path) && ok;
-        ok = WriteBool(L"UI", L"WidgetMode", settings.widgetMode, path) && ok;
         ok = WriteBool(L"UI", L"WidgetPinned", settings.widgetPinned, path) && ok;
         ok = WriteBool(L"UI", L"WidgetAlwaysOnTop", settings.widgetAlwaysOnTop, path) && ok;
         ok = WriteInt(L"UI", L"FontSize", ClampUiFontSize(settings.uiFontSize), path) && ok;
         ok = WriteInt(L"UI", L"WidgetSectionsV2", settings.widgetSections & kWidgetSectionAll, path) && ok;
-        // Superseded by WidgetSectionsV2 when the section list outgrew 7 bits.
+        // Retired keys: WidgetSections was superseded by WidgetSectionsV2 when
+        // the section list outgrew 7 bits; the app is always the widget now and
+        // has no host order, so WidgetMode and WidgetOrder are gone.
         DeleteKey(L"UI", L"WidgetSections", path);
+        DeleteKey(L"UI", L"WidgetMode", path);
+        DeleteKey(L"UI", L"WidgetOrder", path);
         ok = WriteInt(L"UI", L"WidgetAnchor", ClampWidgetAnchor(settings.widgetAnchor), path) && ok;
         ok = WriteInt(L"UI", L"WidgetMonitor", (std::max)(0, settings.widgetMonitor), path) && ok;
         ok = WriteUtf8(L"UI", L"WidgetBarRows", settings.widgetBarRows, path) && ok;
-        ok = WriteUtf8(L"UI", L"WidgetOrder", settings.widgetOrder, path) && ok;
         ok = WriteBool(L"UI", L"ShowResetDateDetails", settings.showResetDateDetails, path) && ok;
         ok = WriteInt(L"UI", L"ResetDisplayMode", ClampResetDisplayMode(settings.resetDisplayMode), path) && ok;
         ok = WriteBool(L"Notifications", L"InsideWindow", settings.notificationsInsideWindow, path) && ok;

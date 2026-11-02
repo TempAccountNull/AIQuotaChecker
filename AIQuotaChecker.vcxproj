@@ -83,7 +83,7 @@
       <ConformanceMode>true</ConformanceMode>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <LanguageStandard>stdcpplatest</LanguageStandard>
-      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;$(AIQuotaImGuiDir);$(AIQuotaImGuiDir)\backends;$(AIQuotaJsonDir)\single_include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;$(AIQuotaImGuiDir);$(AIQuotaImGuiDir)\backends;$(AIQuotaJsonDir)\single_include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>Global.hpp</PrecompiledHeaderFile>
     </ClCompile>
@@ -105,7 +105,7 @@
       <ConformanceMode>true</ConformanceMode>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <LanguageStandard>stdcpplatest</LanguageStandard>
-      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;$(AIQuotaImGuiDir);$(AIQuotaImGuiDir)\backends;$(AIQuotaJsonDir)\single_include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;$(AIQuotaImGuiDir);$(AIQuotaImGuiDir)\backends;$(AIQuotaJsonDir)\single_include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>Global.hpp</PrecompiledHeaderFile>
     </ClCompile>
@@ -126,7 +126,7 @@
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <LanguageStandard>stdcpplatest</LanguageStandard>
       <LanguageStandard_C>stdclatest</LanguageStandard_C>
-      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;$(AIQuotaImGuiDir);$(AIQuotaImGuiDir)\backends;$(AIQuotaJsonDir)\single_include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;$(AIQuotaImGuiDir);$(AIQuotaImGuiDir)\backends;$(AIQuotaJsonDir)\single_include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>Global.hpp</PrecompiledHeaderFile>
     </ClCompile>
@@ -149,7 +149,7 @@
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <LanguageStandard>stdcpplatest</LanguageStandard>
       <LanguageStandard_C>stdclatest</LanguageStandard_C>
-      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Clock;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;$(AIQuotaImGuiDir);$(AIQuotaImGuiDir)\backends;$(AIQuotaJsonDir)\single_include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>src;src\Global;src\Project;src\Resources;src\Settings;src\Format;src\Json;src\Math;src\Network;src\Renderer;src\ResetTime;src\Text;src\Win32;src\Window;src\Providers;src\Providers\Codex;src\Providers\Claude;src\Providers\ZAi;src\Providers\Grok;$(AIQuotaImGuiDir);$(AIQuotaImGuiDir)\backends;$(AIQuotaJsonDir)\single_include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>Global.hpp</PrecompiledHeaderFile>
     </ClCompile>
@@ -162,36 +162,29 @@
     </ResourceCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="src\Project\AIQuotaChecker.h" />
     <ClInclude Include="src\Settings\AppSettings.hpp" />
-    <ClInclude Include="src\Clock\KSharedClock.hpp" />
     <ClInclude Include="src\Format\Format.hpp" />
     <ClInclude Include="src\Json\JsonUtils.hpp" />
     <ClInclude Include="src\Math\Math.hpp" />
     <ClInclude Include="src\Network\Network.hpp" />
     <ClInclude Include="src\Renderer\Renderer.hpp" />
     <ClInclude Include="src\ResetTime\ResetTime.hpp" />
-    <ClInclude Include="src\Resources\framework.h" />
     <ClInclude Include="src\Resources\Resource.h" />
     <ClInclude Include="src\Resources\targetver.h" />
     <ClInclude Include="src\Text\Text.hpp" />
     <ClInclude Include="src\Win32\NotifyGUI.hpp" />
-    <ClInclude Include="src\Win32\notepad_logger.hpp" />
     <ClInclude Include="src\Window\Window.hpp" />
     <ClInclude Include="src\Providers\Codex\Codex.hpp" />
     <ClInclude Include="src\Providers\Codex\CodexAppServer.hpp" />
-    <ClInclude Include="src\Providers\Codex\CodexNotifier.hpp" />
     <ClInclude Include="src\Providers\Codex\CodexProvider.hpp" />
     <ClInclude Include="src\Providers\Claude\Claude.hpp" />
     <ClInclude Include="src\Providers\Claude\ClaudeDesktopAuth.hpp" />
     <ClInclude Include="src\Providers\Claude\ClaudeCookieStore.hpp" />
-    <ClInclude Include="src\Providers\Claude\ClaudeNotifier.hpp" />
     <ClInclude Include="src\Providers\Claude\ClaudeProvider.hpp" />
+    <ClInclude Include="src\Providers\QuotaNotifier.hpp" />
     <ClInclude Include="src\Providers\ZAi\ZAi.hpp" />
-    <ClInclude Include="src\Providers\ZAi\ZAiNotifier.hpp" />
     <ClInclude Include="src\Providers\ZAi\ZAiProvider.hpp" />
     <ClInclude Include="src\Providers\Grok\Grok.hpp" />
-    <ClInclude Include="src\Providers\Grok\GrokNotifier.hpp" />
     <ClInclude Include="src\Providers\Grok\GrokProvider.hpp" />
     <ClInclude Include="src\Providers\UsageTelemetry.hpp" />
     <ClInclude Include="src\Global\Global.hpp" />
@@ -202,7 +195,6 @@
     </ClCompile>
     <ClCompile Include="src\Project\AIQuotaChecker.cpp" />
     <ClCompile Include="src\Settings\AppSettings.cpp" />
-    <ClCompile Include="src\Clock\KSharedClock.cpp" />
     <ClCompile Include="src\Format\Format.cpp" />
     <ClCompile Include="src\Json\JsonUtils.cpp" />
     <ClCompile Include="src\Math\Math.cpp" />
@@ -211,24 +203,18 @@
     <ClCompile Include="src\ResetTime\ResetTime.cpp" />
     <ClCompile Include="src\Text\Text.cpp" />
     <ClCompile Include="src\Win32\NotifyGUI.cpp" />
-    <ClCompile Include="src\Win32\notepad_logger.cpp">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-    </ClCompile>
     <ClCompile Include="src\Window\Window.cpp" />
     <ClCompile Include="src\Providers\Codex\Codex.cpp" />
     <ClCompile Include="src\Providers\Codex\CodexAppServer.cpp" />
-    <ClCompile Include="src\Providers\Codex\CodexNotifier.cpp" />
     <ClCompile Include="src\Providers\Codex\CodexProvider.cpp" />
     <ClCompile Include="src\Providers\Claude\Claude.cpp" />
     <ClCompile Include="src\Providers\Claude\ClaudeDesktopAuth.cpp" />
     <ClCompile Include="src\Providers\Claude\ClaudeCookieStore.cpp" />
-    <ClCompile Include="src\Providers\Claude\ClaudeNotifier.cpp" />
     <ClCompile Include="src\Providers\Claude\ClaudeProvider.cpp" />
+    <ClCompile Include="src\Providers\QuotaNotifier.cpp" />
     <ClCompile Include="src\Providers\ZAi\ZAi.cpp" />
-    <ClCompile Include="src\Providers\ZAi\ZAiNotifier.cpp" />
     <ClCompile Include="src\Providers\ZAi\ZAiProvider.cpp" />
     <ClCompile Include="src\Providers\Grok\Grok.cpp" />
-    <ClCompile Include="src\Providers\Grok\GrokNotifier.cpp" />
     <ClCompile Include="src\Providers\Grok\GrokProvider.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -257,10 +243,6 @@
   <ItemGroup>
     <Image Include="src\Resources\AIQuotaChecker.ico" />
     <Image Include="src\Resources\small.ico" />
-    <Image Include="src\Resources\images\Claude.ico" />
-    <Image Include="src\Resources\images\Codex.ico" />
-    <Image Include="src\Resources\images\Grok.ico" />
-    <Image Include="src\Resources\images\ZAi.ico" />
   </ItemGroup>
   <ItemGroup>
     <None Include="src\Tools\check-codex-resets.cmd" />

@@ -2,14 +2,15 @@
 #include <cstdint>
 
 // ---------------------------------------------------------------------------
-// NotifyGUI - lightweight ImGui overlay notification system.
+// NotifyGUI - provider toasts, either native Win32 popups or an ImGui overlay
+// inside the widget.
 //
-// Thread-safe: Add() may be called from any thread (background scanner, etc.).
-// Render() must be called from the main/render thread each frame, after
-// ImGui::NewFrame() and before Renderer::RenderFrame().
+// Thread-safe: Add() may be called from any thread (provider refreshes).
+// Render() must be called from the main thread each frame, between
+// ImGui::NewFrame() and ImGui::Render().
 //
 // Usage:
-//   NotifyGUI::Add("Skipped: foo.sys  [UPX]",
+//   NotifyGUI::Add("Claude: 90% of the weekly limit used",
 //                  NotifyPosition::BOTTOM_RIGHT, 6.0f,
 //                  NOTIFY_COL32(255, 200, 60, 255));
 // ---------------------------------------------------------------------------
@@ -37,7 +38,9 @@ namespace NotifyGUI
     // false = native Win32 toast outside the app window.
     // true  = ImGui overlay inside the app window.
     void SetInsideWindow(bool enabled);
-    bool GetInsideWindow();
+
+    // Native toasts appear on this window's monitor (the widget).
+    void SetAnchorWindow(HWND window);
 
     // Enqueue a notification. Thread-safe.
     //   message  - text to display (truncated to 255 chars)
@@ -49,7 +52,7 @@ namespace NotifyGUI
         float          duration = 5.0f,
         std::uint32_t  color = NOTIFY_COL32(255, 255, 255, 255));
 
-    // Draw/process all active notifications.
-    // Call once per frame: after ImGui::NewFrame(), before Renderer::RenderFrame().
+    // Draw/process all active notifications. Call once per frame, between
+    // ImGui::NewFrame() and ImGui::Render().
     void Render();
 }

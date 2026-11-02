@@ -8,6 +8,7 @@
 #include "AppSettings.hpp"
 #include "Claude.hpp"
 #include "NotifyGUI.hpp"
+#include "QuotaNotifier.hpp"
 
 class ClaudeProvider
 {
@@ -24,7 +25,6 @@ public:
     AppSettings::ClaudeQuotaWarnings* QuotaWarnings();
 
     void SetAccountSource(int source);
-    int AccountSource() const;
 
     void SetRateLimitCallback(RateLimitCallback callback);
 
@@ -39,7 +39,6 @@ public:
 private:
     ClaudeProvider() = default;
 
-    static void RefreshThunk();
     void HandleRateLimit(const std::string& detail);
     void ApplyLocalTelemetryLocked(Claude::LocalTelemetry local, Claude::Snapshot& target);
 
@@ -54,10 +53,6 @@ private:
     // JSONL transcript. The boundary/new low-context value clears the latch.
     bool m_compactionLatched = false;
     long long m_compactionStartedAtUnixSeconds = 0;
-    // Last time the foreground JSONL positively showed an active user turn.
-    // Compaction can stop transcript writes for minutes, so this lets the
-    // provider bridge the 0%-until-auto-compact edge without polling Claude.
-    long long m_lastActiveRunSeenAtUnixSeconds = 0;
     long long m_compactionNoticeAtUnixSeconds = 0;
     bool m_compactionNoticeEligible = false;
     long long m_lastCompactionSavedTokens = 0;
@@ -65,6 +60,7 @@ private:
 
     AppSettings::ProviderNotifications m_notifySettings;
     AppSettings::ClaudeQuotaWarnings m_quotaWarnings;
+    QuotaNotifier m_notifier{ "Claude" };
 
     std::atomic_int m_accountSource = 0;
     std::atomic<std::uint64_t> m_sourceGeneration = 0;

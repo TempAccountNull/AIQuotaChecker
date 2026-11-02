@@ -1,6 +1,7 @@
 #include "Global.hpp"
 
 #include "Claude.hpp"
+#include "ClaudeCookieStore.hpp"
 #include "ClaudeDesktopAuth.hpp"
 #include "JsonUtils.hpp"
 #include "Network.hpp"
@@ -23,6 +24,7 @@
 #include <iomanip>
 #include <initializer_list>
 #include <mutex>
+#include <regex>
 #include <utility>
 #include <unordered_map>
 #include <optional>
@@ -36,6 +38,7 @@ using json = nlohmann::json;
 
 namespace Claude {
 
+    constexpr std::uint64_t kMegabyte = 1024ULL * 1024ULL;
 
     struct ClaudeOAuth {
         std::string accessToken;
@@ -79,24 +82,39 @@ namespace Claude {
         bool canSave = false;
     };
 
-    static std::filesystem::path ClaudeCredentialsPath() {
-        std::string configDir = Network::get_instance()->GetEnvText("CLAUDE_CONFIG_DIR");
+    // CLAUDE_CONFIG_DIR, or %USERPROFILE%\.claude.
+    static std::filesystem::path ClaudeConfigDir() {
+        const std::string configured = Network::get_instance()->GetEnvText("CLAUDE_CONFIG_DIR");
 
-        if (!configDir.empty()) {
-            return std::filesystem::path(configDir) / ".credentials.json";
-        }
-
-        return Network::get_instance()->UserProfilePath() / ".claude" / ".credentials.json";
+        return configured.empty()
+            ? Network::get_instance()->UserProfilePath() / ".claude"
+            : std::filesystem::path(configured);
     }
 
-    static void WriteTextFile(const std::filesystem::path& path, const std::string& text) {
-        std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    static std::filesystem::path ClaudeCredentialsPath() {
+        return ClaudeConfigDir() / ".credentials.json";
+    }
 
-        if (!file) {
-            throw std::runtime_error("Could not write file: " + path.string());
+    // Replaces the file atomically. The refresh token inside is single-use and
+    // already spent, so a crash or full disk must never leave it truncated.
+    static void WriteTextFile(const std::filesystem::path& path, const std::string& text) {
+        std::filesystem::path temp = path;
+        temp += ".tmp";
+
+        bool written = false;
+        {
+            std::ofstream file(temp, std::ios::binary | std::ios::trunc);
+            file << text;
+            file.flush();
+            written = file.good();
         }
 
-        file << text;
+        if (!written ||
+            !MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            std::error_code ignored;
+            std::filesystem::remove(temp, ignored);
+            throw std::runtime_error("Could not save the refreshed Claude Code credentials");
+        }
     }
 
     static bool IsTokenNearExpiry(double expiresAtMs) {
@@ -114,40 +132,36 @@ namespace Claude {
         return remainingMs <= 5.0 * 60.0 * 1000.0;
     }
 
-    static std::string ClaudeStringAny(
-        const json& object,
-        std::initializer_list<const char*> keys
-    );
-    static std::optional<double> ClaudeNumberAny(
-        const json& object,
-        std::initializer_list<const char*> keys
-    );
-
     static std::optional<ClaudeCredentials> LoadClaudeCredentialsFile() {
         std::filesystem::path path = ClaudeCredentialsPath();
+        std::error_code ec;
 
-        if (!std::filesystem::exists(path)) {
+        if (!std::filesystem::exists(path, ec)) {
             return std::nullopt;
         }
 
-        json root = JsonUtils::get_instance()->ParseRequired(
-            Network::get_instance()->ReadRequiredTextFile(path)
+        // Fixed messages only: a JSON parse error quotes the bytes it stopped
+        // at, and a torn read of this file would put a token in the status.
+        const json root = JsonUtils::get_instance()->ParseOrNull(
+            ClaudeCookieStore::ReadSharedText(path, kMegabyte)
         );
 
+        if (!root.is_object()) {
+            throw std::runtime_error("Claude Code .credentials.json could not be read or is not valid JSON");
+        }
+
         if (!root.contains("claudeAiOauth") || !root.at("claudeAiOauth").is_object()) {
-            throw std::runtime_error(
-                "Claude Code .credentials.json does not contain claudeAiOauth: " + path.string()
-            );
+            throw std::runtime_error("Claude Code .credentials.json does not contain claudeAiOauth");
         }
 
         const json& oauthJson = root.at("claudeAiOauth");
 
         ClaudeOAuth oauth;
-        oauth.accessToken = ClaudeStringAny(oauthJson, { "accessToken", "access_token" });
-        oauth.refreshToken = ClaudeStringAny(oauthJson, { "refreshToken", "refresh_token" });
-        oauth.expiresAtMs = ClaudeNumberAny(oauthJson, { "expiresAt", "expires_at" }).value_or(0.0);
-        oauth.subscriptionType = ClaudeStringAny(oauthJson, { "subscriptionType", "subscription_type" });
-        oauth.rateLimitTier = ClaudeStringAny(oauthJson, { "rateLimitTier", "rate_limit_tier" });
+        oauth.accessToken = Text::get_instance()->FirstNonEmpty({ JsonUtils::get_instance()->String(oauthJson, "accessToken"), JsonUtils::get_instance()->String(oauthJson, "access_token") });
+        oauth.refreshToken = Text::get_instance()->FirstNonEmpty({ JsonUtils::get_instance()->String(oauthJson, "refreshToken"), JsonUtils::get_instance()->String(oauthJson, "refresh_token") });
+        oauth.expiresAtMs = JsonUtils::get_instance()->NumberAny(oauthJson, { "expiresAt", "expires_at" }).value_or(0.0);
+        oauth.subscriptionType = Text::get_instance()->FirstNonEmpty({ JsonUtils::get_instance()->String(oauthJson, "subscriptionType"), JsonUtils::get_instance()->String(oauthJson, "subscription_type") });
+        oauth.rateLimitTier = Text::get_instance()->FirstNonEmpty({ JsonUtils::get_instance()->String(oauthJson, "rateLimitTier"), JsonUtils::get_instance()->String(oauthJson, "rate_limit_tier") });
 
         for (const char* key : { "scopes", "scope" }) {
             auto it = oauthJson.find(key);
@@ -178,9 +192,7 @@ namespace Claude {
         }
 
         if (oauth.accessToken.empty()) {
-            throw std::runtime_error(
-                "Claude Code accessToken is missing from .credentials.json: " + path.string()
-            );
+            throw std::runtime_error("Claude Code accessToken is missing from .credentials.json");
         }
 
         ClaudeCredentials creds;
@@ -268,6 +280,25 @@ namespace Claude {
             return false;
         }
 
+        // The refresh token is single-use. If Claude Code rotated it since the
+        // file was loaded, spending the stale copy fails (or signs the CLI out),
+        // so adopt the CLI's fresh credentials instead.
+        if (creds.canSave) {
+            try {
+                std::optional<ClaudeCredentials> current = LoadClaudeCredentialsFile();
+
+                if (current &&
+                    (current->oauth.refreshToken != creds.oauth.refreshToken ||
+                        current->oauth.expiresAtMs != creds.oauth.expiresAtMs)) {
+                    creds = std::move(*current);
+                    return true;
+                }
+            }
+            catch (const std::exception&) {
+                // Unreadable right now: refresh with what was loaded.
+            }
+        }
+
         json body;
         body["grant_type"] = "refresh_token";
         body["refresh_token"] = creds.oauth.refreshToken;
@@ -278,7 +309,7 @@ namespace Claude {
             std::wstring(L"Content-Type: application/json\r\n") +
             L"Accept: application/json\r\n";
 
-        Network::HttpResponse response = Network::get_instance()->RequestUrl(
+        Network::HttpResponse response = Network::get_instance()->TryRequestUrl(
             "https://platform.claude.com/v1/oauth/token",
             "POST",
             headers,
@@ -289,7 +320,7 @@ namespace Claude {
             return false;
         }
 
-        json decoded = JsonUtils::get_instance()->ParseRequired(response.body);
+        const json decoded = JsonUtils::get_instance()->ParseOrNull(response.body);
 
         if (decoded.contains("scope") && decoded.at("scope").is_string()) {
             std::vector<std::string> refreshed;
@@ -333,7 +364,85 @@ namespace Claude {
         return true;
     }
 
-    static Network::HttpResponse FetchUsage(const std::string& accessToken) {
+    // Claude Code keeps the signed-in account in <CLAUDE_CONFIG_DIR or
+    // %USERPROFILE%>\.claude.json (oauthAccount). Unlike the token, its id
+    // survives every refresh. The CLI rewrites the file often, so a torn read
+    // keeps the last id seen rather than looking like an account switch.
+    static std::string ClaudeCodeAccountId() {
+        static std::mutex mutex;
+        static std::string lastKnown;
+
+        const std::string configured = Network::get_instance()->GetEnvText("CLAUDE_CONFIG_DIR");
+        const std::filesystem::path path = configured.empty()
+            ? Network::get_instance()->UserProfilePath() / ".claude.json"
+            : std::filesystem::path(configured) / ".claude.json";
+
+        const json config = JsonUtils::get_instance()->ParseOrNull(
+            ClaudeCookieStore::ReadSharedText(path, 64 * kMegabyte)
+        );
+        const json account = config.is_object() && config.contains("oauthAccount")
+            ? config.at("oauthAccount")
+            : json();
+        const std::string id = Text::get_instance()->FirstNonEmpty({
+            JsonUtils::get_instance()->String(account, "accountUuid"),
+            JsonUtils::get_instance()->String(account, "organizationUuid")
+        });
+
+        std::lock_guard<std::mutex> lock(mutex);
+
+        if (!id.empty()) {
+            lastKnown = id;
+        }
+
+        return lastKnown;
+    }
+
+    // Claude Desktop 4.4212.0 identifies itself on every claude.ai request and
+    // sends the same anthropic-client-* set to api.anthropic.com.
+    static const char* const kDesktopUserAgent =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Claude/4.4212.0 Chrome/152.0.7977.167 Electron/44.9.3 Safari/537.36 MSIX";
+
+    static const std::string& DesktopClientHeaders() {
+        static const std::string headers = [] {
+            MEMORYSTATUSEX memory{};
+            memory.dwLength = sizeof(memory);
+            const double totalBytes = GlobalMemoryStatusEx(&memory)
+                ? static_cast<double>(memory.ullTotalPhys)
+                : 0.0;
+            const char* deviceClass = totalBytes < 6e9 ? "le4"
+                : totalBytes < 12e9 ? "8"
+                : totalBytes < 2e10 ? "16"
+                : "gt16";
+
+            // os.release() equivalent. GetVersionEx reports what the manifest
+            // allows, RtlGetVersion the real build.
+            using RtlGetVersionFn = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
+            RTL_OSVERSIONINFOW os{};
+            os.dwOSVersionInfoSize = sizeof(os);
+
+            if (const auto rtlGetVersion = reinterpret_cast<RtlGetVersionFn>(
+                    GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"))) {
+                rtlGetVersion(&os);
+            }
+
+            return std::string("anthropic-client-platform: desktop_app\r\n") +
+                "anthropic-client-app: com.anthropic.claudefordesktop\r\n"
+                "anthropic-client-version: 4.4212.0\r\n"
+                "anthropic-client-device-class: " + deviceClass + "\r\n"
+                "anthropic-client-total-memory-gb: " +
+                std::to_string(std::llround(totalBytes / (1024.0 * 1024.0 * 1024.0))) + "\r\n"
+                "anthropic-client-os-platform: win32\r\n"
+                "anthropic-client-os-version: " + std::to_string(os.dwMajorVersion) + "." +
+                std::to_string(os.dwMinorVersion) + "." + std::to_string(os.dwBuildNumber) + "\r\n";
+        }();
+
+        return headers;
+    }
+
+    // Status 0 when the request could not be sent. desktop: the token came
+    // from Claude Desktop, so send what Desktop sends.
+    static Network::HttpResponse FetchUsage(const std::string& accessToken, bool desktop) {
         std::string token = Network::get_instance()->StripHeaderValue(accessToken);
 
         std::wstring headers =
@@ -347,14 +456,57 @@ namespace Claude {
             L"anthropic-beta: oauth-2025-04-20\r\n"
             L"User-Agent: claude-code/2.1.69\r\n";
 
-        return Network::get_instance()->RequestUrl(
+        if (desktop) {
+            headers += Network::get_instance()->Utf8ToWide(DesktopClientHeaders());
+        }
+
+        return Network::get_instance()->TryRequestUrl(
             "https://api.anthropic.com/api/oauth/usage",
             "GET",
             headers
         );
     }
 
-    static std::chrono::system_clock::time_point ParseTimeFlexible(const json& value) {
+    // A GET on claude.ai / claude.com with Desktop's cookie session, sent the
+    // way Desktop sends it. Status 0 when it could not be sent.
+    static Network::HttpResponse DesktopGet(
+        const ClaudeDesktopAuth::Result& desktop,
+        const std::string& base,
+        const std::string& path
+    ) {
+        const std::string cookie = Network::get_instance()->StripHeaderValue(desktop.cookieHeader);
+
+        if (cookie.empty()) {
+            return {};
+        }
+
+        const std::string origin = base.empty() ? "https://claude.ai" : base;
+        const std::string headers =
+            "Accept: application/json\r\n"
+            "Cache-Control: no-cache, no-store, max-age=0\r\n"
+            "Pragma: no-cache\r\n"
+            "Cookie: " + cookie + "\r\n"
+            "Referer: " + origin + "/settings/usage\r\n"
+            "Origin: " + origin + "\r\n"
+            "User-Agent: " + kDesktopUserAgent + "\r\n" +
+            DesktopClientHeaders() +
+            "anthropic-desktop-topbar: 1\r\n";
+
+        return Network::get_instance()->TryRequestUrl(
+            origin + path,
+            "GET",
+            Network::get_instance()->Utf8ToWide(headers)
+        );
+    }
+
+    // claude.ai's Settings > Usage asks for cedar_ember=1 (the free limit
+    // resets block) plus skip_spend=1. Spend is wanted here, and there is no
+    // skip_spend=0 form, so only cedar_ember is sent. GET only, always.
+    static std::string DesktopUsagePath(const ClaudeDesktopAuth::Result& desktop) {
+        return "/api/organizations/" + desktop.organizationId + "/usage?cedar_ember=1";
+    }
+
+    static std::chrono::system_clock::time_point ParseTimeFlexibleOrThrow(const json& value) {
         using namespace std::chrono;
 
         if (value.is_number()) {
@@ -447,16 +599,15 @@ namespace Claude {
         return system_clock::from_time_t(utc);
     }
 
-    static std::string FormatResetRelativeText(std::chrono::system_clock::time_point tp) {
-        return Format::get_instance()->ResetRelative(tp);
-    }
-
-    static std::string FormatResetLong(std::chrono::system_clock::time_point tp) {
-        return Format::get_instance()->ResetLong(tp);
-    }
-
-    static std::string FormatResetShort(std::chrono::system_clock::time_point tp) {
-        return Format::get_instance()->ResetRelative(tp);
+    // A malformed time (stod/stoi on garbage) reads as unknown instead of
+    // throwing out of a whole snapshot.
+    static std::chrono::system_clock::time_point ParseTimeFlexible(const json& value) {
+        try {
+            return ParseTimeFlexibleOrThrow(value);
+        }
+        catch (const std::exception&) {
+            return {};
+        }
     }
 
     static std::chrono::system_clock::time_point FirstDayOfNextMonth() {
@@ -469,6 +620,8 @@ namespace Claude {
         localTime.tm_hour = 0;
         localTime.tm_mday = 1;
         localTime.tm_mon += 1;
+        // Let mktime decide: keeping today's flag is an hour off across DST.
+        localTime.tm_isdst = -1;
 
         return std::chrono::system_clock::from_time_t(std::mktime(&localTime));
     }
@@ -479,14 +632,6 @@ namespace Claude {
         }
 
         return static_cast<long long>(std::chrono::system_clock::to_time_t(tp));
-    }
-
-    static std::string FormatDollars(double value) {
-        return Format::get_instance()->Dollars(value);
-    }
-
-    static std::string ToLowerAscii(std::string value) {
-        return Text::get_instance()->ToLowerCopy(value);
     }
 
     static const json* FindClaudeObject(
@@ -500,52 +645,6 @@ namespace Claude {
         for (const char* key : keys) {
             if (object.contains(key) && object.at(key).is_object()) {
                 return &object.at(key);
-            }
-        }
-
-        return nullptr;
-    }
-
-    static const json* FindClaudeObjectRecursive(
-        const json& value,
-        std::initializer_list<const char*> keys,
-        int depth = 0
-    ) {
-        if (depth > 5) {
-            return nullptr;
-        }
-
-        if (value.is_object()) {
-            if (const json* direct = FindClaudeObject(value, keys)) {
-                return direct;
-            }
-
-            // Current Claude Desktop returns extra_usage at the top level.
-            // These wrappers are accepted for compatible web/API variants,
-            // without scanning or persisting any unrelated local data.
-            for (const char* wrapper : { "data", "usage", "plan_usage", "planUsage", "result" }) {
-                if (value.contains(wrapper)) {
-                    if (const json* nested = FindClaudeObjectRecursive(value.at(wrapper), keys, depth + 1)) {
-                        return nested;
-                    }
-                }
-            }
-
-            for (auto it = value.begin(); it != value.end(); ++it) {
-                if (!it.value().is_object() && !it.value().is_array()) {
-                    continue;
-                }
-
-                if (const json* nested = FindClaudeObjectRecursive(it.value(), keys, depth + 1)) {
-                    return nested;
-                }
-            }
-        }
-        else if (value.is_array()) {
-            for (const json& item : value) {
-                if (const json* nested = FindClaudeObjectRecursive(item, keys, depth + 1)) {
-                    return nested;
-                }
             }
         }
 
@@ -651,50 +750,6 @@ namespace Claude {
         return best;
     }
 
-    static std::string ClaudeStringAny(
-        const json& object,
-        std::initializer_list<const char*> keys
-    ) {
-        if (!object.is_object()) {
-            return {};
-        }
-
-        for (const char* key : keys) {
-            std::string value = JsonUtils::get_instance()->String(object, key);
-
-            if (!value.empty()) {
-                return value;
-            }
-        }
-
-        return {};
-    }
-
-    static std::optional<double> ClaudeNumberAny(
-        const json& object,
-        std::initializer_list<const char*> keys
-    ) {
-        return JsonUtils::get_instance()->NumberAny(object, keys);
-    }
-
-    static bool ClaudeBoolAny(
-        const json& object,
-        std::initializer_list<const char*> keys,
-        bool fallback = false
-    ) {
-        if (!object.is_object()) {
-            return fallback;
-        }
-
-        for (const char* key : keys) {
-            if (object.contains(key) && !object.at(key).is_null()) {
-                return JsonUtils::get_instance()->Bool(object, key, fallback);
-            }
-        }
-
-        return fallback;
-    }
-
     static std::chrono::system_clock::time_point ParseClaudeResetAt(const json& object) {
         if (!object.is_object()) {
             return {};
@@ -739,7 +794,7 @@ namespace Claude {
     }
 
     static std::string PrettySubscriptionType(const std::string& subscriptionType) {
-        std::string lower = ToLowerAscii(subscriptionType);
+        std::string lower = Text::get_instance()->ToLowerCopy(subscriptionType);
 
         if (lower.empty()) return "";
         if (lower == "pro") return "Pro";
@@ -752,7 +807,7 @@ namespace Claude {
     }
 
     static std::string ExtractRateLimitMultiplier(const std::string& rateLimitTier) {
-        std::string lower = ToLowerAscii(rateLimitTier);
+        std::string lower = Text::get_instance()->ToLowerCopy(rateLimitTier);
 
         // OpenClaude only appends the multiplier part of rateLimitTier.
         // Examples:
@@ -776,9 +831,62 @@ namespace Claude {
         return "";
     }
 
+    // Desktop shows plan_display_name whitespace-collapsed and capped at 40
+    // characters: 39 and an ellipsis.
+    static std::string CapPlanDisplayName(const std::string& name) {
+        std::string collapsed;
+
+        for (const unsigned char c : name) {
+            if (!std::isspace(c)) {
+                collapsed.push_back(static_cast<char>(c));
+            }
+            else if (!collapsed.empty() && collapsed.back() != ' ') {
+                collapsed.push_back(' ');
+            }
+        }
+
+        if (!collapsed.empty() && collapsed.back() == ' ') {
+            collapsed.pop_back();
+        }
+
+        // Count characters, not UTF-8 bytes, and never cut inside one.
+        size_t characters = 0;
+        size_t cut = 0;
+
+        for (size_t i = 0; i < collapsed.size(); ++i) {
+            if ((static_cast<unsigned char>(collapsed[i]) & 0xC0) == 0x80) {
+                continue;
+            }
+
+            if (characters++ == 39) {
+                cut = i;
+            }
+        }
+
+        return characters > 40 ? collapsed.substr(0, cut) + "\xE2\x80\xA6" : collapsed;
+    }
+
     static std::string FormatPlan(const ClaudeOAuth& oauth) {
         if (!oauth.displayName.empty()) {
-            return "Claude " + oauth.displayName;
+            return "Claude " + CapPlanDisplayName(oauth.displayName);
+        }
+
+        // Anthropic renamed the Max plans on 2026-10-30: Max 5x is now "Max"
+        // and Max 20x is "Ultra". The tier string still says max_5x/max_20x,
+        // so the multiplier picks the name and is no longer shown. Without a
+        // subscription type the tier alone decides.
+        const std::string lowerSubscription = Text::get_instance()->ToLowerCopy(oauth.subscriptionType);
+        const std::string lowerTier = Text::get_instance()->ToLowerCopy(oauth.rateLimitTier);
+        const bool maxTier = lowerTier.find("max") != std::string::npos;
+
+        if (lowerSubscription == "ultra" || lowerTier.find("ultra") != std::string::npos ||
+            ((lowerSubscription == "max" || maxTier) &&
+                ExtractRateLimitMultiplier(oauth.rateLimitTier) == "20x")) {
+            return "Claude Ultra";
+        }
+
+        if (lowerSubscription == "max" || (lowerSubscription.empty() && maxTier)) {
+            return "Claude Max";
         }
 
         std::string plan = "Claude";
@@ -813,7 +921,7 @@ namespace Claude {
 
         const json& object = root.at(key);
 
-        std::optional<double> usedValue = ClaudeNumberAny(
+        std::optional<double> usedValue = JsonUtils::get_instance()->NumberAny(
             object,
             { "utilization", "percent", "used_percent", "usedPercent" }
         );
@@ -827,27 +935,9 @@ namespace Claude {
 
         return window
             .UsedPercent(static_cast<float>(used))
-            .Reset(TimePointToUnixSeconds(resetAt), FormatResetLong(resetAt))
+            .Reset(TimePointToUnixSeconds(resetAt), Format::get_instance()->ResetRelative(resetAt))
             .Valid()
             .Build();
-    }
-
-
-    static UsageWindow ParseFirstAvailableWindow(
-        const json& root,
-        std::initializer_list<const char*> keys,
-        const std::string& title,
-        const std::string& subtitle
-    ) {
-        for (const char* key : keys) {
-            UsageWindow window = ParseWindow(root, key, title, subtitle);
-
-            if (window.valid) {
-                return window;
-            }
-        }
-
-        return UsageWindowModel::Placeholder(title, subtitle);
     }
 
     static std::string LimitScopeDisplayName(const json& limit) {
@@ -859,10 +949,7 @@ namespace Claude {
 
         for (const char* key : { "model", "surface" }) {
             if (scope.contains(key) && scope.at(key).is_object()) {
-                std::string displayName = ClaudeStringAny(
-                    scope.at(key),
-                    { "display_name", "displayName" }
-                );
+                std::string displayName = Text::get_instance()->FirstNonEmpty({ JsonUtils::get_instance()->String(scope.at(key), "display_name"), JsonUtils::get_instance()->String(scope.at(key), "displayName") });
                 if (!displayName.empty()) return displayName;
             }
         }
@@ -916,7 +1003,7 @@ namespace Claude {
             return displayName;
         }
 
-        std::string kind = ClaudeStringAny(limit, { "kind" });
+        std::string kind = JsonUtils::get_instance()->String(limit, "kind");
 
         if (kind == "session") {
             return "Session";
@@ -926,14 +1013,14 @@ namespace Claude {
             return "Weekly";
         }
 
-        std::string group = ClaudeStringAny(limit, { "group" });
+        std::string group = JsonUtils::get_instance()->String(limit, "group");
         std::string title = HumanizeIdentifier(kind.empty() ? group : kind);
         return title.empty() ? "Usage" : title;
     }
 
     static std::string ServerLimitSubtitle(const json& limit) {
-        const std::string kind = ClaudeStringAny(limit, { "kind" });
-        const std::string group = ClaudeStringAny(limit, { "group" });
+        const std::string kind = JsonUtils::get_instance()->String(limit, "kind");
+        const std::string group = JsonUtils::get_instance()->String(limit, "group");
 
         if (kind == "session") {
             return "Starts when a message is sent";
@@ -970,7 +1057,7 @@ namespace Claude {
         UsageWindowModel::Builder window;
         window.Title(title).Subtitle(subtitle);
 
-        std::optional<double> percent = ClaudeNumberAny(
+        std::optional<double> percent = JsonUtils::get_instance()->NumberAny(
             limit,
             { "percent", "utilization", "used_percent", "usedPercent" }
         );
@@ -980,7 +1067,7 @@ namespace Claude {
 
         return window
             .UsedPercent(static_cast<float>(Math::get_instance()->ClampPercentDouble(*percent)))
-            .Reset(TimePointToUnixSeconds(resetAt), FormatResetLong(resetAt))
+            .Reset(TimePointToUnixSeconds(resetAt), Format::get_instance()->ResetRelative(resetAt))
             .Valid()
             .Build();
     }
@@ -992,8 +1079,8 @@ namespace Claude {
 
         auto sameIdentity = [&](const UsageWindow& existing) {
             return existing.valid &&
-                ToLowerAscii(existing.title) == ToLowerAscii(window.title) &&
-                ToLowerAscii(existing.subtitle) == ToLowerAscii(window.subtitle) &&
+                Text::get_instance()->ToLowerCopy(existing.title) == Text::get_instance()->ToLowerCopy(window.title) &&
+                Text::get_instance()->ToLowerCopy(existing.subtitle) == Text::get_instance()->ToLowerCopy(window.subtitle) &&
                 existing.resetAtUnixSeconds == window.resetAtUnixSeconds;
         };
 
@@ -1013,6 +1100,25 @@ namespace Claude {
         snapshot.additionalLimits.push_back(std::move(window));
     }
 
+    // weekly_scoped_shares[] ties a scoped limit, by its limits[] index, to
+    // the share of the weekly limit it may use (Fable: "up to half").
+    static std::string ScopedShareSubtitle(const json& root, size_t limitIndex) {
+        if (!root.contains("weekly_scoped_shares") || !root.at("weekly_scoped_shares").is_array()) {
+            return {};
+        }
+
+        for (const json& share : root.at("weekly_scoped_shares")) {
+            const auto index = JsonUtils::get_instance()->NumberOpt(share, "limit_index");
+            const auto allowance = JsonUtils::get_instance()->NumberOpt(share, "allowance_percent_of_weekly");
+
+            if (index && allowance && *index >= 0.0 && static_cast<size_t>(*index) == limitIndex) {
+                return "Up to " + Format::get_instance()->Percent(*allowance) + " of weekly limit";
+            }
+        }
+
+        return {};
+    }
+
     static bool ParseServerDrivenLimits(const json& root, Snapshot& snapshot) {
         if (!root.contains("limits") || !root.at("limits").is_array()) {
             return false;
@@ -1028,15 +1134,18 @@ namespace Claude {
 
         bool parsedAny = false;
 
-        for (const json& limit : limits) {
+        for (size_t index = 0; index < limits.size(); ++index) {
+            const json& limit = limits.at(index);
+
             if (!limit.is_object()) continue;
 
-            if (!ClaudeNumberAny(limit, { "percent", "utilization", "used_percent", "usedPercent" })) {
+            if (!JsonUtils::get_instance()->NumberAny(limit, { "percent", "utilization", "used_percent", "usedPercent" })) {
                 continue;
             }
 
-            const std::string kind = ClaudeStringAny(limit, { "kind" });
-            const std::string group = ClaudeStringAny(limit, { "group" });
+            const std::string kind = JsonUtils::get_instance()->String(limit, "kind");
+            const std::string group = JsonUtils::get_instance()->String(limit, "group");
+            const std::string share = ScopedShareSubtitle(root, index);
 
             if (kind == "session") {
                 snapshot.currentSession = ParseServerLimitWindow(
@@ -1059,13 +1168,13 @@ namespace Claude {
             }
 
             const std::string displayName = LimitScopeDisplayName(limit);
-            const std::string lower = ToLowerAscii(displayName);
+            const std::string lower = Text::get_instance()->ToLowerCopy(displayName);
 
             if (group == "weekly" && lower.find("sonnet") != std::string::npos) {
                 snapshot.weeklySonnet = ParseServerLimitWindow(
                     limit,
                     displayName.empty() ? "Sonnet" : displayName,
-                    "Model-specific weekly limit"
+                    share.empty() ? "Model-specific weekly limit" : share
                 );
                 parsedAny = snapshot.weeklySonnet.valid || parsedAny;
             }
@@ -1075,7 +1184,7 @@ namespace Claude {
                 snapshot.weeklyFable = ParseServerLimitWindow(
                     limit,
                     displayName,
-                    "Model-specific weekly limit"
+                    share.empty() ? "Model-specific weekly limit" : share
                 );
                 parsedAny = snapshot.weeklyFable.valid || parsedAny;
             }
@@ -1083,7 +1192,7 @@ namespace Claude {
                 UsageWindow additional = ParseServerLimitWindow(
                     limit,
                     ServerLimitTitle(limit),
-                    ServerLimitSubtitle(limit)
+                    share.empty() ? ServerLimitSubtitle(limit) : share
                 );
                 parsedAny = additional.valid || parsedAny;
                 AddAdditionalLimit(snapshot, std::move(additional));
@@ -1097,8 +1206,94 @@ namespace Claude {
         return parsedAny;
     }
 
-    static UsageCredits ParseCredits(const json& root, const ClaudeOAuth& oauth) {
-        (void)oauth;
+    // Credit amounts as the credits section shows them: USD (or no currency,
+    // Desktop's default) as dollars, anything else with its code.
+    static std::string FormatCreditMoney(double value, const std::string& currency) {
+        const std::string lower = Text::get_instance()->ToLowerCopy(currency);
+
+        if (lower.empty() || lower == "usd") {
+            return Format::get_instance()->Dollars(value);
+        }
+
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(2) << value << ' ' << currency;
+        return out.str();
+    }
+
+    // spend: { used: { amount_minor, currency, exponent }, limit, percent,
+    //          enabled, disabled_reason, balance, cap, ... }
+    // The newer shape both usage bodies send beside extra_usage, and the one
+    // claude.ai's Settings > Usage reads. It always carries the spent amount,
+    // so it is final: no supplementary request is made for it.
+    static UsageCredits ParseSpend(const json& spend) {
+        struct Money {
+            double amount = 0.0;
+            std::string currency;
+        };
+        const auto money = [](const json& object, const char* key) -> std::optional<Money> {
+            const json* value = FindClaudeObject(object, { key });
+            const std::optional<double> minor = value
+                ? JsonUtils::get_instance()->NumberOpt(*value, "amount_minor")
+                : std::nullopt;
+
+            if (!minor) {
+                return std::nullopt;
+            }
+
+            return Money{
+                std::max(0.0, *minor) / std::pow(10.0, JsonUtils::get_instance()->Number(*value, "exponent")),
+                JsonUtils::get_instance()->String(*value, "currency")
+            };
+        };
+
+        // The page shows an absent amount as nothing spent.
+        const Money used = money(spend, "used").value_or(Money{});
+        const std::optional<Money> limit = money(spend, "limit");
+        const Money balance = money(spend, "balance").value_or(Money{ 0.0, used.currency });
+
+        UsageCredits credits;
+        credits.reported = true;
+        credits.valid = true;
+        credits.enabled = JsonUtils::get_instance()->Bool(spend, "enabled");
+        credits.disabledReason = JsonUtils::get_instance()->String(spend, "disabled_reason");
+        credits.hasSpentAmount = true;
+        credits.hasMonthlyLimit = limit.has_value();
+        credits.spentText = FormatCreditMoney(used.amount, used.currency) + " spent";
+        credits.currentBalanceText = FormatCreditMoney(balance.amount, balance.currency);
+
+        if (!credits.enabled) {
+            credits.limitText = "Off";
+            credits.monthlyLimitText = "Off";
+            return credits;
+        }
+
+        if (limit) {
+            credits.limitText = FormatCreditMoney(limit->amount, limit->currency) + " monthly limit";
+            credits.monthlyLimitText = FormatCreditMoney(limit->amount, limit->currency);
+            credits.hasUsedPercent = true;
+
+            const std::optional<double> percent = JsonUtils::get_instance()->NumberOpt(spend, "percent");
+            credits.usedPercent = static_cast<float>(Math::get_instance()->ClampPercentDouble(
+                percent ? *percent
+                : limit->amount > 0.0 ? used.amount / limit->amount * 100.0
+                : 100.0
+            ));
+        }
+        else {
+            credits.limitText = "Unlimited";
+            credits.monthlyLimitText = "Unlimited";
+        }
+
+        const std::chrono::system_clock::time_point resetAt = FirstDayOfNextMonth();
+        credits.resetAtUnixSeconds = TimePointToUnixSeconds(resetAt);
+        credits.resetText = Format::get_instance()->ResetRelative(resetAt);
+        return credits;
+    }
+
+    static UsageCredits ParseCredits(const json& root) {
+        if (const json* spend = FindClaudeObject(root, { "spend" })) {
+            return ParseSpend(*spend);
+        }
 
         UsageCredits credits;
 
@@ -1117,24 +1312,24 @@ namespace Claude {
 
         for (const char* key : { "is_enabled", "isEnabled", "enabled" }) {
             if (object.contains(key) && !object.at(key).is_null()) {
-                enabled = ClaudeBoolAny(object, { key }, false);
+                enabled = JsonUtils::get_instance()->Bool(object, key);
                 break;
             }
         }
 
-        const std::optional<double> usedCents = ClaudeNumberAny(
+        const std::optional<double> usedCents = JsonUtils::get_instance()->NumberAny(
             object,
             { "used_credits", "usedCredits", "spent_credits", "spentCredits" }
         );
-        const std::optional<double> limitCents = ClaudeNumberAny(
+        const std::optional<double> limitCents = JsonUtils::get_instance()->NumberAny(
             object,
             { "monthly_limit", "monthlyLimit", "spend_limit", "spendLimit" }
         );
-        const std::optional<double> utilization = ClaudeNumberAny(
+        const std::optional<double> utilization = JsonUtils::get_instance()->NumberAny(
             object,
             { "utilization", "percent", "used_percent", "usedPercent" }
         );
-        const std::optional<double> balanceCents = ClaudeNumberAny(
+        const std::optional<double> balanceCents = JsonUtils::get_instance()->NumberAny(
             object,
             {
                 "current_balance", "currentBalance",
@@ -1142,28 +1337,20 @@ namespace Claude {
             }
         );
         // /api/oauth/usage now names the currency; Desktop defaults to USD.
-        const std::string currency = ToLowerAscii(ClaudeStringAny(object, { "currency" }));
-        const auto FormatDollars = [&](double value) {
-            if (currency.empty() || currency == "usd") {
-                return Claude::FormatDollars(value);
-            }
-
-            std::ostringstream out;
-            out << std::fixed << std::setprecision(2) << value << ' ' << ClaudeStringAny(object, { "currency" });
-            return out.str();
+        const std::string currency = JsonUtils::get_instance()->String(object, "currency");
+        const auto money = [&](double value) {
+            return FormatCreditMoney(value, currency);
         };
 
+        credits.disabledReason = JsonUtils::get_instance()->String(object, "disabled_reason");
         credits.hasSpentAmount = usedCents.has_value();
         credits.hasMonthlyLimit = limitCents.has_value();
 
-        // Spend data is authoritative evidence that usage credits are active.
-        // Do not render Off when a stale/contradictory flag is returned next
-        // to non-null used_credits, monthly_limit, or utilization values.
-        const bool hasSpendData = usedCents.has_value() || limitCents.has_value();
-        const bool inferredEnabled = hasSpendData || utilization.has_value();
-        credits.enabled = enabled.has_value()
-            ? (*enabled || hasSpendData)
-            : inferredEnabled;
+        // Desktop parity: an explicit is_enabled is final, whatever spend
+        // figures sit next to it; only without one does spend data imply on.
+        credits.enabled = enabled.value_or(
+            usedCents.has_value() || limitCents.has_value() || utilization.has_value()
+        );
 
         if (!credits.enabled) {
             credits.spentText = "Off";
@@ -1178,31 +1365,31 @@ namespace Claude {
             // The provider reported that usage credits are enabled but withheld
             // spend data. Keep the section visible without fabricating a value.
             credits.spentText = "Spend unavailable";
-            credits.limitText = limitCents ? FormatDollars(std::max(0.0, *limitCents) / 100.0) : "Unavailable";
+            credits.limitText = limitCents ? money(std::max(0.0, *limitCents) / 100.0) : "Unavailable";
             credits.monthlyLimitText = credits.limitText;
             credits.currentBalanceText = balanceCents
-                ? FormatDollars(std::max(0.0, *balanceCents) / 100.0)
-                : FormatDollars(0.0);
+                ? money(std::max(0.0, *balanceCents) / 100.0)
+                : money(0.0);
             credits.hasUsedPercent = false;
             return credits;
         }
 
         const double safeUsedCents = std::max(0.0, *usedCents);
         const double usedDollars = safeUsedCents / 100.0;
-        credits.spentText = FormatDollars(usedDollars) + " spent";
+        credits.spentText = money(usedDollars) + " spent";
 
         if (limitCents) {
             const double safeLimitCents = std::max(0.0, *limitCents);
             const double limitDollars = safeLimitCents / 100.0;
-            credits.limitText = FormatDollars(limitDollars) + " monthly limit";
-            credits.monthlyLimitText = FormatDollars(limitDollars);
+            credits.limitText = money(limitDollars) + " monthly limit";
+            credits.monthlyLimitText = money(limitDollars);
             // The monthly limit is a spending cap, not a wallet balance.
             // Claude Desktop renders an omitted prepaid-credit balance as
             // $0.00, so mirror that exact UI behavior instead of showing an
             // ambiguous "Not reported" value.
             credits.currentBalanceText = balanceCents
-                ? FormatDollars(std::max(0.0, *balanceCents) / 100.0)
-                : FormatDollars(0.0);
+                ? money(std::max(0.0, *balanceCents) / 100.0)
+                : money(0.0);
             credits.hasUsedPercent = true;
 
             if (utilization) {
@@ -1225,8 +1412,8 @@ namespace Claude {
             credits.limitText = "Unlimited";
             credits.monthlyLimitText = "Unlimited";
             credits.currentBalanceText = balanceCents
-                ? FormatDollars(std::max(0.0, *balanceCents) / 100.0)
-                : FormatDollars(0.0);
+                ? money(std::max(0.0, *balanceCents) / 100.0)
+                : money(0.0);
             credits.hasUsedPercent = false;
         }
 
@@ -1237,13 +1424,8 @@ namespace Claude {
         }
 
         credits.resetAtUnixSeconds = TimePointToUnixSeconds(resetAt);
-
-        const std::string reset = FormatResetShort(resetAt);
-
-        if (!reset.empty()) {
-            credits.resetText = "Resets " + reset;
-        }
-
+        // Already "Resets in ..." / "Reset available".
+        credits.resetText = Format::get_instance()->ResetRelative(resetAt);
         return credits;
     }
 
@@ -1271,87 +1453,9 @@ namespace Claude {
 
         // Desktop treats is_enabled:false as final; only skip_spend=1 replies
         // (which this app never sends) omit spend data. A full-spend response
-        // always supplies used_credits when the feature is enabled.
+        // always supplies used_credits when the feature is enabled, and a
+        // spend block always counts as spent data (ParseSpend).
         return credits.enabled && !credits.hasSpentAmount;
-    }
-
-    static std::filesystem::path ClaudeProjectsPath() {
-        std::string configDir = Network::get_instance()->GetEnvText("CLAUDE_CONFIG_DIR");
-
-        if (!configDir.empty()) {
-            return std::filesystem::path(configDir) / "projects";
-        }
-
-        return Network::get_instance()->UserProfilePath() / ".claude" / "projects";
-    }
-
-    static std::string ReadClaudeTailSharedReadOnly(
-        const std::filesystem::path& path,
-        unsigned long long maximumBytes
-    ) {
-        HANDLE file = CreateFileW(
-            path.wstring().c_str(),
-            GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            nullptr,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
-            nullptr
-        );
-
-        if (file == INVALID_HANDLE_VALUE) {
-            return {};
-        }
-
-        LARGE_INTEGER size{};
-
-        if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0) {
-            CloseHandle(file);
-            return {};
-        }
-
-        const unsigned long long fileSize = static_cast<unsigned long long>(size.QuadPart);
-        const unsigned long long readSize = std::min(fileSize, maximumBytes);
-        const unsigned long long start = fileSize - readSize;
-        LARGE_INTEGER offset{};
-        offset.QuadPart = static_cast<LONGLONG>(start);
-
-        if (!SetFilePointerEx(file, offset, nullptr, FILE_BEGIN)) {
-            CloseHandle(file);
-            return {};
-        }
-
-        std::string text(static_cast<size_t>(readSize), '\0');
-        size_t totalRead = 0;
-
-        while (totalRead < text.size()) {
-            const DWORD chunk = static_cast<DWORD>(std::min<size_t>(
-                text.size() - totalRead,
-                1024 * 1024
-            ));
-            DWORD read = 0;
-
-            if (!ReadFile(file, text.data() + totalRead, chunk, &read, nullptr) || read == 0) {
-                break;
-            }
-
-            totalRead += read;
-        }
-
-        CloseHandle(file);
-        text.resize(totalRead);
-
-        if (start > 0) {
-            const size_t newline = text.find('\n');
-
-            if (newline == std::string::npos) {
-                return {};
-            }
-
-            text.erase(0, newline + 1);
-        }
-
-        return text;
     }
 
     // Desktop keeps claude-code-sessions\<acct>\<org>\local_<uuid>.json and
@@ -1372,15 +1476,62 @@ namespace Claude {
         return dirs;
     }
 
-    struct ClaudeDesktopSessionHint {
-        bool valid = false;
+    struct ClaudeFile {
         std::filesystem::path path;
         std::filesystem::file_time_type writeTime{};
-        std::string sessionId;
+    };
+
+    // Files under the roots (recursively) that keep() accepts, newest first,
+    // at most limit. Never throws: an unreadable entry is skipped and an
+    // iteration error ends that root's scan. keep() sees the native wide path,
+    // so a name outside the code page is never converted.
+    static std::vector<ClaudeFile> NewestClaudeFiles(
+        const std::vector<std::filesystem::path>& roots,
+        const std::function<bool(const std::filesystem::path&)>& keep,
+        size_t limit
+    ) {
+        std::vector<ClaudeFile> files;
+
+        for (const std::filesystem::path& root : roots) {
+            std::error_code ec;
+
+            for (std::filesystem::recursive_directory_iterator it(
+                     root,
+                     std::filesystem::directory_options::skip_permission_denied,
+                     ec), end;
+                 !ec && it != end;
+                 it.increment(ec)) {
+                std::error_code entryError;
+
+                if (!it->is_regular_file(entryError) || entryError || !keep(it->path())) {
+                    continue;
+                }
+
+                const auto writeTime = it->last_write_time(entryError);
+
+                if (!entryError) {
+                    files.push_back({ it->path(), writeTime });
+                }
+            }
+        }
+
+        std::sort(files.begin(), files.end(), [](const ClaudeFile& a, const ClaudeFile& b) {
+            return a.writeTime > b.writeTime;
+        });
+
+        if (files.size() > limit) {
+            files.resize(limit);
+        }
+
+        return files;
+    }
+
+    struct ClaudeDesktopSessionHint {
+        bool valid = false;
+        std::filesystem::file_time_type writeTime{};
         std::string cliSessionId;
         long long lastActivityAtMs = 0;
         long long lastFocusedAtMs = 0;
-        long long completedTurns = 0;
         std::string selectedModel;
     };
 
@@ -1441,41 +1592,14 @@ namespace Claude {
 
     // The Desktop ASAR stores account settings under
     // userData/local-agent-mode-sessions/<account>/<org>/; newest first.
-    static std::vector<std::filesystem::path> ClaudeCoworkSettingsFiles() {
-        struct Candidate {
-            std::filesystem::path path;
-            std::filesystem::file_time_type writeTime{};
-        };
-        std::vector<Candidate> files;
-        std::error_code ec;
-        for (const std::filesystem::path& root : ClaudeDesktopDataDirs("local-agent-mode-sessions")) {
-            std::filesystem::recursive_directory_iterator it(
-                root,
-                std::filesystem::directory_options::skip_permission_denied,
-                ec
-            );
-            const std::filesystem::recursive_directory_iterator end;
-            for (; it != end; it.increment(ec)) {
-                if (ec) { ec.clear(); continue; }
-                const auto& entry = *it;
-                if (!entry.is_regular_file(ec) || ec) { ec.clear(); continue; }
-                if (ToLowerAscii(entry.path().filename().string()) != "cowork_account_settings.json") {
-                    continue;
-                }
-                const auto writeTime = entry.last_write_time(ec);
-                if (ec) { ec.clear(); continue; }
-                files.push_back({ entry.path(), writeTime });
-            }
-            ec.clear();
-        }
-        std::sort(files.begin(), files.end(), [](const Candidate& a, const Candidate& b) {
-            return a.writeTime > b.writeTime;
-        });
-        if (files.size() > 16) files.resize(16);
-
-        std::vector<std::filesystem::path> paths;
-        for (const Candidate& file : files) paths.push_back(file.path);
-        return paths;
+    static std::vector<ClaudeFile> ClaudeCoworkSettingsFiles() {
+        return NewestClaudeFiles(
+            ClaudeDesktopDataDirs("local-agent-mode-sessions"),
+            [](const std::filesystem::path& path) {
+                return _wcsicmp(path.filename().c_str(), L"cowork_account_settings.json") == 0;
+            },
+            16
+        );
     }
 
     static std::string LatestClaudeDesktopSelectedModel() {
@@ -1494,11 +1618,10 @@ namespace Claude {
         cache.checkedAt = now;
         cache.model.clear();
 
-        for (const std::filesystem::path& file : ClaudeCoworkSettingsFiles()) {
-            const std::string raw = ReadClaudeTailSharedReadOnly(file, 4ULL * 1024ULL * 1024ULL);
-            if (raw.empty()) continue;
-            const json value = json::parse(raw, nullptr, false);
-            if (value.is_discarded()) continue;
+        for (const ClaudeFile& file : ClaudeCoworkSettingsFiles()) {
+            const json value = JsonUtils::get_instance()->ParseOrNull(
+                ClaudeCookieStore::ReadSharedText(file.path, 4 * kMegabyte)
+            );
             std::string selected = ClaudeSelectedModelFromJson(value);
             if (!selected.empty()) {
                 cache.model = std::move(selected);
@@ -1508,98 +1631,58 @@ namespace Claude {
         return cache.model;
     }
 
+    // An explicit 1M-context selection: "[1m]", context-1m / context_1m, or a
+    // "-1m" suffix (Desktop matches /-1m\b/i).
+    static bool HasOneMillionMarker(const std::string& model) {
+        static const std::regex kSuffix("-1m\\b");
+        const std::string lower = Text::get_instance()->ToLowerCopy(model);
+
+        return lower.find("[1m]") != std::string::npos ||
+            lower.find("context-1m") != std::string::npos ||
+            lower.find("context_1m") != std::string::npos ||
+            std::regex_search(lower, kSuffix);
+    }
+
     static long long ClaudeDesktopSelectedContextWindowHint(
         const ClaudeDesktopSessionHint& hint
     ) {
-        std::string selected = hint.selectedModel;
-        if (selected.empty()) {
-            selected = LatestClaudeDesktopSelectedModel();
-        }
-        const std::string lower = ToLowerAscii(selected);
-        if (lower.find("[1m]") != std::string::npos ||
-            lower.find("context-1m") != std::string::npos ||
-            lower.find("context_1m") != std::string::npos) {
-            return 1000000;
-        }
-        return 0;
+        const std::string selected = hint.selectedModel.empty()
+            ? LatestClaudeDesktopSelectedModel()
+            : hint.selectedModel;
+
+        return HasOneMillionMarker(selected) ? 1000000 : 0;
     }
 
     static ClaudeDesktopSessionHint LatestClaudeDesktopSessionHint() {
-        struct Candidate {
-            std::filesystem::path path;
-            std::filesystem::file_time_type writeTime{};
-        };
-        std::vector<Candidate> files;
-        std::error_code ec;
-
-        for (const std::filesystem::path& root : ClaudeDesktopDataDirs("claude-code-sessions")) {
-            std::filesystem::recursive_directory_iterator it(
-                root,
-                std::filesystem::directory_options::skip_permission_denied,
-                ec
-            );
-            const std::filesystem::recursive_directory_iterator end;
-
-            for (; it != end; it.increment(ec)) {
-                if (ec) {
-                    ec.clear();
-                    continue;
-                }
-                const auto& entry = *it;
-                if (!entry.is_regular_file(ec) || ec || entry.path().extension() != ".json") {
-                    ec.clear();
-                    continue;
-                }
-                const std::string filename = ToLowerAscii(entry.path().filename().string());
-                if (filename.rfind("local_", 0) != 0) {
-                    continue;
-                }
-                const auto writeTime = entry.last_write_time(ec);
-                if (ec) {
-                    ec.clear();
-                    continue;
-                }
-                files.push_back({ entry.path(), writeTime });
-            }
-            ec.clear();
-        }
-
-        std::sort(files.begin(), files.end(), [](const Candidate& a, const Candidate& b) {
-            return a.writeTime > b.writeTime;
-        });
-        if (files.size() > 64) {
-            files.resize(64);
-        }
+        const std::vector<ClaudeFile> files = NewestClaudeFiles(
+            ClaudeDesktopDataDirs("claude-code-sessions"),
+            [](const std::filesystem::path& path) {
+                return path.extension() == ".json" &&
+                    _wcsnicmp(path.filename().c_str(), L"local_", 6) == 0;
+            },
+            64
+        );
 
         ClaudeDesktopSessionHint best;
-        for (const Candidate& file : files) {
-            const std::string raw = ReadClaudeTailSharedReadOnly(file.path, 10ULL * 1024ULL * 1024ULL);
-            if (raw.empty()) {
-                continue;
-            }
-
-            json value = json::parse(raw, nullptr, false);
-            if (value.is_discarded() || !value.is_object() || value.value("isArchived", false)) {
+        for (const ClaudeFile& file : files) {
+            const json value = JsonUtils::get_instance()->ParseOrNull(
+                ClaudeCookieStore::ReadSharedText(file.path, 10 * kMegabyte)
+            );
+            if (!value.is_object() || JsonUtils::get_instance()->Bool(value, "isArchived")) {
                 continue;
             }
 
             ClaudeDesktopSessionHint hint;
             hint.valid = true;
-            hint.path = file.path;
             hint.writeTime = file.writeTime;
-            hint.sessionId = value.value("sessionId", std::string{});
-            hint.cliSessionId = value.value("cliSessionId", std::string{});
+            hint.cliSessionId = JsonUtils::get_instance()->String(value, "cliSessionId");
             hint.lastActivityAtMs = static_cast<long long>(std::max(
                 0.0,
-                ClaudeNumberAny(value, { "lastActivityAt" }).value_or(0.0)
+                JsonUtils::get_instance()->Number(value, "lastActivityAt")
             ));
             hint.lastFocusedAtMs = static_cast<long long>(std::max(
                 0.0,
-                ClaudeNumberAny(value, { "lastFocusedAt" }).value_or(0.0)
-            ));
-            hint.completedTurns = static_cast<long long>(std::max(
-                0.0,
-                ClaudeNumberAny(value, { "completedTurns" }).value_or(0.0)
+                JsonUtils::get_instance()->Number(value, "lastFocusedAt")
             ));
             hint.selectedModel = ClaudeSelectedModelFromJson(value);
 
@@ -1615,79 +1698,26 @@ namespace Claude {
         return best;
     }
 
-    struct ClaudeSessionCandidate {
-        std::filesystem::path path;
-        std::filesystem::file_time_type writeTime{};
-    };
-
     static bool IsClaudeBackgroundSessionPath(const std::filesystem::path& path) {
         for (const auto& component : path) {
-            if (ToLowerAscii(component.string()) == "subagents") {
+            if (_wcsicmp(component.c_str(), L"subagents") == 0) {
                 return true;
             }
         }
 
-        return ToLowerAscii(path.filename().string()).rfind("agent-", 0) == 0;
+        return _wcsnicmp(path.filename().c_str(), L"agent-", 6) == 0;
     }
 
-    static std::vector<ClaudeSessionCandidate> LatestClaudeSessionFiles() {
-        const std::filesystem::path projects = ClaudeProjectsPath();
-        std::error_code ec;
-
-        if (!std::filesystem::exists(projects, ec) || ec) {
-            return {};
-        }
-
-        std::vector<ClaudeSessionCandidate> candidates;
-        std::filesystem::recursive_directory_iterator it(
-            projects,
-            std::filesystem::directory_options::skip_permission_denied,
-            ec
+    static std::vector<ClaudeFile> LatestClaudeSessionFiles() {
+        return NewestClaudeFiles(
+            { ClaudeConfigDir() / "projects" },
+            [](const std::filesystem::path& path) {
+                // Task/subagent transcripts have independent context windows and
+                // must never replace the visible foreground conversation meter.
+                return path.extension() == ".jsonl" && !IsClaudeBackgroundSessionPath(path);
+            },
+            64
         );
-        const std::filesystem::recursive_directory_iterator end;
-
-        for (; it != end; it.increment(ec)) {
-            if (ec) {
-                ec.clear();
-                continue;
-            }
-
-            const std::filesystem::directory_entry& entry = *it;
-
-            if (!entry.is_regular_file(ec) || ec || entry.path().extension() != ".jsonl") {
-                ec.clear();
-                continue;
-            }
-
-            // Task/subagent transcripts have independent context windows and
-            // must never replace the visible foreground conversation meter.
-            if (IsClaudeBackgroundSessionPath(entry.path())) {
-                continue;
-            }
-
-            const auto writeTime = entry.last_write_time(ec);
-
-            if (ec) {
-                ec.clear();
-                continue;
-            }
-
-            candidates.push_back({ entry.path(), writeTime });
-        }
-
-        std::sort(
-            candidates.begin(),
-            candidates.end(),
-            [](const ClaudeSessionCandidate& left, const ClaudeSessionCandidate& right) {
-                return left.writeTime > right.writeTime;
-            }
-        );
-
-        if (candidates.size() > 64) {
-            candidates.resize(64);
-        }
-
-        return candidates;
     }
 
     static std::optional<double> FindClaudeNumberRecursive(
@@ -1813,114 +1843,37 @@ namespace Claude {
         }
     }
 
+    // One usage counter, snake_case or camelCase. Some Claude SDK snapshots
+    // fill usage through iterations[] first, so the newest iteration stands in
+    // until the top-level count is persisted.
+    static long long ClaudeUsageTokens(const json& usage, const char* snakeKey, const char* camelKey) {
+        std::optional<double> value = JsonUtils::get_instance()->NumberAny(usage, { snakeKey, camelKey });
+
+        if (!value && usage.is_object() && usage.contains("iterations") && usage.at("iterations").is_array()) {
+            const json& iterations = usage.at("iterations");
+
+            for (auto it = iterations.rbegin(); it != iterations.rend() && !value; ++it) {
+                value = JsonUtils::get_instance()->NumberAny(*it, { snakeKey, camelKey });
+            }
+        }
+
+        return static_cast<long long>(std::max(0.0, value.value_or(0.0)));
+    }
+
+    // What the context window holds: fresh input plus both cache sides.
     static long long ClaudeInputTokensFromUsage(const json& usage) {
-        if (!usage.is_object()) {
-            return 0;
-        }
-
-        const long long input = static_cast<long long>(std::max(
-            0.0,
-            ClaudeNumberAny(usage, { "input_tokens", "inputTokens" }).value_or(0.0)
-        ));
-        const long long cacheCreate = static_cast<long long>(std::max(
-            0.0,
-            ClaudeNumberAny(usage, {
-                "cache_creation_input_tokens", "cacheCreationInputTokens"
-            }).value_or(0.0)
-        ));
-        const long long cacheRead = static_cast<long long>(std::max(
-            0.0,
-            ClaudeNumberAny(usage, {
-                "cache_read_input_tokens", "cacheReadInputTokens"
-            }).value_or(0.0)
-        ));
-
-        return input + cacheCreate + cacheRead;
+        return ClaudeUsageTokens(usage, "input_tokens", "inputTokens") +
+            ClaudeUsageTokens(usage, "cache_creation_input_tokens", "cacheCreationInputTokens") +
+            ClaudeUsageTokens(usage, "cache_read_input_tokens", "cacheReadInputTokens");
     }
 
-    static long long ClaudeOutputTokensFromUsage(const json& usage) {
-        if (!usage.is_object()) {
-            return 0;
-        }
+    // Cheap pre-filter before a full parse: does the line carry
+    // "type":"<type>" in either spacing JSON writers use?
+    static bool LineHasType(const std::string& line, const char* type) {
+        const std::string value = std::string("\"") + type + "\"";
 
-        const auto direct = ClaudeNumberAny(usage, { "output_tokens", "outputTokens" });
-        if (direct) {
-            return static_cast<long long>(std::max(0.0, *direct));
-        }
-
-        // Some Claude SDK snapshots expose usage first through iterations.
-        // Use the newest iteration as a fallback so AQC picks up the first
-        // persisted token count as early as the transcript allows.
-        if (usage.contains("iterations") && usage.at("iterations").is_array()) {
-            const json& iterations = usage.at("iterations");
-            for (auto it = iterations.rbegin(); it != iterations.rend(); ++it) {
-                if (!it->is_object()) {
-                    continue;
-                }
-                const auto value = ClaudeNumberAny(*it, { "output_tokens", "outputTokens" });
-                if (value) {
-                    return static_cast<long long>(std::max(0.0, *value));
-                }
-            }
-        }
-
-        return 0;
-    }
-
-    static long long ClaudeCacheCreationTokensFromUsage(const json& usage) {
-        if (!usage.is_object()) {
-            return 0;
-        }
-
-        const auto direct = ClaudeNumberAny(usage, {
-            "cache_creation_input_tokens", "cacheCreationInputTokens"
-        });
-        if (direct) {
-            return static_cast<long long>(std::max(0.0, *direct));
-        }
-
-        return 0;
-    }
-
-    static long long ClaudeCacheReadTokensFromUsage(const json& usage) {
-        if (!usage.is_object()) {
-            return 0;
-        }
-
-        const auto direct = ClaudeNumberAny(usage, {
-            "cache_read_input_tokens", "cacheReadInputTokens"
-        });
-        if (direct) {
-            return static_cast<long long>(std::max(0.0, *direct));
-        }
-
-        return 0;
-    }
-
-    static long long ClaudeRawInputTokensFromUsage(const json& usage) {
-        if (!usage.is_object()) {
-            return 0;
-        }
-
-        const auto direct = ClaudeNumberAny(usage, { "input_tokens", "inputTokens" });
-        if (direct) {
-            return static_cast<long long>(std::max(0.0, *direct));
-        }
-
-        if (usage.contains("iterations") && usage.at("iterations").is_array()) {
-            const json& iterations = usage.at("iterations");
-            for (auto it = iterations.rbegin(); it != iterations.rend(); ++it) {
-                if (!it->is_object()) {
-                    continue;
-                }
-                const auto value = ClaudeNumberAny(*it, { "input_tokens", "inputTokens" });
-                if (value) {
-                    return static_cast<long long>(std::max(0.0, *value));
-                }
-            }
-        }
-
-        return 0;
+        return line.find("\"type\":" + value) != std::string::npos ||
+            line.find("\"type\": " + value) != std::string::npos;
     }
 
     static long long ClaudeUsedTokensFromRecordLine(const std::string& line) {
@@ -1933,7 +1886,7 @@ namespace Claude {
         }
 
         if (contextWindow) {
-            const json* current = FindClaudeObjectRecursive(
+            const json* current = FindClaudeObject(
                 *contextWindow,
                 { "current_usage", "currentUsage" }
             );
@@ -1944,7 +1897,7 @@ namespace Claude {
                 }
             }
 
-            const auto total = ClaudeNumberAny(
+            const auto total = JsonUtils::get_instance()->NumberAny(
                 *contextWindow,
                 { "total_input_tokens", "totalInputTokens" }
             );
@@ -1953,21 +1906,13 @@ namespace Claude {
             }
         }
 
-        const bool assistantRecord =
-            line.find("\"type\":\"assistant\"") != std::string::npos ||
-            line.find("\"type\": \"assistant\"") != std::string::npos;
-        if (assistantRecord) {
+        if (LineHasType(line, "assistant")) {
             if (auto usage = ExtractClaudeMetadataObject(line, "usage")) {
                 return ClaudeInputTokensFromUsage(*usage);
             }
         }
 
         return 0;
-    }
-
-    static bool LooksLikeClaudeAssistantRecord(const std::string& line) {
-        return line.find("\"type\":\"assistant\"") != std::string::npos ||
-            line.find("\"type\": \"assistant\"") != std::string::npos;
     }
 
     static bool LooksLikeClaudeSidechainRecord(const std::string& line) {
@@ -2030,12 +1975,13 @@ namespace Claude {
 
     // Mirrors Claude Code's own context-window resolution (KT()/esc() in the
     // CLI bundle), verified against the model registry embedded in
-    // claude.exe 2.1.220:
+    // claude.exe 2.1.220 and Desktop 4.4212.0:
     //
-    //   1. a "[1m]" model-id suffix               -> 1,000,000
-    //   2. registry entry with context.native_1m  -> 1,000,000
-    //   3. registry entry context.window          -> that value
-    //   4. any other recognizable Claude model    -> 200,000 (the CLI's default)
+    //   1. a "[1m]" / "-1m" model-id suffix       -> 1,000,000
+    //   2. a bare first-party alias (opus, best)  -> 1,000,000, its 1M 5.x target
+    //   3. registry entry with context.native_1m  -> 1,000,000
+    //   4. registry entry context.window          -> that value
+    //   5. any other recognizable Claude model    -> 200,000 (the CLI's default)
     //
     // Entries are longest-prefix matched so dated ids (claude-opus-4-8-20260101)
     // and vendor-prefixed ids resolve to their base model.
@@ -2055,8 +2001,6 @@ namespace Claude {
     //
     //   context_window: { context_window_size, current_usage,
     //                     total_input_tokens, used_percentage, ... }
-    //   rate_limits:    { five_hour:  { used_percentage, resets_at },
-    //                     seven_day: { used_percentage, resets_at } }
     //   model: { id, display_name }, exceeds_200k_tokens, cost, session_id
     //
     // Running `AIQuotaChecker.exe --statusline` as that command parks the
@@ -2067,17 +2011,8 @@ namespace Claude {
     // ---------------------------------------------------------------------
     struct ClaudeStatusLinePayload {
         bool valid = false;
-        long long writtenAtUnixSeconds = 0;
         std::string sessionId;
-        std::string model;
         long long contextWindowTokens = 0;
-        long long usedTokens = 0;
-        bool hasFiveHour = false;
-        double fiveHourUsedPercent = 0.0;
-        std::string fiveHourResetsAt;
-        bool hasSevenDay = false;
-        double sevenDayUsedPercent = 0.0;
-        std::string sevenDayResetsAt;
         bool hasCost = false;
         double totalCostUsd = 0.0;
         long long linesAdded = 0;
@@ -2106,46 +2041,24 @@ namespace Claude {
 
     static ClaudeStatusLinePayload ReadClaudeStatusLinePayload() {
         ClaudeStatusLinePayload payload;
-
         const std::filesystem::path path = ClaudeStatusLineFilePath();
-        std::error_code ec;
 
-        if (path.empty() || !std::filesystem::exists(path, ec) || ec) {
+        if (path.empty()) {
             return payload;
         }
 
-        const std::string raw = ReadClaudeTailSharedReadOnly(path, 4ULL * 1024ULL * 1024ULL);
+        const json root = JsonUtils::get_instance()->ParseOrNull(
+            ClaudeCookieStore::ReadSharedText(path, 4 * kMegabyte)
+        );
 
-        if (raw.empty()) {
+        if (!root.is_object()) {
             return payload;
         }
 
-        const json root = json::parse(raw, nullptr, false);
+        payload.sessionId = JsonUtils::get_instance()->String(root, "session_id");
 
-        if (root.is_discarded() || !root.is_object()) {
-            return payload;
-        }
-
-        const auto writeTime = std::filesystem::last_write_time(path, ec);
-
-        if (!ec) {
-            const auto age = std::filesystem::file_time_type::clock::now() - writeTime;
-            payload.writtenAtUnixSeconds = static_cast<long long>(std::time(nullptr)) -
-                std::chrono::duration_cast<std::chrono::seconds>(age).count();
-        }
-
-        payload.sessionId = root.value("session_id", std::string{});
-
-        const auto model = root.find("model");
-
-        if (model != root.end() && model->is_object()) {
-            payload.model = model->value("id", std::string{});
-        }
-
-        const auto context = root.find("context_window");
-
-        if (context != root.end() && context->is_object()) {
-            const auto size = ClaudeNumberAny(
+        if (const json* context = FindClaudeObject(root, { "context_window" })) {
+            const auto size = JsonUtils::get_instance()->NumberAny(
                 *context,
                 { "context_window_size", "contextWindowSize" }
             );
@@ -2153,165 +2066,84 @@ namespace Claude {
             if (size && *size > 0.0) {
                 payload.contextWindowTokens = static_cast<long long>(*size);
             }
-
-            const auto used = ClaudeNumberAny(
-                *context,
-                { "total_input_tokens", "totalInputTokens" }
-            );
-
-            if (used && *used > 0.0) {
-                payload.usedTokens = static_cast<long long>(*used);
-            }
         }
 
-        const auto limits = root.find("rate_limits");
-
-        if (limits != root.end() && limits->is_object()) {
-            struct Target {
-                const char* key;
-                bool* has;
-                double* percent;
-                std::string* resetsAt;
-            };
-
-            const Target targets[] = {
-                { "five_hour", &payload.hasFiveHour, &payload.fiveHourUsedPercent, &payload.fiveHourResetsAt },
-                { "seven_day", &payload.hasSevenDay, &payload.sevenDayUsedPercent, &payload.sevenDayResetsAt }
-            };
-
-            for (const Target& target : targets) {
-                const auto window = limits->find(target.key);
-
-                if (window == limits->end() || !window->is_object()) {
-                    continue;
-                }
-
-                const auto percent = ClaudeNumberAny(
-                    *window,
-                    { "used_percentage", "usedPercentage" }
-                );
-
-                if (!percent) {
-                    continue;
-                }
-
-                *target.has = true;
-                *target.percent = *percent;
-
-                const auto resets = window->find("resets_at");
-
-                if (resets != window->end() && resets->is_string()) {
-                    *target.resetsAt = resets->get<std::string>();
-                }
-            }
-        }
-
-        const auto cost = root.find("cost");
-
-        if (cost != root.end() && cost->is_object()) {
-            const auto total = ClaudeNumberAny(*cost, { "total_cost_usd", "totalCostUsd" });
+        if (const json* cost = FindClaudeObject(root, { "cost" })) {
+            const auto total = JsonUtils::get_instance()->NumberAny(*cost, { "total_cost_usd", "totalCostUsd" });
 
             if (total) {
                 payload.hasCost = true;
                 payload.totalCostUsd = *total;
             }
 
-            payload.linesAdded = static_cast<long long>(
-                ClaudeNumberAny(*cost, { "total_lines_added" }).value_or(0.0)
-            );
-            payload.linesRemoved = static_cast<long long>(
-                ClaudeNumberAny(*cost, { "total_lines_removed" }).value_or(0.0)
-            );
-            payload.durationMs = static_cast<long long>(
-                ClaudeNumberAny(*cost, { "total_duration_ms" }).value_or(0.0)
-            );
-            payload.apiDurationMs = static_cast<long long>(
-                ClaudeNumberAny(*cost, { "total_api_duration_ms" }).value_or(0.0)
-            );
+            payload.linesAdded = static_cast<long long>(JsonUtils::get_instance()->Number(*cost, "total_lines_added"));
+            payload.linesRemoved = static_cast<long long>(JsonUtils::get_instance()->Number(*cost, "total_lines_removed"));
+            payload.durationMs = static_cast<long long>(JsonUtils::get_instance()->Number(*cost, "total_duration_ms"));
+            payload.apiDurationMs = static_cast<long long>(JsonUtils::get_instance()->Number(*cost, "total_api_duration_ms"));
         }
 
         // Session facts published only here. Each is optional.
-        {
-            const auto model = root.find("model");
-            if (model != root.end() && model->is_object()) {
-                const std::string display = model->value("display_name", std::string{});
-                if (!display.empty()) payload.details.push_back("Model: " + display);
+        const auto field = [&](const char* object, const char* key) {
+            const json* holder = FindClaudeObject(root, { object });
+            return holder ? JsonUtils::get_instance()->String(*holder, key) : std::string();
+        };
+        const auto add = [&](const char* label, const std::string& value) {
+            if (!value.empty()) {
+                payload.details.push_back(label + value);
             }
+        };
 
-            const auto style = root.find("output_style");
-            if (style != root.end() && style->is_object()) {
-                const std::string name = style->value("name", std::string{});
-                if (!name.empty()) payload.details.push_back("Output style: " + name);
-            }
+        add("Model: ", field("model", "display_name"));
+        add("Output style: ", field("output_style", "name"));
 
-            const auto exceeds = root.find("exceeds_200k_tokens");
-            if (exceeds != root.end() && exceeds->is_boolean() && exceeds->get<bool>()) {
-                payload.details.push_back("Long-context tier (>200k)");
-            }
+        if (JsonUtils::get_instance()->Bool(root, "exceeds_200k_tokens")) {
+            payload.details.push_back("Long-context tier (>200k)");
+        }
 
-            const auto workspace = root.find("workspace");
-            if (workspace != root.end() && workspace->is_object()) {
-                std::string dir = workspace->value("project_dir", std::string{});
-                if (dir.empty()) dir = workspace->value("current_dir", std::string{});
-                if (!dir.empty()) {
-                    const size_t slash = dir.find_last_of("/\\");
-                    payload.details.push_back("Project: " +
-                        (slash == std::string::npos ? dir : dir.substr(slash + 1)));
-                }
-                const std::string repo = workspace->value("repo", std::string{});
-                if (!repo.empty()) payload.details.push_back("Repo: " + repo);
-            }
+        // The folder name only; npos + 1 keeps the whole string.
+        const std::string dir = Text::get_instance()->FirstNonEmpty({
+            field("workspace", "project_dir"),
+            field("workspace", "current_dir")
+        });
+        add("Project: ", dir.substr(dir.find_last_of("/\\") + 1));
+        add("Repo: ", field("workspace", "repo"));
+        add("Agent: ", field("agent", "name"));
 
-            const auto agent = root.find("agent");
-            if (agent != root.end() && agent->is_object()) {
-                const std::string name = agent->value("name", std::string{});
-                if (!name.empty()) payload.details.push_back("Agent: " + name);
-            }
-
-            const auto pr = root.find("pr");
-            if (pr != root.end() && pr->is_object()) {
-                const auto number = pr->find("number");
-                if (number != pr->end() && number->is_number()) {
-                    payload.details.push_back("PR #" +
-                        std::to_string(static_cast<long long>(number->get<double>())));
-                }
-            }
-
-            const auto worktree = root.find("worktree");
-            if (worktree != root.end() && worktree->is_object()) {
-                const std::string branch = worktree->value("branch", std::string{});
-                if (!branch.empty()) payload.details.push_back("Branch: " + branch);
-            }
-
-            const auto vim = root.find("vim");
-            if (vim != root.end() && vim->is_object()) {
-                const std::string mode = vim->value("mode", std::string{});
-                if (!mode.empty()) payload.details.push_back("Vim: " + mode);
+        if (const json* pr = FindClaudeObject(root, { "pr" })) {
+            if (const auto number = JsonUtils::get_instance()->NumberOpt(*pr, "number")) {
+                payload.details.push_back("PR #" + std::to_string(static_cast<long long>(*number)));
             }
         }
 
-        payload.valid = payload.contextWindowTokens > 0 ||
-            payload.hasFiveHour || payload.hasSevenDay || payload.hasCost ||
-            !payload.details.empty();
+        add("Branch: ", field("worktree", "branch"));
+        add("Vim: ", field("vim", "mode"));
+
+        payload.valid = payload.contextWindowTokens > 0 || payload.hasCost || !payload.details.empty();
         return payload;
     }
 
     static ClaudeContextWindow ResolveClaudeContextWindow(const std::string& model) {
-        const std::string lower = ToLowerAscii(model);
+        const std::string lower = Text::get_instance()->ToLowerCopy(model);
 
         if (lower.empty()) {
             return {};
         }
 
-        if (lower.find("[1m]") != std::string::npos ||
-            lower.find("context-1m") != std::string::npos ||
-            lower.find("context_1m") != std::string::npos) {
+        if (HasOneMillionMarker(lower)) {
             return { 1000000, true };
+        }
+
+        for (const char* alias : { "opus", "sonnet", "haiku", "fable", "mythos", "best", "opusplan" }) {
+            if (lower == alias) {
+                return { 1000000, true };
+            }
         }
 
         struct Entry { const char* id; long long window; };
         static const Entry kRegistry[] = {
             // Native 1M-context models (Desktop 4.4212 catalog max_input_tokens).
+            // Prefixes: claude-opus-5-5, claude-fable-5-1 and claude-mythos-5-1
+            // resolve through their family entry.
             { "claude-opus-5",     1000000 },
             { "claude-sonnet-5",   1000000 },
             { "claude-fable-5",    1000000 },
@@ -2365,21 +2197,15 @@ namespace Claude {
         }
 
         // The CLI's own fallback for anything still unresolved.
-        if (lower.rfind("claude-", 0) == 0 ||
-            lower == "sonnet" || lower == "opus" || lower == "haiku" ||
-            lower == "fable" || lower == "default") {
+        if (lower.rfind("claude-", 0) == 0 || lower == "default") {
             return { 200000, false };
         }
 
         return {};
     }
 
-    static long long KnownClaudeContextWindowForModel(const std::string& model) {
-        return ResolveClaudeContextWindow(model).tokens;
-    }
-
     static bool ClaudeEnvTruthy(const std::string& value) {
-        const std::string lower = ToLowerAscii(value);
+        const std::string lower = Text::get_instance()->ToLowerCopy(value);
         return lower == "1" || lower == "true" || lower == "yes" || lower == "on";
     }
 
@@ -2460,15 +2286,15 @@ namespace Claude {
         const std::string& line,
         bool& state
     ) {
-        const std::string lower = ToLowerAscii(line);
+        const std::string lower = Text::get_instance()->ToLowerCopy(line);
         if (lower.find("compact") == std::string::npos) {
             return false;
         }
 
-        const std::string type = ToLowerAscii(ExtractClaudeMetadataString(line, "type"));
-        const std::string subtype = ToLowerAscii(ExtractClaudeMetadataString(line, "subtype"));
-        const std::string status = ToLowerAscii(ExtractClaudeMetadataString(line, "status"));
-        const std::string phase = ToLowerAscii(ExtractClaudeMetadataString(line, "phase"));
+        const std::string type = Text::get_instance()->ToLowerCopy(ExtractClaudeMetadataString(line, "type"));
+        const std::string subtype = Text::get_instance()->ToLowerCopy(ExtractClaudeMetadataString(line, "subtype"));
+        const std::string status = Text::get_instance()->ToLowerCopy(ExtractClaudeMetadataString(line, "status"));
+        const std::string phase = Text::get_instance()->ToLowerCopy(ExtractClaudeMetadataString(line, "phase"));
         const std::string combined = type + " " + subtype + " " + status + " " + phase;
 
         const bool completed =
@@ -2527,20 +2353,15 @@ namespace Claude {
             return false;
         }
 
-        return ToLowerAscii(ExtractClaudeMetadataString(line, "type")) == "system" &&
-            ToLowerAscii(ExtractClaudeMetadataString(line, "subtype")) == "compact_boundary";
-    }
-
-    static bool ClaudeJsonBool(const json& object, const char* key) {
-        return object.is_object() && object.contains(key) &&
-            object.at(key).is_boolean() && object.at(key).get<bool>();
+        return Text::get_instance()->ToLowerCopy(ExtractClaudeMetadataString(line, "type")) == "system" &&
+            Text::get_instance()->ToLowerCopy(ExtractClaudeMetadataString(line, "subtype")) == "compact_boundary";
     }
 
     static bool ClaudeUserRecordStartsRun(const json& record) {
-        if (!record.is_object() || record.value("type", std::string{}) != "user" ||
-            ClaudeJsonBool(record, "isSidechain") || ClaudeJsonBool(record, "isSynthetic") ||
-            ClaudeJsonBool(record, "isMeta") || ClaudeJsonBool(record, "isCompactSummary") ||
-            ClaudeJsonBool(record, "isVisibleInTranscriptOnly")) {
+        if (!record.is_object() || JsonUtils::get_instance()->String(record, "type") != "user" ||
+            JsonUtils::get_instance()->Bool(record, "isSidechain") || JsonUtils::get_instance()->Bool(record, "isSynthetic") ||
+            JsonUtils::get_instance()->Bool(record, "isMeta") || JsonUtils::get_instance()->Bool(record, "isCompactSummary") ||
+            JsonUtils::get_instance()->Bool(record, "isVisibleInTranscriptOnly")) {
             return false;
         }
 
@@ -2566,7 +2387,7 @@ namespace Claude {
                 continue;
             }
 
-            const std::string type = block.value("type", std::string{});
+            const std::string type = JsonUtils::get_instance()->String(block, "type");
             if (type == "tool_result") {
                 hasToolResult = true;
             }
@@ -2599,7 +2420,7 @@ namespace Claude {
                 continue;
             }
 
-            const std::string type = record.value("type", std::string{});
+            const std::string type = JsonUtils::get_instance()->String(record, "type");
 
             if (type == "assistant" || type == "user") {
                 return true;
@@ -2627,15 +2448,8 @@ namespace Claude {
                 continue;
             }
 
-            const bool mayBeUser = line.find("\"type\":\"user\"") != std::string::npos ||
-                line.find("\"type\": \"user\"") != std::string::npos;
-            const bool mayBeResult = line.find("\"type\":\"result\"") != std::string::npos ||
-                line.find("\"type\": \"result\"") != std::string::npos;
-            const bool mayBeAssistant =
-                line.find("\"type\":\"assistant\"") != std::string::npos ||
-                line.find("\"type\": \"assistant\"") != std::string::npos;
-
-            if (!mayBeUser && !mayBeResult && !mayBeAssistant) {
+            if (!LineHasType(line, "user") && !LineHasType(line, "result") &&
+                !LineHasType(line, "assistant")) {
                 continue;
             }
 
@@ -2644,16 +2458,16 @@ namespace Claude {
                 continue;
             }
 
-            const std::string type = record.value("type", std::string{});
+            const std::string type = JsonUtils::get_instance()->String(record, "type");
 
             // Sidechain records are subagent turns interleaved into the same
             // transcript. Their end_turn is not the main turn ending, and
             // treating it as one made the scan stop early and report "idle"
             // for the whole time any subagent was running.
             const bool sidechain =
-                ClaudeJsonBool(record, "isSidechain") ||
-                ClaudeJsonBool(record, "isMeta") ||
-                ClaudeJsonBool(record, "isSynthetic");
+                JsonUtils::get_instance()->Bool(record, "isSidechain") ||
+                JsonUtils::get_instance()->Bool(record, "isMeta") ||
+                JsonUtils::get_instance()->Bool(record, "isSynthetic");
 
             if (type == "result" && !sidechain) {
                 return run;
@@ -2668,7 +2482,7 @@ namespace Claude {
                 // them. It only means the turn is over when nothing came after
                 // it; otherwise the model is still working and stopping here
                 // reported "idle" for the whole rest of the turn.
-                if (message.value("stop_reason", std::string{}) == "end_turn" &&
+                if (JsonUtils::get_instance()->String(message, "stop_reason") == "end_turn" &&
                     !ClaudeActivityFollows(lines, i)) {
                     return run;
                 }
@@ -2755,15 +2569,15 @@ namespace Claude {
                         for (const json& block : message.at("content")) {
                             if (!block.is_object()) continue;
 
-                            const std::string blockType = block.value("type", std::string{});
+                            const std::string blockType = JsonUtils::get_instance()->String(block, "type");
 
                             if (blockType == "tool_use" &&
-                                block.value("name", std::string{}) == "Task") {
-                                pendingTasks.push_back(block.value("id", std::string{}));
+                                JsonUtils::get_instance()->String(block, "name") == "Task") {
+                                pendingTasks.push_back(JsonUtils::get_instance()->String(block, "id"));
                             }
                             else if (blockType == "tool_result") {
                                 const std::string id =
-                                    block.value("tool_use_id", std::string{});
+                                    JsonUtils::get_instance()->String(block, "tool_use_id");
                                 pendingTasks.erase(
                                     std::remove(pendingTasks.begin(), pendingTasks.end(), id),
                                     pendingTasks.end());
@@ -2774,16 +2588,11 @@ namespace Claude {
             }
 
             const bool mayAffectRun =
-                line.find("\"type\":\"assistant\"") != std::string::npos ||
-                line.find("\"type\": \"assistant\"") != std::string::npos ||
-                line.find("\"type\":\"tool_progress\"") != std::string::npos ||
-                line.find("\"type\": \"tool_progress\"") != std::string::npos ||
-                line.find("\"type\":\"tool_use_summary\"") != std::string::npos ||
-                line.find("\"type\": \"tool_use_summary\"") != std::string::npos ||
-                line.find("\"type\":\"stream_event\"") != std::string::npos ||
-                line.find("\"type\": \"stream_event\"") != std::string::npos ||
-                line.find("\"type\":\"user\"") != std::string::npos ||
-                line.find("\"type\": \"user\"") != std::string::npos;
+                LineHasType(line, "assistant") ||
+                LineHasType(line, "tool_progress") ||
+                LineHasType(line, "tool_use_summary") ||
+                LineHasType(line, "stream_event") ||
+                LineHasType(line, "user");
 
             if (!mayAffectRun) {
                 continue;
@@ -2794,7 +2603,7 @@ namespace Claude {
                 continue;
             }
 
-            const std::string type = record.value("type", std::string{});
+            const std::string type = JsonUtils::get_instance()->String(record, "type");
 
             if (type == "stream_event") {
                 // Claude Desktop enables partial SDK messages. When those raw
@@ -2804,12 +2613,12 @@ namespace Claude {
                 // does not persist partial events.
                 if (record.contains("event") && record.at("event").is_object()) {
                     const json& event = record.at("event");
-                    const std::string eventType = event.value("type", std::string{});
+                    const std::string eventType = JsonUtils::get_instance()->String(event, "type");
 
                     if (eventType == "content_block_delta" &&
                         event.contains("delta") && event.at("delta").is_object()) {
                         const std::string deltaType =
-                            event.at("delta").value("type", std::string{});
+                            JsonUtils::get_instance()->String(event.at("delta"), "type");
 
                         const long long at = recordTimestamp(record);
                         if (deltaType == "thinking_delta") {
@@ -2824,7 +2633,7 @@ namespace Claude {
                         event.contains("content_block") &&
                         event.at("content_block").is_object()) {
                         const std::string blockType =
-                            event.at("content_block").value("type", std::string{});
+                            JsonUtils::get_instance()->String(event.at("content_block"), "type");
                         const long long at = recordTimestamp(record);
                         if (blockType == "thinking" || blockType == "redacted_thinking") {
                             beginThinking(at);
@@ -2855,7 +2664,7 @@ namespace Claude {
 
                 if (message && message->contains("content") && message->at("content").is_array()) {
                     for (const json& block : message->at("content")) {
-                        if (block.is_object() && block.value("type", std::string{}) == "tool_result") {
+                        if (block.is_object() && JsonUtils::get_instance()->String(block, "type") == "tool_result") {
                             // Once the tool result is appended Claude immediately
                             // starts the next model cycle. Current-message token
                             // stats belong to the API message that just ended, so
@@ -2881,21 +2690,21 @@ namespace Claude {
             }
 
             const json& message = record.at("message");
-            const std::string messageId = message.value("id", std::string{});
+            const std::string messageId = JsonUtils::get_instance()->String(message, "id");
 
             if (message.contains("usage") && message.at("usage").is_object()) {
                 const std::string dedupeId = messageId.empty()
-                    ? record.value("uuid", std::string{})
+                    ? JsonUtils::get_instance()->String(record, "uuid")
                     : messageId;
                 const json& usage = message.at("usage");
-                const long long output = ClaudeOutputTokensFromUsage(usage);
+                const long long output = ClaudeUsageTokens(usage, "output_tokens", "outputTokens");
 
                 run.tokenStatsValid = true;
                 run.currentTokens = output;
                 run.inputTokens = ClaudeInputTokensFromUsage(usage);
-                run.rawInputTokens = ClaudeRawInputTokensFromUsage(usage);
-                run.cacheCreationInputTokens = ClaudeCacheCreationTokensFromUsage(usage);
-                run.cacheReadInputTokens = ClaudeCacheReadTokensFromUsage(usage);
+                run.rawInputTokens = ClaudeUsageTokens(usage, "input_tokens", "inputTokens");
+                run.cacheCreationInputTokens = ClaudeUsageTokens(usage, "cache_creation_input_tokens", "cacheCreationInputTokens");
+                run.cacheReadInputTokens = ClaudeUsageTokens(usage, "cache_read_input_tokens", "cacheReadInputTokens");
 
                 if (dedupeId.empty()) {
                     // No stable ID means this record cannot be correlated with
@@ -2921,7 +2730,7 @@ namespace Claude {
                         continue;
                     }
 
-                    const std::string blockType = block.value("type", std::string{});
+                    const std::string blockType = JsonUtils::get_instance()->String(block, "type");
                     if (blockType == "thinking" || blockType == "redacted_thinking") {
                         sawActivityBlock = true;
                         latestBlockThinking = true;
@@ -2961,10 +2770,7 @@ namespace Claude {
     ) {
         LocalTelemetry local;
         UsageTelemetry::ContextUsage& context = local.context;
-        const std::string text = ReadClaudeTailSharedReadOnly(
-            session,
-            8ULL * 1024ULL * 1024ULL
-        );
+        const std::string text = ClaudeCookieStore::ReadSharedText(session, 8 * kMegabyte, true);
 
         if (text.empty()) {
             return local;
@@ -3108,7 +2914,7 @@ namespace Claude {
 
             if (contextWindow) {
                 if (contextWindowTokens <= 0) {
-                    const auto maximum = ClaudeNumberAny(
+                    const auto maximum = JsonUtils::get_instance()->NumberAny(
                         *contextWindow,
                         { "context_window_size", "contextWindowSize" }
                     );
@@ -3119,7 +2925,7 @@ namespace Claude {
                 }
 
                 if (usedTokens <= 0) {
-                    const json* current = FindClaudeObjectRecursive(
+                    const json* current = FindClaudeObject(
                         *contextWindow,
                         { "current_usage", "currentUsage" }
                     );
@@ -3129,7 +2935,7 @@ namespace Claude {
                     }
 
                     if (usedTokens <= 0) {
-                        const auto total = ClaudeNumberAny(
+                        const auto total = JsonUtils::get_instance()->NumberAny(
                             *contextWindow,
                             { "total_input_tokens", "totalInputTokens" }
                         );
@@ -3196,7 +3002,7 @@ namespace Claude {
                     }
 
                     if (contextWindow) {
-                        const auto maximum = ClaudeNumberAny(
+                        const auto maximum = JsonUtils::get_instance()->NumberAny(
                             *contextWindow,
                             { "context_window_size", "contextWindowSize" }
                         );
@@ -3292,7 +3098,7 @@ namespace Claude {
         ClaudeDesktopSessionHint desktopHint = LatestClaudeDesktopSessionHint();
         const long long desktopContextWindowHint =
             ClaudeDesktopSelectedContextWindowHint(desktopHint);
-        std::vector<ClaudeSessionCandidate> candidates = LatestClaudeSessionFiles();
+        std::vector<ClaudeFile> candidates = LatestClaudeSessionFiles();
 
         // The supplied Desktop ASAR persists cliSessionId in
         // LOCALAPPDATA\\Claude-3p\\claude-code-sessions even though isRunning
@@ -3309,7 +3115,7 @@ namespace Claude {
             std::filesystem::file_time_type hintWrite{};
             bool hintSeen = false;
 
-            for (const ClaudeSessionCandidate& candidate : candidates) {
+            for (const ClaudeFile& candidate : candidates) {
                 if (candidate.writeTime > newestWrite) newestWrite = candidate.writeTime;
 
                 if (candidate.path.stem().string() == desktopHint.cliSessionId) {
@@ -3330,7 +3136,7 @@ namespace Claude {
                 std::stable_sort(
                     candidates.begin(),
                     candidates.end(),
-                    [&](const ClaudeSessionCandidate& left, const ClaudeSessionCandidate& right) {
+                    [&](const ClaudeFile& left, const ClaudeFile& right) {
                         const bool leftMatch =
                             left.path.stem().string() == desktopHint.cliSessionId;
                         const bool rightMatch =
@@ -3341,7 +3147,7 @@ namespace Claude {
             }
         }
 
-        for (const ClaudeSessionCandidate& candidate : candidates) {
+        for (const ClaudeFile& candidate : candidates) {
             const bool matchesDesktopHint = desktopHint.valid &&
                 !desktopHint.cliSessionId.empty() &&
                 candidate.path.stem().string() == desktopHint.cliSessionId;
@@ -3398,10 +3204,6 @@ namespace Claude {
 
     LocalTelemetry ReadLocalTelemetry() {
         return ReadLatestClaudeLocalTelemetry();
-    }
-
-    UsageTelemetry::ContextUsage ReadLocalContextUsage() {
-        return ReadLatestClaudeLocalTelemetry().context;
     }
 
     static void FinalizeClaudeAccess(Snapshot& snapshot) {
@@ -3464,6 +3266,240 @@ namespace Claude {
         }
     }
 
+    // An ISO or epoch time field as unix seconds; 0 when absent or unreadable.
+    static long long ClaudeUnixSeconds(const json& object, const char* key) {
+        return object.is_object() && object.contains(key) && !object.at(key).is_null()
+            ? TimePointToUnixSeconds(ParseTimeFlexible(object.at(key)))
+            : 0;
+    }
+
+    // cedar_ember: free limit resets, ported from claude.ai's own parser.
+    // Read-only - claiming a reset is a POST that is never sent from here.
+    static LimitResets ParseLimitResets(const json& root, long long now) {
+        // The limit types the page knows; any other blocker is ignored.
+        static const char* const kLimitTypes[] = {
+            "five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet",
+            "seven_day_oauth_apps", "seven_day_cowork", "seven_day_omelette",
+            "seven_day_overage_included"
+        };
+        static const std::regex kGrantId("^[a-z0-9_-]{1,40}$");
+
+        const auto isTrue = [](const json& object, const char* key) {
+            const auto it = object.find(key);
+            return it != object.end() && it->is_boolean() && it->get<bool>();
+        };
+        const auto integer = [](const json& object, const char* key) -> std::optional<long long> {
+            const auto it = object.find(key);
+            if (it == object.end() || !it->is_number() || std::floor(it->get<double>()) != it->get<double>()) {
+                return std::nullopt;
+            }
+            return static_cast<long long>(it->get<double>());
+        };
+        const auto strings = [](const json& object, const char* key) {
+            std::vector<std::string> values;
+            const auto it = object.find(key);
+            if (it != object.end() && it->is_array()) {
+                for (const json& value : *it) {
+                    if (value.is_string()) values.push_back(value.get<std::string>());
+                }
+            }
+            return values;
+        };
+
+        LimitResets resets;
+        const json* block = FindClaudeObject(root, { "cedar_ember" });
+
+        if (!block || !block->contains("eligible") || !block->at("eligible").is_boolean()) {
+            return resets;
+        }
+
+        resets.valid = true;
+        resets.eligible = block->at("eligible").get<bool>();
+        resets.atLimit = isTrue(*block, "at_limit") && block->contains("exhausted") &&
+            block->at("exhausted").is_array() && !block->at("exhausted").empty();
+        resets.cooldownUntilUnixSeconds = ClaudeUnixSeconds(*block, "cooldown_until");
+
+        if (!resets.eligible || !block->contains("grants") || !block->at("grants").is_array()) {
+            return resets;
+        }
+
+        for (const json& grant : block->at("grants")) {
+            const std::string id = JsonUtils::get_instance()->String(grant, "id");
+            const std::optional<long long> total = integer(grant, "resets_total");
+            const std::optional<long long> left = integer(grant, "resets_left");
+            const long long endsAt = ClaudeUnixSeconds(grant, "ends_at");
+
+            // Malformed, expired, or a duplicate id: skipped.
+            if (!std::regex_match(id, kGrantId) || !total || *total < 1 || !left || *left < 0 ||
+                endsAt <= now ||
+                std::any_of(resets.grants.begin(), resets.grants.end(), [&](const LimitReset& kept) {
+                    return kept.id == id;
+                })) {
+                continue;
+            }
+
+            const std::vector<std::string> clears = strings(grant, "clears");
+            bool blocked = false;
+
+            for (const std::string& type : strings(grant, "blocking")) {
+                blocked = blocked ||
+                    (std::find(std::begin(kLimitTypes), std::end(kLimitTypes), type) != std::end(kLimitTypes) &&
+                        std::find(clears.begin(), clears.end(), type) == clears.end());
+            }
+
+            LimitReset reset;
+            reset.id = id;
+            reset.total = static_cast<int>(*total);
+            reset.paused = isTrue(grant, "paused");
+            reset.usableNow = isTrue(grant, "usable_now") && !reset.paused && !blocked;
+            reset.endsAtUnixSeconds = endsAt;
+
+            // Shown as the resets left, or 1 when none are counted but it is
+            // usable right now.
+            const int remaining = static_cast<int>(std::min(*left, *total));
+            if (remaining <= 0 && !reset.usableNow) {
+                continue;
+            }
+            reset.left = remaining > 0 ? remaining : 1;
+
+            reset.type = JsonUtils::get_instance()->String(grant, "type");
+            if (reset.type.empty()) {
+                const auto fiveHour = [](const std::string& type) { return type == "five_hour"; };
+                reset.type = std::none_of(clears.begin(), clears.end(), fiveHour) ? "weekly"
+                    : std::all_of(clears.begin(), clears.end(), fiveHour) ? "session"
+                    : "both";
+            }
+
+            reset.title = isTrue(grant, "gives_back_weekly") ? "Fable reset"
+                : reset.type == "weekly" ? "Weekly reset"
+                : reset.type == "session" ? "Session reset"
+                : reset.type == "both" ? "Session and weekly reset"
+                : Text::get_instance()->FirstNonEmpty({ JsonUtils::get_instance()->String(grant, "label"), "Limit reset" });
+
+            resets.grants.push_back(std::move(reset));
+        }
+
+        std::sort(resets.grants.begin(), resets.grants.end(), [](const LimitReset& a, const LimitReset& b) {
+            return a.endsAtUnixSeconds < b.endsAtUnixSeconds;
+        });
+
+        return resets;
+    }
+
+    // One-time credits that never reset. iguana_necktie is the cloud session
+    // credit; the rest share one window shape, and their real titles live in
+    // a server message catalog, so they get a generic one.
+    static std::vector<PromoCredit> ParsePromoCredits(const json& root, long long now) {
+        // limit_dollars > 0 with remaining_dollars, or else limit - used.
+        const auto readDollars = [](const json& object, PromoCredit& credit) {
+            const std::optional<double> limit = JsonUtils::get_instance()->NumberOpt(object, "limit_dollars");
+            std::optional<double> remaining = JsonUtils::get_instance()->NumberOpt(object, "remaining_dollars");
+            const std::optional<double> used = JsonUtils::get_instance()->NumberOpt(object, "used_dollars");
+
+            if (!limit || *limit <= 0.0 || (!remaining && !used)) {
+                return false;
+            }
+
+            credit.hasDollars = true;
+            credit.limitDollars = *limit;
+            credit.remainingDollars = remaining ? *remaining : *limit - *used;
+            return true;
+        };
+        const auto spentPercent = [](const PromoCredit& credit) {
+            return static_cast<float>(Math::get_instance()->ClampPercentDouble(
+                (credit.limitDollars - credit.remainingDollars) / credit.limitDollars * 100.0));
+        };
+
+        std::vector<PromoCredit> credits;
+
+        // Whole dollars; the page hides the card below $1 left.
+        if (const json* object = FindClaudeObject(root, { "iguana_necktie" })) {
+            PromoCredit credit{ "iguana_necktie", "Cloud session credits", "Included credit" };
+
+            if (readDollars(*object, credit)) {
+                credit.remainingDollars = std::floor(credit.remainingDollars);
+
+                if (credit.remainingDollars >= 1.0) {
+                    credit.usedPercent = spentPercent(credit);
+                    credit.expiresAtUnixSeconds = ClaudeUnixSeconds(*object, "resets_at");
+                    credit.lockedReason = JsonUtils::get_instance()->String(*object, "locked_reason");
+                    credits.push_back(std::move(credit));
+                }
+            }
+        }
+
+        static const std::pair<const char*, const char*> kCredits[] = {
+            { "cinder_cove", "Claude Code and Cowork credit" },
+            { "copper_kite", "Promotional credit" },
+            { "harbor_lantern", "Promotional credit" },
+            { "wattle_ember", "Promotional credit" },
+            { "tangelo", "Promotional credit" },
+            { "kumquat_keel", "Promotional credit" },
+            { "nimbus_quill", "Promotional credit" },
+            { "brass_thimble", "Promotional credit" },
+            { "promo_credits", "Promotional credit" },
+            { "amber_ladder", "Promotional credit" },
+            { "granite_teacup", "Promotional credit" },
+            { "amber_cistern", "Promotional credit" },
+            { "juniper_tide", "Promotional credit" },
+            { "amber_gauge", "Promotional credit" },
+            { "starry_waterfall", "Promotional credit" },
+        };
+
+        for (const auto& [key, title] : kCredits) {
+            const json* object = FindClaudeObject(root, { key });
+
+            if (!object) {
+                continue;
+            }
+
+            PromoCredit credit{ key, title, "Included credit" };
+            const std::optional<double> utilization = JsonUtils::get_instance()->NumberOpt(*object, "utilization");
+
+            if (!readDollars(*object, credit) && !utilization) {
+                continue;
+            }
+
+            credit.usedPercent = utilization
+                ? static_cast<float>(Math::get_instance()->ClampPercentDouble(*utilization))
+                : spentPercent(credit);
+
+            const long long expires = ClaudeUnixSeconds(*object, "resets_at");
+            credit.expiresAtUnixSeconds = expires > now ? expires : 0;
+            credit.lockedReason = JsonUtils::get_instance()->String(*object, "locked_reason");
+
+            const std::string models = JsonUtils::get_instance()->String(*object, "covered_models_label");
+            if (credit.key == "wattle_ember" && !models.empty()) {
+                credit.title += " \xC2\xB7 " + models;
+            }
+
+            credits.push_back(std::move(credit));
+        }
+
+        return credits;
+    }
+
+    // seven_day_breakdown.rows[]: this week's usage by surface.
+    static std::vector<BreakdownRow> ParseWeeklyBreakdown(const json& root) {
+        std::vector<BreakdownRow> rows;
+        const json* breakdown = FindClaudeObject(root, { "seven_day_breakdown" });
+
+        if (!breakdown || !breakdown->contains("rows") || !breakdown->at("rows").is_array()) {
+            return rows;
+        }
+
+        for (const json& row : breakdown->at("rows")) {
+            const std::string name = JsonUtils::get_instance()->String(row, "display_name");
+            const std::optional<double> percent = JsonUtils::get_instance()->NumberOpt(row, "percent");
+
+            if (!name.empty() && percent) {
+                rows.push_back({ name, static_cast<float>(Math::get_instance()->ClampPercentDouble(*percent)) });
+            }
+        }
+
+        return rows;
+    }
+
     static Snapshot ParseSnapshot(const json& root, const ClaudeOAuth& oauth, const std::string& usageHeading) {
         Snapshot snapshot;
 
@@ -3488,6 +3524,7 @@ namespace Claude {
         // Desktop's Code tab reads 5-hour, weekly and Sonnet from the named
         // fields and only per-model rows from limits[], so a limits[] array
         // (even an empty one) must not hide them. Fill whatever it left empty.
+        // A null five_hour (Ultra has no 5-hour limit) leaves Session invalid.
         if (!snapshot.currentSession.valid) {
             snapshot.currentSession = ParseWindow(
                 root,
@@ -3519,12 +3556,7 @@ namespace Claude {
             // "omelette" is Claude Design, a product - not the Fable model.
             AddAdditionalLimit(
                 snapshot,
-                ParseFirstAvailableWindow(
-                    root,
-                    { "seven_day_omelette" },
-                    "Claude Design",
-                    "Product-specific weekly limit"
-                )
+                ParseWindow(root, "seven_day_omelette", "Claude Design", "Product-specific weekly limit")
             );
 
             if (!snapshot.weeklyFable.valid) {
@@ -3553,77 +3585,20 @@ namespace Claude {
             ParseWindow(root, "omelette_promotional", "Claude Design grant", "Promotional grant")
         );
 
-        snapshot.credits = ParseCredits(root, oauth);
+        const long long now = static_cast<long long>(std::time(nullptr));
+        snapshot.limitResets = ParseLimitResets(root, now);
+        snapshot.promoCredits = ParsePromoCredits(root, now);
+        snapshot.weeklyBreakdown = ParseWeeklyBreakdown(root);
+        snapshot.credits = ParseCredits(root);
         FinalizeClaudeAccess(snapshot);
         return snapshot;
-    }
-
-    static Network::HttpResponse FetchDesktopOrganizationUsage(
-        const ClaudeDesktopAuth::Result& desktop,
-        const std::string& baseUrl
-    ) {
-        const std::string cookie = Network::get_instance()->StripHeaderValue(desktop.cookieHeader);
-
-        if (cookie.empty()) {
-            return {};
-        }
-
-        std::string headers;
-        headers += "Accept: application/json\r\n";
-        headers += "Cache-Control: no-cache, no-store, max-age=0\r\n";
-        headers += "Pragma: no-cache\r\n";
-        headers += "Cookie: " + cookie + "\r\n";
-        headers += "Referer: " + baseUrl + "/settings/usage\r\n";
-        headers += "Origin: " + baseUrl + "\r\n";
-        headers += "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Claude/4.4212.0\r\n";
-
-        // Desktop omits the query for a full-spend fetch and sends only
-        // skip_spend=1 to skip spend; there is no skip_spend=0 form.
-        const std::string url = baseUrl + "/api/organizations/" + desktop.organizationId + "/usage";
-
-        return Network::get_instance()->RequestUrl(
-            url,
-            "GET",
-            Network::get_instance()->Utf8ToWide(headers)
-        );
-    }
-
-    // The usage payload carries no plan at all - every key in it is a limit
-    // window or a spend figure. Claude Desktop gets the plan from a separate
-    // call to /api/oauth/profile, whose cookie-authenticated equivalent is
-    // /api/account: memberships[].organization.{rate_limit_tier, billing_type}
-    // plus memberships[].seat_tier.
-    static Network::HttpResponse FetchDesktopAccount(
-        const ClaudeDesktopAuth::Result& desktop,
-        const std::string& baseUrl
-    ) {
-        const std::string cookie = Network::get_instance()->StripHeaderValue(desktop.cookieHeader);
-
-        if (cookie.empty()) {
-            return {};
-        }
-
-        std::string headers;
-        headers += "Accept: application/json\r\n";
-        headers += "Cache-Control: no-cache, no-store, max-age=0\r\n";
-        headers += "Pragma: no-cache\r\n";
-        headers += "Cookie: " + cookie + "\r\n";
-        headers += "Referer: " + baseUrl + "/settings/usage\r\n";
-        headers += "Origin: " + baseUrl + "\r\n";
-        headers += "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Claude/4.4212.0\r\n";
-
-        return Network::get_instance()->RequestUrl(
-            baseUrl + "/api/account",
-            "GET",
-            Network::get_instance()->Utf8ToWide(headers)
-        );
     }
 
     // organization_type is the upstream value Claude Desktop switches on; the
     // web account payload exposes the same fact through rate_limit_tier, so
     // accept either spelling.
     static std::string SubscriptionFromOrganizationType(const std::string& raw) {
-        const std::string lower = ToLowerAscii(raw);
+        const std::string lower = Text::get_instance()->ToLowerCopy(raw);
 
         // Before "max": an Ultra tier string can contain both.
         if (lower.find("ultra") != std::string::npos) return "ultra";
@@ -3727,7 +3702,7 @@ namespace Claude {
 
         // A team seat refines to Standard/Premium, which is a real distinction
         // in the reference tools rather than cosmetic.
-        const std::string seat = ToLowerAscii(
+        const std::string seat = Text::get_instance()->ToLowerCopy(
             JsonUtils::get_instance()->String(*chosen, "seat_tier"));
 
         if (subscription == "team" && !seat.empty() && seat != "unassigned") {
@@ -3749,15 +3724,59 @@ namespace Claude {
         return !plan.subscriptionType.empty() || !plan.rateLimitTier.empty();
     }
 
-    static Network::HttpResponse FetchDesktopUsage(const ClaudeDesktopAuth::Result& desktop) {
-        const std::string baseUrl = desktop.baseUrl.empty() ? "https://claude.ai" : desktop.baseUrl;
-        return FetchDesktopOrganizationUsage(desktop, baseUrl);
+    struct PlanRenewal {
+        long long atUnixSeconds = 0;
+        bool ends = false; // nothing will be charged: the plan ends then
+    };
+
+    // subscription_details: { next_charge_at, plan_ending_at, payment_method,
+    // ... }. The next charge is the renewal; without one the plan ends at
+    // plan_ending_at. payment_method is dropped while parsing, so it is never
+    // read or held.
+    static PlanRenewal ParsePlanRenewal(const std::string& body) {
+        const json details = json::parse(
+            body,
+            [](int, json::parse_event_t event, json& parsed) {
+                return !(event == json::parse_event_t::key && parsed == "payment_method");
+            },
+            false
+        );
+
+        PlanRenewal renewal;
+        const long long charge = ClaudeUnixSeconds(details, "next_charge_at");
+        renewal.atUnixSeconds = charge > 0 ? charge : ClaudeUnixSeconds(details, "plan_ending_at");
+        renewal.ends = charge <= 0 && renewal.atUnixSeconds > 0;
+        return renewal;
+    }
+
+    // Per-organization answers that rarely change (plan name, renewal):
+    // fetched at most once an hour each, so a renamed plan still shows up
+    // without a restart. Only a usable answer is kept; a failure is simply
+    // asked again on the next refresh, and an older answer stands meanwhile.
+    template <class Value>
+    static std::optional<Value> HourlyPerOrganization(
+        const std::string& organizationId,
+        const std::function<std::optional<Value>()>& fetch
+    ) {
+        static std::mutex mutex;
+        static std::unordered_map<std::string, std::pair<Value, long long>> cache;
+        std::lock_guard<std::mutex> lock(mutex);
+
+        const long long now = static_cast<long long>(std::time(nullptr));
+        auto known = cache.find(organizationId);
+
+        if (known == cache.end() || now - known->second.second >= 60 * 60) {
+            if (std::optional<Value> fresh = fetch()) {
+                known = cache.insert_or_assign(organizationId, std::make_pair(std::move(*fresh), now)).first;
+            }
+        }
+
+        return known == cache.end() ? std::nullopt : std::optional<Value>(known->second.first);
     }
 
     static bool MergeCreditsFromBody(
         Snapshot& snapshot,
-        const std::string& body,
-        const ClaudeOAuth& oauth
+        const std::string& body
     ) {
         if (body.empty()) {
             return false;
@@ -3769,7 +3788,7 @@ namespace Claude {
             return false;
         }
 
-        UsageCredits credits = ParseCredits(parsed, oauth);
+        UsageCredits credits = ParseCredits(parsed);
 
         if (credits.reported &&
             CreditsInformationScore(credits) > CreditsInformationScore(snapshot.credits)) {
@@ -3780,46 +3799,41 @@ namespace Claude {
         return false;
     }
 
+    // Cookie sessions only: an OAuth-cache snapshot already came from
+    // /api/oauth/usage, the one other place spend data lives.
     static void FetchDesktopCreditsSupplement(
         Snapshot& snapshot,
-        const ClaudeDesktopAuth::Result& desktop,
-        const ClaudeOAuth& desktopPlan
+        const ClaudeDesktopAuth::Result& desktop
     ) {
-        if (!CreditsNeedSupplement(snapshot.credits)) {
+        if (desktop.source != ClaudeDesktopAuth::AuthSource::BrowserCookies ||
+            !CreditsNeedSupplement(snapshot.credits)) {
             return;
         }
 
-        const std::string primaryBase = desktop.baseUrl.empty()
-            ? "https://claude.ai"
-            : desktop.baseUrl;
-
         auto mergeSuccessful = [&](const Network::HttpResponse& response) {
             if (response.statusCode >= 200 && response.statusCode < 300) {
-                MergeCreditsFromBody(snapshot, response.body, desktopPlan);
+                MergeCreditsFromBody(snapshot, response.body);
             }
         };
 
-        // The matching Desktop OAuth cache belongs to the same active
-        // organization. The token remains in memory only.
-        if (CreditsNeedSupplement(snapshot.credits) &&
-            desktop.source == ClaudeDesktopAuth::AuthSource::BrowserCookies &&
-            !desktop.accessToken.empty()) {
-            mergeSuccessful(FetchUsage(desktop.accessToken));
+        // The session only carries a cached token of its own organization
+        // (AcquireCurrentSession). The token remains in memory only.
+        if (!desktop.accessToken.empty()) {
+            mergeSuccessful(FetchUsage(desktop.accessToken, true));
         }
 
-        if (!CreditsNeedSupplement(snapshot.credits) ||
-            desktop.source != ClaudeDesktopAuth::AuthSource::BrowserCookies) {
+        if (!CreditsNeedSupplement(snapshot.credits)) {
             return;
         }
 
         // Claude has migrated between claude.ai and claude.com. Query the
         // alternate official host with the same in-memory authentication and
         // merge only extra_usage; no credentials are persisted or copied.
-        const std::string alternate = primaryBase.find("claude.com") != std::string::npos
+        const std::string alternate = desktop.baseUrl.find("claude.com") != std::string::npos
             ? "https://claude.ai"
             : "https://claude.com";
 
-        mergeSuccessful(FetchDesktopOrganizationUsage(desktop, alternate));
+        mergeSuccessful(DesktopGet(desktop, alternate, DesktopUsagePath(desktop)));
     }
 
     static Snapshot FailedSnapshot(
@@ -3838,9 +3852,10 @@ namespace Claude {
         return snapshot;
     }
 
-    // Claude Desktop records its own plan usage to disk every few minutes. When
-    // the live request cannot be made (Cookies locked, token expired, offline)
-    // that file is still an honest, current reading, so surface it instead of
+    // Claude Desktop's tray poller records its own plan usage to disk (see
+    // ClaudeDesktopAuth::ReadLatestPlanUsage for its gated 15-minute cadence).
+    // When the live request cannot be made (Cookies locked, token expired,
+    // offline) that file is still an honest reading, so surface it instead of
     // showing empty bars. It carries percentages only - no reset timestamps -
     // which is why it is a fallback and never preferred over a live response.
     static std::optional<Snapshot> DesktopSnapshotFromPlanUsage(
@@ -3857,9 +3872,7 @@ namespace Claude {
         json root = json::object();
 
         for (const ClaudeDesktopAuth::PlanUsageWindow& window : sample.windows) {
-            // used_percent, not utilization: the history file already stores
-            // 0-100 while the API reports a 0-1 utilization fraction.
-            json entry = json::object({ { "used_percent", window.usedPercent } });
+            json entry = json::object({ { "utilization", window.usedPercent } });
 
             if (window.resetAtUnixSeconds > 0) {
                 entry["resets_at"] = window.resetAtUnixSeconds;
@@ -3869,6 +3882,19 @@ namespace Claude {
         }
 
         Snapshot snapshot = ParseSnapshot(root, desktopPlan, "Claude Desktop usage");
+
+        // xu is the extra-usage percentage the history file records alongside
+        // the windows; ParseSnapshot has no field for it, so apply it directly
+        // and classify access again, since it can exhaust access on its own.
+        if (sample.hasExtraUsage) {
+            snapshot.credits.reported = true;
+            snapshot.credits.valid = true;
+            snapshot.credits.enabled = true;
+            snapshot.credits.hasUsedPercent = true;
+            snapshot.credits.usedPercent = static_cast<float>(
+                Math::get_instance()->ClampPercentDouble(sample.extraUsagePercent));
+            FinalizeClaudeAccess(snapshot);
+        }
 
         const long long ageSeconds = sample.sampledAtUnixMs > 0
             ? static_cast<long long>(std::time(nullptr)) - sample.sampledAtUnixMs / 1000
@@ -3885,25 +3911,9 @@ namespace Claude {
 
         snapshot.lastUpdated = "from Desktop history";
         snapshot.statusText = "Plan: " + snapshot.plan + " | Source: " + age;
-        snapshot.access.state = UsageTelemetry::AccessState::Available;
         snapshot.access.detail = failureDetail.empty()
             ? age + ". Reset times are derived from the recorded series."
             : age + ". Live request unavailable: " + failureDetail;
-        // xu is the extra-usage percentage the history file records alongside
-        // the windows; ParseSnapshot has no field for it, so apply it directly.
-        if (sample.hasExtraUsage) {
-            snapshot.credits.reported = true;
-            snapshot.credits.valid = true;
-            snapshot.credits.enabled = true;
-            snapshot.credits.hasUsedPercent = true;
-            snapshot.credits.usedPercent = static_cast<float>(
-                Math::get_instance()->ClampPercentDouble(sample.extraUsagePercent));
-
-            if (snapshot.credits.label.empty()) {
-                snapshot.credits.label = "Extra usage";
-            }
-        }
-
         snapshot.accountKey = "desktop:" + sample.organizationId;
         return snapshot;
     }
@@ -3914,14 +3924,13 @@ namespace Claude {
         desktopPlan.subscriptionType = desktop.subscriptionType;
         desktopPlan.rateLimitTier = desktop.rateLimitTier;
 
-        Network::HttpResponse response;
+        const auto fetchUsage = [](const ClaudeDesktopAuth::Result& session) {
+            return session.source == ClaudeDesktopAuth::AuthSource::OAuthCache
+                ? FetchUsage(session.accessToken, true)
+                : DesktopGet(session, session.baseUrl, DesktopUsagePath(session));
+        };
 
-        if (desktop.source == ClaudeDesktopAuth::AuthSource::OAuthCache) {
-            response = FetchUsage(desktop.accessToken);
-        }
-        else {
-            response = FetchDesktopUsage(desktop);
-        }
+        Network::HttpResponse response = fetchUsage(desktop);
 
         if (desktop.source == ClaudeDesktopAuth::AuthSource::BrowserCookies &&
             (response.statusCode == 401 || response.statusCode == 403)) {
@@ -3930,13 +3939,7 @@ namespace Claude {
             ClaudeDesktopAuth::Result current = ClaudeDesktopAuth::AcquireCurrentSession();
 
             if (current.kind == ClaudeDesktopAuth::ResultKind::Success) {
-                if (current.source == ClaudeDesktopAuth::AuthSource::OAuthCache) {
-                    response = FetchUsage(current.accessToken);
-                }
-                else {
-                    response = FetchDesktopUsage(current);
-                }
-
+                response = fetchUsage(current);
                 desktop = current;
                 desktopPlan.subscriptionType = desktop.subscriptionType;
                 desktopPlan.rateLimitTier = desktop.rateLimitTier;
@@ -3969,7 +3972,7 @@ namespace Claude {
 
             return FailedSnapshot(
                 "Claude Desktop usage",
-                "Claude Desktop usage failed: HTTP " + std::to_string(response.statusCode),
+                "Claude Desktop usage failed: " + detail,
                 response.statusCode,
                 response.body
             );
@@ -3977,35 +3980,27 @@ namespace Claude {
 
         // The plan is not in the usage payload, so ask for it separately. The
         // OAuth cache usually supplies the tier, but only the account payload
-        // carries the display name Desktop shows (e.g. "Ultra"), so look each
-        // organization up once per run rather than on every refresh.
-        {
-            static std::mutex accountMutex;
-            static std::unordered_map<std::string, ClaudeOAuth> accountPlans;
-            std::lock_guard<std::mutex> lock(accountMutex);
+        // carries the display name Desktop shows (e.g. "Ultra"). Best effort:
+        // a failure costs the plan label, nothing else.
+        const std::optional<ClaudeOAuth> accountPlan = HourlyPerOrganization<ClaudeOAuth>(
+            desktop.organizationId,
+            [&]() -> std::optional<ClaudeOAuth> {
+                const Network::HttpResponse account = DesktopGet(desktop, desktop.baseUrl, "/api/account");
+                ClaudeOAuth plan;
 
-            auto known = accountPlans.find(desktop.organizationId);
-
-            if (known == accountPlans.end()) {
-                const std::string accountBase = desktop.baseUrl.empty()
-                    ? "https://claude.ai"
-                    : desktop.baseUrl;
-
-                const Network::HttpResponse account = FetchDesktopAccount(desktop, accountBase);
-                ClaudeOAuth fromAccount;
-
-                if (account.statusCode >= 200 && account.statusCode < 300) {
-                    // Best effort: a failure here costs the plan label, nothing else.
-                    ApplyAccountPlan(account.body, desktop.organizationId, fromAccount);
-                    known = accountPlans.emplace(desktop.organizationId, fromAccount).first;
+                if (account.statusCode >= 200 && account.statusCode < 300 &&
+                    ApplyAccountPlan(account.body, desktop.organizationId, plan)) {
+                    return plan;
                 }
-            }
 
-            if (known != accountPlans.end()) {
-                if (desktopPlan.subscriptionType.empty()) desktopPlan.subscriptionType = known->second.subscriptionType;
-                if (desktopPlan.rateLimitTier.empty()) desktopPlan.rateLimitTier = known->second.rateLimitTier;
-                desktopPlan.displayName = known->second.displayName;
+                return std::nullopt;
             }
+        );
+
+        if (accountPlan) {
+            if (desktopPlan.subscriptionType.empty()) desktopPlan.subscriptionType = accountPlan->subscriptionType;
+            if (desktopPlan.rateLimitTier.empty()) desktopPlan.rateLimitTier = accountPlan->rateLimitTier;
+            desktopPlan.displayName = accountPlan->displayName;
         }
 
         Snapshot snapshot = ParseSnapshot(
@@ -4014,11 +4009,36 @@ namespace Claude {
             "Claude Desktop usage"
         );
 
+        // When the plan renews, or ends. The cookie session is what
+        // subscription_details accepts; a failure just leaves it unknown.
+        if (desktop.source == ClaudeDesktopAuth::AuthSource::BrowserCookies) {
+            const std::optional<PlanRenewal> renewal = HourlyPerOrganization<PlanRenewal>(
+                desktop.organizationId,
+                [&]() -> std::optional<PlanRenewal> {
+                    const Network::HttpResponse details = DesktopGet(
+                        desktop,
+                        desktop.baseUrl,
+                        "/api/organizations/" + desktop.organizationId + "/subscription_details"
+                    );
+                    const PlanRenewal parsed = details.statusCode >= 200 && details.statusCode < 300
+                        ? ParsePlanRenewal(details.body)
+                        : PlanRenewal{};
+
+                    return parsed.atUnixSeconds > 0 ? std::optional<PlanRenewal>(parsed) : std::nullopt;
+                }
+            );
+
+            if (renewal) {
+                snapshot.planRenewsAtUnixSeconds = renewal->atUnixSeconds;
+                snapshot.planEnds = renewal->ends;
+            }
+        }
+
         // Keep notification state separate for each Desktop organization.
         // The organization ID is already required for the usage request and is
         // retained only in memory.
         snapshot.accountKey = "desktop:" + desktop.organizationId;
-        FetchDesktopCreditsSupplement(snapshot, desktop, desktopPlan);
+        FetchDesktopCreditsSupplement(snapshot, desktop);
         // Supplemental spend data can change availability independently from
         // Session/Weekly limits, so classify access again after the merge.
         FinalizeClaudeAccess(snapshot);
@@ -4054,13 +4074,16 @@ namespace Claude {
             );
         }
 
-        Network::HttpResponse response = FetchUsage(codeCredentials.oauth.accessToken);
+        Network::HttpResponse response = FetchUsage(codeCredentials.oauth.accessToken, false);
 
-        if ((response.statusCode == 401 || response.statusCode == 403) &&
+        // 401 only. A 403 means the token authenticated but may not read
+        // usage, and a refresh would spend the single-use refresh token for
+        // the same class of token.
+        if (response.statusCode == 401 &&
             codeCredentials.canSave &&
             !codeCredentials.oauth.refreshToken.empty() &&
             RefreshToken(codeCredentials)) {
-            response = FetchUsage(codeCredentials.oauth.accessToken);
+            response = FetchUsage(codeCredentials.oauth.accessToken, false);
         }
 
         if (response.statusCode == 403) {
@@ -4086,7 +4109,9 @@ namespace Claude {
         if (response.statusCode < 200 || response.statusCode >= 300) {
             return FailedSnapshot(
                 usageHeading,
-                sourceName + " usage failed: HTTP " + std::to_string(response.statusCode),
+                sourceName + " usage failed: " + (response.statusCode > 0
+                    ? "HTTP " + std::to_string(response.statusCode)
+                    : std::string("the usage request could not be sent")),
                 response.statusCode,
                 response.body
             );
@@ -4098,11 +4123,14 @@ namespace Claude {
             usageHeading
         );
 
-        // Do not store or display the token. A process-local hash is enough to
-        // detect a changed Claude Code login and reset stale warning state.
-        snapshot.accountKey = sourceName + ":" + std::to_string(
-            std::hash<std::string>{}(codeCredentials.oauth.accessToken)
-        );
+        // Never the token itself. A credentials-file login is keyed by its
+        // account id, which survives the token rotating on every refresh; an
+        // environment token never rotates here, and it may belong to another
+        // account than .claude.json, so it keeps a process-local hash.
+        const std::string accountId = codeCredentials.canSave ? ClaudeCodeAccountId() : std::string();
+        snapshot.accountKey = sourceName + ":" + (accountId.empty()
+            ? std::to_string(std::hash<std::string>{}(codeCredentials.oauth.accessToken))
+            : accountId);
         return snapshot;
     }
 
@@ -4213,7 +4241,9 @@ namespace Claude {
             // In Auto mode, a present credentials file is authoritative. If it is
             // malformed or expired, show that error instead of silently switching
             // to a different environment-token account.
-            if (std::filesystem::exists(ClaudeCredentialsPath())) {
+            std::error_code ec;
+
+            if (std::filesystem::exists(ClaudeCredentialsPath(), ec)) {
                 return FetchCredentialsFileSnapshot(true);
             }
 
@@ -4261,11 +4291,12 @@ namespace Claude {
         }
 
         json usage;
-        const std::vector<std::filesystem::path> files = ClaudeCoworkSettingsFiles();
+        const std::vector<ClaudeFile> files = ClaudeCoworkSettingsFiles();
 
         if (!files.empty()) {
-            const json settings = json::parse(
-                ReadClaudeTailSharedReadOnly(files.front(), 4ULL * 1024ULL * 1024ULL), nullptr, false);
+            const json settings = JsonUtils::get_instance()->ParseOrNull(
+                ClaudeCookieStore::ReadSharedText(files.front().path, 4 * kMegabyte)
+            );
 
             if (settings.is_object() && settings.contains("__token_usage")) {
                 usage = settings.at("__token_usage");
@@ -4275,10 +4306,10 @@ namespace Claude {
         using namespace std::chrono;
         const double nowMs = static_cast<double>(duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
         const double windowMs = static_cast<double>(*hours) * 3600000.0;
-        const double startMs = ClaudeNumberAny(usage, { "windowStartMs" }).value_or(0.0);
+        const double startMs = JsonUtils::get_instance()->Number(usage, "windowStartMs");
         const bool current = startMs > 0.0 && startMs <= nowMs && nowMs < startMs + windowMs;
         const double used = current
-            ? ClaudeNumberAny(usage, { "inputTokens" }).value_or(0.0) + ClaudeNumberAny(usage, { "outputTokens" }).value_or(0.0)
+            ? JsonUtils::get_instance()->Number(usage, "inputTokens") + JsonUtils::get_instance()->Number(usage, "outputTokens")
             : 0.0;
         const float percent = static_cast<float>(
             Math::get_instance()->ClampPercentDouble(used / static_cast<double>(*cap) * 100.0));
@@ -4288,7 +4319,7 @@ namespace Claude {
 
         if (current) {
             const system_clock::time_point resetAt{ milliseconds(static_cast<long long>(startMs + windowMs)) };
-            window.Reset(TimePointToUnixSeconds(resetAt), FormatResetLong(resetAt));
+            window.Reset(TimePointToUnixSeconds(resetAt), Format::get_instance()->ResetRelative(resetAt));
         }
 
         AddAdditionalLimit(snapshot, window.Valid().Build());
@@ -4300,14 +4331,342 @@ namespace Claude {
         }
     }
 
-    Snapshot FetchSnapshot(AccountSource source) {
-        Snapshot snapshot = FetchSnapshotForSource(source);
-        AddClaudeTokenCap(snapshot);
-        LocalTelemetry local = ReadLatestClaudeLocalTelemetry();
-        snapshot.context = std::move(local.context);
-        snapshot.run = std::move(local.run);
-        return snapshot;
+    // <userData>\ccd-limit-auto-resume.json, written while Desktop's limit
+    // auto-resume is on:
+    //   { choices: { <accountId>: bool }, migrated: [...],
+    //     windows: { "<accountId>/<orgId>": { <sessionId>: { resetsAt (epoch
+    //       seconds), attempt 0..3, optedIn, armed } } } }
+    // Desktop only keeps entries within 6 hours of now; a session is waiting
+    // while its resetsAt is still ahead. Given an organization, only its own
+    // windows count. Read-only.
+    static AutoResume ReadAutoResume(const std::string& organizationId, long long now) {
+        constexpr long long kHorizonSeconds = 6 * 60 * 60;
+        const std::string suffix = "/" + organizationId;
+        AutoResume resume;
+
+        for (const std::filesystem::path& root : ClaudeDesktopAuth::UserDataCandidates()) {
+            const json store = JsonUtils::get_instance()->ParseOrNull(
+                ClaudeCookieStore::ReadSharedText(root / "ccd-limit-auto-resume.json", 4 * kMegabyte)
+            );
+            const json* windows = FindClaudeObject(store, { "windows" });
+
+            if (!windows) {
+                continue;
+            }
+
+            for (auto account = windows->begin(); account != windows->end(); ++account) {
+                const std::string& key = account.key();
+
+                if (!account.value().is_object() || (!organizationId.empty() &&
+                    (key.size() < suffix.size() || key.compare(key.size() - suffix.size(), suffix.size(), suffix) != 0))) {
+                    continue;
+                }
+
+                for (const json& session : account.value()) {
+                    const long long resetsAt = JsonUtils::get_instance()->UnixSecondsField(session, "resetsAt");
+
+                    if (resetsAt <= now || resetsAt > now + kHorizonSeconds) {
+                        continue;
+                    }
+
+                    ++resume.waitingSessions;
+                    resume.optedIn = resume.optedIn || JsonUtils::get_instance()->Bool(session, "optedIn");
+
+                    if (resume.resetAtUnixSeconds == 0 || resetsAt < resume.resetAtUnixSeconds) {
+                        resume.resetAtUnixSeconds = resetsAt;
+                    }
+                }
+            }
+        }
+
+        resume.valid = resume.waitingSessions > 0;
+        return resume;
     }
 
+    // 3P builds log every turn to local-agent-mode-sessions\<acct>\<org>\
+    // usage-ledger\YYYY-MM-DD[.N].ndjson, one file set per local date:
+    //   { v: 1, ts, surface: chat|cowork|code, origin, sessionId?, isError,
+    //     models: { <id>: { inputTokens, outputTokens, cacheReadTokens,
+    //       cacheWriteTokens, webSearchRequests, cost?: { usd, basis } } } }
+    // Sums the newest ledger's last 30 local days. Only 3P installs keep one;
+    // without it this stays silent.
+    static UsageLedger ReadUsageLedger(long long now) {
+        static const std::wregex kLedgerName(LR"(^(\d{4}-\d{2}-\d{2})(?:\.(\d+))?\.ndjson$)");
+        static const char* const kSurfaces[] = { "chat", "cowork", "code" };
+        UsageLedger ledger;
+
+        const std::vector<ClaudeFile> files = NewestClaudeFiles(
+            ClaudeDesktopDataDirs("local-agent-mode-sessions"),
+            [](const std::filesystem::path& path) {
+                return _wcsicmp(path.parent_path().filename().c_str(), L"usage-ledger") == 0 &&
+                    std::regex_match(path.filename().wstring(), kLedgerName);
+            },
+            SIZE_MAX
+        );
+
+        if (files.empty()) {
+            return ledger;
+        }
+
+        // The window's first local date. Noon keeps a DST shift from moving it.
+        std::time_t start = static_cast<std::time_t>(now);
+        std::tm day{};
+        localtime_s(&day, &start);
+        day.tm_mday -= ledger.windowDays - 1;
+        day.tm_hour = 12;
+        day.tm_isdst = -1;
+        std::mktime(&day);
+
+        wchar_t firstDate[11]{};
+        std::wcsftime(firstDate, 11, L"%Y-%m-%d", &day);
+
+        const std::filesystem::path folder = files.front().path.parent_path();
+        long long surfaceTokens[3] = {};
+        bool surfaceSeen[3] = {};
+
+        for (const ClaudeFile& file : files) {
+            if (file.path.parent_path() != folder ||
+                file.path.filename().wstring().compare(0, 10, firstDate) < 0) {
+                continue;
+            }
+
+            std::istringstream lines(ClaudeCookieStore::ReadSharedText(file.path, 64 * kMegabyte));
+
+            for (std::string line; std::getline(lines, line);) {
+                const json entry = JsonUtils::get_instance()->ParseOrNull(line);
+                const std::string surface = JsonUtils::get_instance()->String(entry, "surface");
+                const size_t slot = static_cast<size_t>(
+                    std::find(std::begin(kSurfaces), std::end(kSurfaces), surface) - std::begin(kSurfaces));
+
+                if (JsonUtils::get_instance()->Number(entry, "v") != 1.0 || slot >= std::size(kSurfaces)) {
+                    continue;
+                }
+
+                ledger.valid = true;
+                surfaceSeen[slot] = true;
+
+                if (JsonUtils::get_instance()->String(entry, "origin") != "connection_probe") {
+                    ++ledger.turns;
+                }
+
+                if (JsonUtils::get_instance()->Bool(entry, "isError")) {
+                    ++ledger.errorTurns;
+                }
+
+                const json* models = FindClaudeObject(entry, { "models" });
+
+                if (!models) {
+                    continue;
+                }
+
+                for (const json& model : *models) {
+                    const auto tokens = [&](const char* key) {
+                        return static_cast<long long>(std::max(0.0, JsonUtils::get_instance()->Number(model, key)));
+                    };
+                    const long long input = tokens("inputTokens");
+                    const long long output = tokens("outputTokens");
+
+                    ledger.inputTokens += input;
+                    ledger.outputTokens += output;
+                    ledger.cacheReadTokens += tokens("cacheReadTokens");
+                    ledger.cacheWriteTokens += tokens("cacheWriteTokens");
+                    surfaceTokens[slot] += input + output;
+
+                    if (const json* cost = FindClaudeObject(model, { "cost" })) {
+                        if (const auto usd = JsonUtils::get_instance()->NumberOpt(*cost, "usd")) {
+                            ledger.costValid = true;
+                            ledger.costUsd += *usd;
+                        }
+                    }
+                }
+            }
+        }
+
+        for (size_t slot = 0; slot < std::size(kSurfaces); ++slot) {
+            if (surfaceSeen[slot]) {
+                ledger.surfaceTokens.emplace_back(kSurfaces[slot], surfaceTokens[slot]);
+            }
+        }
+
+        return ledger;
+    }
+
+    // ---------------------------------------------------------------------
+    // Weekly pace, ported from claude.ai's Settings > Usage page.
+    // ---------------------------------------------------------------------
+    static const char* const kWeekdayNames[] = {
+        "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"
+    };
+
+    static std::tm LocalTime(long long unixSeconds) {
+        const std::time_t time = static_cast<std::time_t>(unixSeconds);
+        std::tm local{};
+        localtime_s(&local, &time);
+        return local;
+    }
+
+    // The local calendar day as a running day number.
+    static long long LocalDay(long long unixSeconds) {
+        std::tm local = LocalTime(unixSeconds);
+        return static_cast<long long>(_mkgmtime(&local)) / 86400;
+    }
+
+    // Small hours count as the night before, unless that night is already
+    // behind today.
+    static long long PaceShift(long long unixSeconds, long long now) {
+        if (LocalTime(unixSeconds).tm_hour >= 5) {
+            return unixSeconds;
+        }
+
+        const long long earlier = unixSeconds - 5 * 60 * 60;
+        return LocalDay(earlier) < LocalDay(now) ? unixSeconds : earlier;
+    }
+
+    // "tonight", "tomorrow morning", "Wednesday night"...
+    static std::string PaceRunOut(long long runsOut, long long now) {
+        const int hour = LocalTime(runsOut).tm_hour;
+        const std::string part = hour < 5 ? "night"
+            : hour < 12 ? "morning"
+            : hour < 17 ? "afternoon"
+            : hour < 21 ? "evening"
+            : "night";
+        const long long shifted = PaceShift(runsOut, now);
+        const long long days = LocalDay(shifted) - LocalDay(now);
+
+        if (days == 0) {
+            return part == "night" ? "tonight" : "this " + part;
+        }
+
+        if (days == 1) {
+            return "tomorrow " + part;
+        }
+
+        return std::string(kWeekdayNames[LocalTime(shifted).tm_wday]) + " " + part;
+    }
+
+    // "today's", "tomorrow's", "Thursday's", "the Nov 5", or "the 11:00 AM"
+    // when a heads-up runs out on the reset's own day.
+    static std::string PaceResetName(const Pace& pace, long long now) {
+        static const char* const kMonths[] = {
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+        };
+        const std::tm reset = LocalTime(pace.resetsAtUnixSeconds);
+        char text[32]{};
+
+        if (pace.state == Pace::State::HeadsUp &&
+            LocalDay(PaceShift(pace.runsOutAtUnixSeconds, now)) == LocalDay(pace.resetsAtUnixSeconds)) {
+            std::snprintf(text, sizeof(text), "the %d:%02d %s",
+                reset.tm_hour % 12 == 0 ? 12 : reset.tm_hour % 12, reset.tm_min,
+                reset.tm_hour < 12 ? "AM" : "PM");
+            return text;
+        }
+
+        if (pace.resetsAtUnixSeconds - now >= 6 * 24 * 60 * 60) {
+            std::snprintf(text, sizeof(text), "the %s %d", kMonths[reset.tm_mon], reset.tm_mday);
+            return text;
+        }
+
+        const long long days = LocalDay(pace.resetsAtUnixSeconds) - LocalDay(now);
+
+        return days == 0 ? "today's"
+            : days == 1 ? "tomorrow's"
+            : std::string(kWeekdayNames[reset.tm_wday]) + "'s";
+    }
+
+    Pace ComputePace(float usedPercent, long long resetAtUnixSeconds, long long nowUnixSeconds) {
+        constexpr long long kWeekSeconds = 7 * 24 * 60 * 60;
+        Pace pace;
+        pace.percent = static_cast<int>(std::floor(std::max(0.0, static_cast<double>(usedPercent)) + 1e-9));
+        pace.resetsAtUnixSeconds = resetAtUnixSeconds;
+
+        const long long elapsed = nowUnixSeconds - (resetAtUnixSeconds - kWeekSeconds);
+
+        if (pace.percent >= 100) {
+            pace.state = Pace::State::LimitHit;
+        }
+        else if (pace.percent == 0) {
+            pace.state = Pace::State::Zero;
+        }
+        else if (pace.percent < 10) {
+            pace.state = Pace::State::Fresh;
+        }
+        else if (resetAtUnixSeconds <= 0 || elapsed < 12 * 60 * 60) {
+            pace.state = Pace::State::Early;
+        }
+        else {
+            const double runsOut = static_cast<double>(nowUnixSeconds) +
+                (100.0 - pace.percent) * static_cast<double>(elapsed) / pace.percent;
+
+            if (runsOut < static_cast<double>(resetAtUnixSeconds)) {
+                pace.state = Pace::State::HeadsUp;
+                pace.runsOutAtUnixSeconds = static_cast<long long>(runsOut);
+            }
+            else {
+                pace.state = Pace::State::OnTrack;
+            }
+        }
+
+        return pace;
+    }
+
+    // Plain ASCII apostrophes: the UI font may lack U+2019.
+    std::string PaceText(const Pace& pace, long long nowUnixSeconds) {
+        const std::string percent = std::to_string(pace.percent);
+        const bool hasReset = pace.resetsAtUnixSeconds > 0;
+
+        switch (pace.state) {
+        case Pace::State::Zero:
+            return "No usage yet. 100% of your weekly limit is available.";
+        case Pace::State::Fresh:
+            return "Fresh week. " + percent + "% of your weekly limit used.";
+        case Pace::State::Early:
+            return percent + "% of your weekly limit used.";
+        case Pace::State::OnTrack:
+            return hasReset
+                ? "On track. You should reach " + PaceResetName(pace, nowUnixSeconds) + " reset with room to spare."
+                : "On track. You have room to spare this week.";
+        case Pace::State::HeadsUp: {
+            const std::string runOut = "Heads up. At this pace you'll run out " +
+                PaceRunOut(pace.runsOutAtUnixSeconds, nowUnixSeconds);
+            return hasReset
+                ? runOut + ", before " + PaceResetName(pace, nowUnixSeconds) + " reset."
+                : runOut + ".";
+        }
+        case Pace::State::LimitHit:
+            return hasReset
+                ? "Limit hit. Your week resets " + Format::get_instance()->ResetDateTime(pace.resetsAtUnixSeconds) + "."
+                : "Limit hit.";
+        default:
+            return {};
+        }
+    }
+
+    Snapshot FetchSnapshot(AccountSource source) {
+        Snapshot snapshot = FetchSnapshotForSource(source);
+        const long long now = static_cast<long long>(std::time(nullptr));
+        const std::string organizationId = snapshot.accountKey.rfind("desktop:", 0) == 0
+            ? snapshot.accountKey.substr(8)
+            : std::string();
+
+        // Local files are best effort: one bad transcript or settings file
+        // must never cost the network snapshot, or the other local readers.
+        const auto bestEffort = [](const auto& read) {
+            try {
+                read();
+            }
+            catch (const std::exception&) {
+            }
+        };
+
+        bestEffort([&] { AddClaudeTokenCap(snapshot); });
+        bestEffort([&] { snapshot.autoResume = ReadAutoResume(organizationId, now); });
+        bestEffort([&] { snapshot.ledger = ReadUsageLedger(now); });
+        bestEffort([&] {
+            LocalTelemetry local = ReadLatestClaudeLocalTelemetry();
+            snapshot.context = std::move(local.context);
+            snapshot.run = std::move(local.run);
+        });
+        return snapshot;
+    }
 
 }

@@ -20,6 +20,13 @@ namespace CodexAppServer {
         // separate from quota/account state because older app-server builds
         // may not expose the method.
         nlohmann::json configResult;
+        // ChatGPT bearer token from getAuthStatus (memory only), so the
+        // backend-only extras - monthly usage, profile stats, workspace
+        // credits - also work for the app-server account. Empty for API-key
+        // logins or older app-servers.
+        std::string authToken;
+        // accountSession/list: signed-in sessions (0 when unsupported).
+        int sessionCount = 0;
         std::string detail;
     };
 

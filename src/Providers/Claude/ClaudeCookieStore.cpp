@@ -1,34 +1,24 @@
 #include "Global.hpp"
 
 #include "ClaudeCookieStore.hpp"
+#include "Text.hpp"
+
+#include <tlhelp32.h>
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <functional>
-#include <thread>
 #include <limits>
-#include <optional>
 #include <stdexcept>
 #include <string>
-#include <system_error>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
-#ifdef _WIN32
-#include <tlhelp32.h>
-#endif
-
-#ifndef _WIN32
-#include <cerrno>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
 
 namespace ClaudeCookieStore {
 namespace {
@@ -44,6 +34,13 @@ namespace {
     constexpr std::uint32_t kMaximumTraversalDepth = 64;
     constexpr int kMaximumConsistencyAttempts = 4;
 
+    // Claude Desktop wrote to the database while it was being read. Only this
+    // is worth retrying: a locked, missing or malformed file fails the same way
+    // again, and every attempt can cost a system-wide handle scan.
+    struct ChangedDuringRead : std::runtime_error {
+        using std::runtime_error::runtime_error;
+    };
+
     static std::filesystem::path SidecarPath(
         const std::filesystem::path& databasePath,
         const char* suffix
@@ -53,49 +50,6 @@ namespace {
         return path;
     }
 
-    static std::string PathText(const std::filesystem::path& path) {
-#ifdef _WIN32
-        const std::wstring wide = path.wstring();
-        if (wide.empty()) {
-            return {};
-        }
-
-        int needed = WideCharToMultiByte(
-            CP_UTF8,
-            0,
-            wide.data(),
-            static_cast<int>(wide.size()),
-            nullptr,
-            0,
-            nullptr,
-            nullptr
-        );
-
-        if (needed <= 0) {
-            return path.string();
-        }
-
-        std::string output(static_cast<std::size_t>(needed), '\0');
-        if (WideCharToMultiByte(
-            CP_UTF8,
-            0,
-            wide.data(),
-            static_cast<int>(wide.size()),
-            output.data(),
-            needed,
-            nullptr,
-            nullptr
-        ) != needed) {
-            return path.string();
-        }
-
-        return output;
-#else
-        return path.string();
-#endif
-    }
-
-#ifdef _WIN32
     class UniqueHandle final {
     public:
         UniqueHandle() = default;
@@ -143,71 +97,24 @@ namespace {
     private:
         HANDLE m_handle = INVALID_HANDLE_VALUE;
     };
-#else
-    class UniqueFd final {
-    public:
-        UniqueFd() = default;
-        explicit UniqueFd(int fd) : m_fd(fd) {}
 
-        ~UniqueFd() {
-            Reset();
-        }
-
-        UniqueFd(const UniqueFd&) = delete;
-        UniqueFd& operator=(const UniqueFd&) = delete;
-
-        UniqueFd(UniqueFd&& other) noexcept
-            : m_fd(other.Release()) {
-        }
-
-        UniqueFd& operator=(UniqueFd&& other) noexcept {
-            if (this != &other) {
-                Reset(other.Release());
-            }
-            return *this;
-        }
-
-        bool Valid() const {
-            return m_fd >= 0;
-        }
-
-        int Get() const {
-            return m_fd;
-        }
-
-        int Release() {
-            int fd = m_fd;
-            m_fd = -1;
-            return fd;
-        }
-
-        void Reset(int fd = -1) {
-            if (Valid()) {
-                ::close(m_fd);
-            }
-            m_fd = fd;
-        }
-
-    private:
-        int m_fd = -1;
-    };
-#endif
-
-#ifdef _WIN32
     // -----------------------------------------------------------------------
     // Locked-file fallback: borrow Claude Desktop's own open handle
     //
     // Recent Claude Desktop builds open Network\Cookies with a share mode that
     // denies concurrent readers (CreateFileW then fails with Win32 32,
     // ERROR_SHARING_VIOLATION). The file cannot be opened or copied while
-    // Desktop runs. But Desktop is a process we own, so we can duplicate the
-    // handle it already holds and read through that.
+    // Desktop runs, but the handle it already holds can be duplicated - with
+    // read access only.
     //
-    // Reading through a shared handle is safe here for one specific reason: the
-    // only other user of this handle is Chromium's SQLite, whose Win32 VFS
-    // always reads and writes at absolute offsets (OVERLAPPED.Offset) and never
-    // relies on the file's current position. SharedReadFile does the same, so
-    // neither side disturbs the other. This is strictly read-only.
+    // A duplicate shares Desktop's file object, and with it the file position
+    // SQLite sets right before SetEndOfFile. ReadFile on that object moves the
+    // position - even at an OVERLAPPED offset, on a synchronous handle - so a
+    // read landing between the two calls would truncate Desktop's database at
+    // our offset. The borrowed handle is therefore only ever read through a
+    // read-only mapped view, which has no file position. While the view exists
+    // the file cannot shrink; SQLite's winTruncate tolerates exactly that
+    // (ERROR_USER_MAPPED_FILE) and keeps the database consistent.
     // -----------------------------------------------------------------------
 
     typedef LONG(NTAPI* NtQuerySystemInformationFn)(
@@ -294,8 +201,8 @@ namespace {
         return pids;
     }
 
-    // Returns a duplicated, readable handle to targetPath borrowed from a Claude
-    // Desktop process, or INVALID_HANDLE_VALUE. The caller owns the handle.
+    // Returns a duplicated, read-only handle to targetPath borrowed from a
+    // Claude Desktop process, or INVALID_HANDLE_VALUE. The caller owns it.
     static HANDLE DuplicateLockedFileHandle(const std::wstring& targetPath) {
         static NtQuerySystemInformationFn queryFn = []() -> NtQuerySystemInformationFn {
             HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
@@ -371,15 +278,17 @@ namespace {
                 continue;
             }
 
+            // Read access only: never hold write access to Desktop's database.
+            // Handles without read access (and most non-file handles) fail here.
             HANDLE duplicated = nullptr;
             if (!DuplicateHandle(
                     sourceProcess,
                     reinterpret_cast<HANDLE>(entry.HandleValue),
                     GetCurrentProcess(),
                     &duplicated,
-                    0,
+                    FILE_GENERIC_READ,
                     FALSE,
-                    DUPLICATE_SAME_ACCESS) ||
+                    0) ||
                 !duplicated) {
                 continue;
             }
@@ -402,32 +311,52 @@ namespace {
 
         return result;
     }
-#endif
+
+    // An I/O error while a mapped page is faulted in arrives as an SEH
+    // exception, not a C++ one. No objects with destructors here, so __try is
+    // allowed.
+    static bool CopyFromView(void* destination, const unsigned char* source, std::size_t size) {
+        __try {
+            std::memcpy(destination, source, size);
+            return true;
+        }
+        __except (GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR
+            ? EXCEPTION_EXECUTE_HANDLER
+            : EXCEPTION_CONTINUE_SEARCH) {
+            return false;
+        }
+    }
 
     class SharedReadFile final {
     public:
-        SharedReadFile() = default;
-
         SharedReadFile(const std::filesystem::path& path, bool optional)
             : m_path(path) {
             Open(optional);
         }
 
+        ~SharedReadFile() {
+            if (m_view) {
+                UnmapViewOfFile(m_view);
+            }
+        }
+
         SharedReadFile(const SharedReadFile&) = delete;
         SharedReadFile& operator=(const SharedReadFile&) = delete;
-        SharedReadFile(SharedReadFile&&) noexcept = default;
-        SharedReadFile& operator=(SharedReadFile&&) noexcept = default;
 
         bool Valid() const {
-#ifdef _WIN32
             return m_handle.Valid();
-#else
-            return m_fd.Valid();
-#endif
         }
 
         std::uint64_t Size() const {
-            return QuerySize();
+            if (!Valid()) {
+                return 0;
+            }
+
+            LARGE_INTEGER size{};
+            if (!GetFileSizeEx(m_handle.Get(), &size) || size.QuadPart < 0) {
+                throw std::runtime_error("Could not read the size of " + Name());
+            }
+            return static_cast<std::uint64_t>(size.QuadPart);
         }
 
         void ReadExact(std::uint64_t offset, void* destination, std::size_t size) const {
@@ -436,35 +365,37 @@ namespace {
             }
 
             if (!Valid() || !destination) {
-                throw std::runtime_error("Invalid read requested for " + PathText(m_path));
+                throw std::runtime_error("Invalid read requested for " + Name());
             }
 
+            if (m_borrowed) {
+                if (offset > m_viewSize || size > m_viewSize - offset) {
+                    throw ChangedDuringRead("The live file changed while it was being read: " + Name());
+                }
+                if (!CopyFromView(destination, m_view + offset, size)) {
+                    throw std::runtime_error("Read-only access to " + Name() + " failed");
+                }
+                return;
+            }
+
+            // Our own handle: an OVERLAPPED offset read never depends on, or
+            // disturbs, anyone else's file position.
             unsigned char* output = static_cast<unsigned char*>(destination);
             std::size_t completed = 0;
 
             while (completed < size) {
-                const std::size_t remaining = size - completed;
-                const std::size_t chunk = std::min<std::size_t>(
-                    remaining,
-                    static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())
-                );
-
-#ifdef _WIN32
                 const std::uint64_t absoluteOffset = offset + completed;
                 OVERLAPPED overlapped{};
                 overlapped.Offset = static_cast<DWORD>(absoluteOffset & 0xFFFFFFFFULL);
                 overlapped.OffsetHigh = static_cast<DWORD>((absoluteOffset >> 32) & 0xFFFFFFFFULL);
 
+                const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(
+                    size - completed,
+                    static_cast<std::size_t>(std::numeric_limits<DWORD>::max())
+                ));
                 DWORD bytesRead = 0;
-                BOOL readStarted = ReadFile(
-                    m_handle.Get(),
-                    output + completed,
-                    static_cast<DWORD>(chunk),
-                    &bytesRead,
-                    &overlapped
-                );
 
-                if (!readStarted) {
+                if (!ReadFile(m_handle.Get(), output + completed, chunk, &bytesRead, &overlapped)) {
                     const DWORD error = GetLastError();
                     if (error != ERROR_IO_PENDING ||
                         !GetOverlappedResult(m_handle.Get(), &overlapped, &bytesRead, TRUE)) {
@@ -472,45 +403,17 @@ namespace {
                             ? GetLastError()
                             : error;
                         throw std::runtime_error(
-                            "Read-only access to \"" + PathText(m_path) +
-                            "\" failed (Win32 " + std::to_string(finalError) + ")"
+                            "Read-only access to " + Name() +
+                            " failed (Win32 " + std::to_string(finalError) + ")"
                         );
                     }
                 }
 
                 if (bytesRead == 0) {
-                    throw std::runtime_error(
-                        "The live file changed while it was being read: " + PathText(m_path)
-                    );
+                    throw ChangedDuringRead("The live file changed while it was being read: " + Name());
                 }
 
                 completed += static_cast<std::size_t>(bytesRead);
-#else
-                const ssize_t bytesRead = ::pread(
-                    m_fd.Get(),
-                    output + completed,
-                    chunk,
-                    static_cast<off_t>(offset + completed)
-                );
-
-                if (bytesRead < 0) {
-                    if (errno == EINTR) {
-                        continue;
-                    }
-                    throw std::runtime_error(
-                        "Read-only access to \"" + PathText(m_path) +
-                        "\" failed (errno " + std::to_string(errno) + ")"
-                    );
-                }
-
-                if (bytesRead == 0) {
-                    throw std::runtime_error(
-                        "The live file changed while it was being read: " + PathText(m_path)
-                    );
-                }
-
-                completed += static_cast<std::size_t>(bytesRead);
-#endif
             }
         }
 
@@ -525,11 +428,15 @@ namespace {
         }
 
     private:
+        // The file name alone ("Cookies", "Cookies-wal"): enough to say which
+        // file failed, and it never needs a lossy code-page conversion.
+        std::string Name() const {
+            return "\"" + m_path.filename().string() + "\"";
+        }
+
         void Open(bool optional) {
-#ifdef _WIN32
-            const std::wstring nativePath = m_path.wstring();
             HANDLE handle = CreateFileW(
-                nativePath.c_str(),
+                m_path.c_str(),
                 GENERIC_READ,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 nullptr,
@@ -538,88 +445,78 @@ namespace {
                 nullptr
             );
 
-            if (handle == INVALID_HANDLE_VALUE) {
-                const DWORD error = GetLastError();
-
-                // Claude Desktop opens Cookies with no read sharing, so a normal
-                // open fails with a sharing violation. Borrow the handle Desktop
-                // already holds instead of giving up. This is what lets Auto and
-                // Desktop modes read live usage while Desktop is running.
-                if (error == ERROR_SHARING_VIOLATION) {
-                    HANDLE borrowed = DuplicateLockedFileHandle(m_path.wstring());
-                    if (borrowed != INVALID_HANDLE_VALUE) {
-                        // m_handle now OWNS the duplicated handle. UniqueHandle
-                        // closes it via CloseHandle in its destructor, and this
-                        // SharedReadFile lives only for the duration of one
-                        // ReadOnce call, so the borrowed handle is always closed
-                        // as soon as the read finishes - it never leaks to app
-                        // shutdown, and no duplicated handle is ever left open.
-                        m_handle.Reset(borrowed);
-                        return;
-                    }
-                }
-
-                if (optional &&
-                    (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)) {
-                    return;
-                }
-
-                throw std::runtime_error(
-                    "Could not open \"" + PathText(m_path) +
-                    "\" for shared read-only access (Win32 " +
-                    std::to_string(error) + ")"
-                );
+            if (handle != INVALID_HANDLE_VALUE) {
+                m_handle.Reset(handle);
+                return;
             }
 
-            m_handle.Reset(handle);
-#else
-            const int fd = ::open(m_path.c_str(), O_RDONLY | O_CLOEXEC);
-            if (fd < 0) {
-                if (optional && errno == ENOENT) {
+            const DWORD error = GetLastError();
+
+            // Claude Desktop opens Cookies with no read sharing, so a normal
+            // open fails with a sharing violation. Borrow the handle Desktop
+            // already holds instead of giving up. This is what lets Auto and
+            // Desktop modes read live usage while Desktop is running.
+            if (error == ERROR_SHARING_VIOLATION) {
+                HANDLE borrowed = DuplicateLockedFileHandle(m_path.wstring());
+                if (borrowed != INVALID_HANDLE_VALUE) {
+                    // m_handle owns the duplicate, and this object lives for
+                    // one ReadOnce call, so it is closed as soon as the read
+                    // finishes - it never leaks to app shutdown.
+                    m_handle.Reset(borrowed);
+                    m_borrowed = true;
+                    MapBorrowedView();
                     return;
                 }
-
-                throw std::runtime_error(
-                    "Could not open \"" + PathText(m_path) +
-                    "\" for read-only access (errno " +
-                    std::to_string(errno) + ")"
-                );
             }
 
-            m_fd.Reset(fd);
-#endif
+            if (optional &&
+                (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)) {
+                return;
+            }
+
+            throw std::runtime_error(
+                "Could not open " + Name() +
+                " for shared read-only access (Win32 " + std::to_string(error) + ")"
+            );
         }
 
-        std::uint64_t QuerySize() const {
-            if (!Valid()) {
-                return 0;
+        // An explicit size makes the view exactly as long as the file was;
+        // CreateFileMapping rejects an empty file, which then has no view.
+        void MapBorrowedView() {
+            const std::uint64_t size = Size();
+            if (size == 0) {
+                return;
             }
 
-#ifdef _WIN32
-            LARGE_INTEGER size{};
-            if (!GetFileSizeEx(m_handle.Get(), &size) || size.QuadPart < 0) {
+            m_mapping.Reset(CreateFileMappingW(
+                m_handle.Get(),
+                nullptr,
+                PAGE_READONLY,
+                static_cast<DWORD>(size >> 32),
+                static_cast<DWORD>(size & 0xFFFFFFFFULL),
+                nullptr
+            ));
+            void* view = m_mapping.Valid()
+                ? MapViewOfFile(m_mapping.Get(), FILE_MAP_READ, 0, 0, 0)
+                : nullptr;
+
+            if (!view) {
                 throw std::runtime_error(
-                    "Could not read the size of \"" + PathText(m_path) + "\""
+                    "Could not map " + Name() + " read-only (Win32 " +
+                    std::to_string(GetLastError()) + ")"
                 );
             }
-            return static_cast<std::uint64_t>(size.QuadPart);
-#else
-            struct stat info{};
-            if (::fstat(m_fd.Get(), &info) != 0 || info.st_size < 0) {
-                throw std::runtime_error(
-                    "Could not read the size of \"" + PathText(m_path) + "\""
-                );
-            }
-            return static_cast<std::uint64_t>(info.st_size);
-#endif
+
+            m_view = static_cast<const unsigned char*>(view);
+            m_viewSize = size;
         }
 
         std::filesystem::path m_path;
-#ifdef _WIN32
         UniqueHandle m_handle;
-#else
-        UniqueFd m_fd;
-#endif
+        UniqueHandle m_mapping;
+        bool m_borrowed = false;
+        const unsigned char* m_view = nullptr;
+        std::uint64_t m_viewSize = 0;
     };
 
     static std::uint16_t ReadBe16(const unsigned char* data) {
@@ -814,12 +711,8 @@ namespace {
                 value.kind = ValueKind::Real;
                 const std::uint64_t bits = ReadUnsignedBigEndian(payload.data() + dataOffset, 8);
                 static_assert(sizeof(bits) == sizeof(value.real));
+                // bits is already the host-order value of the big-endian bytes.
                 std::memcpy(&value.real, &bits, sizeof(bits));
-#if defined(_WIN32) || defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-                // bits is already the host-order integer representation of the
-                // big-endian bytes. memcpy therefore produces the correct IEEE
-                // value on little-endian and Windows hosts.
-#endif
             }
             else if (serialType == 8 || serialType == 9) {
                 value.kind = ValueKind::Integer;
@@ -949,7 +842,7 @@ namespace {
 
         void RejectActiveRollbackJournal() const {
             if (HasActiveRollbackJournal()) {
-                throw std::runtime_error(
+                throw ChangedDuringRead(
                     "Claude Desktop Cookies database has an active rollback journal; retry after the write completes"
                 );
             }
@@ -1324,29 +1217,6 @@ namespace {
         VisitTablePage(pager, rootPage, 0, visited, visitor);
     }
 
-    static std::string LowerAscii(std::string text) {
-        for (char& character : text) {
-            character = static_cast<char>(
-                std::tolower(static_cast<unsigned char>(character))
-            );
-        }
-        return text;
-    }
-
-    static std::string Trim(std::string text) {
-        auto isSpace = [](unsigned char character) {
-            return std::isspace(character) != 0;
-        };
-
-        while (!text.empty() && isSpace(static_cast<unsigned char>(text.front()))) {
-            text.erase(text.begin());
-        }
-        while (!text.empty() && isSpace(static_cast<unsigned char>(text.back()))) {
-            text.pop_back();
-        }
-        return text;
-    }
-
     static std::vector<std::string> SplitColumnDefinitions(const std::string& createSql) {
         const std::size_t open = createSql.find('(');
         const std::size_t close = createSql.rfind(')');
@@ -1397,25 +1267,25 @@ namespace {
                 }
             }
             else if (character == ',' && parenthesisDepth == 0) {
-                definitions.push_back(Trim(createSql.substr(itemStart, index - itemStart)));
+                definitions.push_back(Text::get_instance()->TrimCopy(createSql.substr(itemStart, index - itemStart)));
                 itemStart = index + 1;
             }
         }
 
         if (itemStart < close) {
-            definitions.push_back(Trim(createSql.substr(itemStart, close - itemStart)));
+            definitions.push_back(Text::get_instance()->TrimCopy(createSql.substr(itemStart, close - itemStart)));
         }
 
         return definitions;
     }
 
     static std::string FirstIdentifier(const std::string& definition) {
-        std::string text = Trim(definition);
+        std::string text = Text::get_instance()->TrimCopy(definition);
         if (text.empty()) {
             return {};
         }
 
-        const std::string lower = LowerAscii(text);
+        const std::string lower = Text::get_instance()->ToLowerCopy(text);
         for (const char* prefix : {
             "constraint ", "primary ", "unique ", "check ", "foreign "
         }) {
@@ -1466,7 +1336,7 @@ namespace {
             if (identifier.empty()) {
                 continue;
             }
-            indexes[LowerAscii(identifier)] = columnIndex++;
+            indexes[Text::get_instance()->ToLowerCopy(identifier)] = columnIndex++;
         }
 
         return indexes;
@@ -1504,7 +1374,7 @@ namespace {
     }
 
     static bool IsClaudeHost(const std::string& host) {
-        std::string lower = LowerAscii(host);
+        std::string lower = Text::get_instance()->ToLowerCopy(host);
         while (!lower.empty() && lower.front() == '.') {
             lower.erase(lower.begin());
         }
@@ -1523,9 +1393,7 @@ namespace {
             isDomainOrSubdomain("claude.com");
     }
 
-    static ReadResult ReadOnce(const std::filesystem::path& cookiePath) {
-        LivePager pager(cookiePath);
-
+    static ReadResult ReadCookies(const LivePager& pager) {
         const std::vector<unsigned char> liveHeader = pager.ReadPage(1);
         if (liveHeader.size() < kDatabaseHeaderSize) {
             throw std::runtime_error("Claude Desktop Cookies database header is truncated");
@@ -1661,40 +1529,100 @@ namespace {
             }
         );
 
-        if (!pager.IsStable()) {
-            throw std::runtime_error(
-                "Claude Desktop changed its Cookies database during the read"
-            );
-        }
-
         ReadResult result;
         result.databaseVersion = databaseVersion;
         result.cookies = std::move(cookies);
         return result;
     }
 
+    // Opening and the header checks fail permanently. After that, a torn read
+    // can surface as any parse error, so a failure only counts as permanent
+    // when the database did not change underneath it.
+    static ReadResult ReadOnce(const std::filesystem::path& cookiePath) {
+        LivePager pager(cookiePath);
+
+        try {
+            ReadResult result = ReadCookies(pager);
+            if (pager.IsStable()) {
+                return result;
+            }
+        }
+        catch (const std::exception&) {
+            if (pager.IsStable()) {
+                throw;
+            }
+        }
+
+        throw ChangedDuringRead("Claude Desktop changed its Cookies database during the read");
+    }
+
 } // namespace
 
 ReadResult ReadLive(const std::filesystem::path& cookiePath) {
-    std::string lastError;
-
-    for (int attempt = 0; attempt < kMaximumConsistencyAttempts; ++attempt) {
+    for (int attempt = 1;; ++attempt) {
         try {
             return ReadOnce(cookiePath);
         }
-        catch (const std::exception& error) {
-            lastError = error.what();
-            if (attempt + 1 < kMaximumConsistencyAttempts) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        catch (const ChangedDuringRead&) {
+            if (attempt >= kMaximumConsistencyAttempts) {
+                throw;
             }
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
         }
     }
+}
 
-    throw std::runtime_error(
-        lastError.empty()
-            ? "Could not read Claude Desktop Cookies database"
-            : lastError
-    );
+std::string ReadSharedText(const std::filesystem::path& path, std::uint64_t maxBytes, bool tail) {
+    UniqueHandle file(CreateFileW(
+        path.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+        nullptr
+    ));
+
+    LARGE_INTEGER size{};
+    if (!file.Valid() || !GetFileSizeEx(file.Get(), &size) || size.QuadPart <= 0) {
+        return {};
+    }
+
+    const std::uint64_t fileSize = static_cast<std::uint64_t>(size.QuadPart);
+    if (fileSize > maxBytes && !tail) {
+        return {};
+    }
+
+    LARGE_INTEGER start{};
+    start.QuadPart = static_cast<LONGLONG>(fileSize > maxBytes ? fileSize - maxBytes : 0);
+    if (!SetFilePointerEx(file.Get(), start, nullptr, FILE_BEGIN)) {
+        return {};
+    }
+
+    std::string text(static_cast<std::size_t>(fileSize - static_cast<std::uint64_t>(start.QuadPart)), '\0');
+    std::size_t total = 0;
+
+    while (total < text.size()) {
+        const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(text.size() - total, 1024 * 1024));
+        DWORD read = 0;
+
+        // A writer truncating the file underneath us just ends the read early.
+        if (!ReadFile(file.Get(), text.data() + total, chunk, &read, nullptr) || read == 0) {
+            break;
+        }
+
+        total += read;
+    }
+
+    text.resize(total);
+
+    // A tail that starts mid-file starts mid-line: drop the partial line.
+    if (start.QuadPart > 0) {
+        const std::size_t newline = text.find('\n');
+        text.erase(0, newline == std::string::npos ? text.size() : newline + 1);
+    }
+
+    return text;
 }
 
 }

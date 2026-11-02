@@ -1,14 +1,13 @@
 #include "Global.hpp"
 
 #include "CodexAppServer.hpp"
+#include "JsonUtils.hpp"
 #include "Network.hpp"
-
-#include <windows.h>
+#include "Text.hpp"
 
 #include <array>
 #include <cwctype>
 #include <limits>
-#include <unordered_map>
 
 using json = nlohmann::json;
 
@@ -69,13 +68,7 @@ namespace {
     };
 
     static std::wstring TrimQuotes(std::wstring value) {
-        while (!value.empty() && std::iswspace(value.front())) {
-            value.erase(value.begin());
-        }
-
-        while (!value.empty() && std::iswspace(value.back())) {
-            value.pop_back();
-        }
+        value = Text::get_instance()->TrimCopy(std::move(value));
 
         if (value.size() >= 2 && value.front() == L'"' && value.back() == L'"') {
             value = value.substr(1, value.size() - 2);
@@ -105,9 +98,9 @@ namespace {
     // Codex Desktop copies its bundled CLI to
     // %LOCALAPPDATA%\OpenAI\Codex\bin\<16 hex>\codex.exe. That copy matches the
     // desktop's protocol; a codex.exe on PATH can be an older standalone CLI.
-    static std::wstring DesktopBundledCodex(const std::string& localAppData) {
+    static std::wstring DesktopBundledCodex(const std::filesystem::path& localAppData) {
         std::error_code ec;
-        const std::filesystem::path bin = std::filesystem::path(localAppData) / "OpenAI" / "Codex" / "bin";
+        const std::filesystem::path bin = localAppData / "OpenAI" / "Codex" / "bin";
         std::wstring newest;
         std::filesystem::file_time_type newestTime{};
 
@@ -134,15 +127,13 @@ namespace {
     static std::wstring FindCodexExecutable() {
         // CODEX_CLI_PATH is the variable Codex Desktop itself honours.
         for (const char* variable : { "CODEX_EXECUTABLE", "CODEX_CLI_PATH" }) {
-            std::string configured = Network::get_instance()->GetEnvText(variable);
+            const std::wstring candidate = TrimQuotes(Network::get_instance()->EnvPath(variable).wstring());
 
-            if (configured.empty()) {
+            if (candidate.empty()) {
                 continue;
             }
 
-            std::wstring candidate = TrimQuotes(Network::get_instance()->Utf8ToWide(configured));
-
-            if (!candidate.empty() && std::filesystem::exists(candidate)) {
+            if (std::filesystem::exists(candidate)) {
                 return candidate;
             }
 
@@ -152,7 +143,7 @@ namespace {
             }
         }
 
-        std::string localAppData = Network::get_instance()->GetEnvText("LOCALAPPDATA");
+        const std::filesystem::path localAppData = Network::get_instance()->EnvPath("LOCALAPPDATA");
         if (!localAppData.empty()) {
             std::wstring bundled = DesktopBundledCodex(localAppData);
             if (!bundled.empty()) {
@@ -166,9 +157,8 @@ namespace {
         }
 
         if (!localAppData.empty()) {
-            std::filesystem::path candidate =
-                std::filesystem::path(localAppData) /
-                "Programs" / "OpenAI" / "Codex" / "bin" / "codex.exe";
+            const std::filesystem::path candidate =
+                localAppData / "Programs" / "OpenAI" / "Codex" / "bin" / "codex.exe";
 
             if (std::filesystem::exists(candidate)) {
                 return candidate.wstring();
@@ -291,7 +281,7 @@ namespace {
     }
 
     static bool LooksLikeUnsupportedMethod(const std::string& message) {
-        std::string lower = Network::get_instance()->ToLowerCopy(message);
+        std::string lower = Text::get_instance()->ToLowerCopy(message);
         return lower.find("method not found") != std::string::npos ||
             lower.find("unknown method") != std::string::npos ||
             lower.find("unsupported method") != std::string::npos ||
@@ -355,33 +345,55 @@ namespace {
                 return false;
             }
 
-            STARTUPINFOW startup{};
-            startup.cb = sizeof(startup);
-            startup.dwFlags = STARTF_USESTDHANDLES;
-            startup.hStdInput = childInput.Get();
-            startup.hStdOutput = childOutput.Get();
-            startup.hStdError = childError.Get();
+            // Only the three pipe ends are inherited, not every inheritable
+            // handle other threads hold at this moment (CRT files included).
+            SIZE_T attributeSize = 0;
+            InitializeProcThreadAttributeList(nullptr, 1, 0, &attributeSize);
+            std::vector<unsigned char> attributeBuffer(attributeSize);
+            const auto attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributeBuffer.data());
+            HANDLE inherited[] = { childInput.Get(), childOutput.Get(), childError.Get() };
+
+            if (!InitializeProcThreadAttributeList(attributes, 1, 0, &attributeSize)) {
+                detail = LastErrorText("Preparing the Codex app-server handle list");
+                return false;
+            }
+
+            STARTUPINFOEXW startup{};
+            startup.StartupInfo.cb = sizeof(startup);
+            startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            startup.StartupInfo.hStdInput = childInput.Get();
+            startup.StartupInfo.hStdOutput = childOutput.Get();
+            startup.StartupInfo.hStdError = childError.Get();
+            startup.lpAttributeList = attributes;
 
             PROCESS_INFORMATION processInfo{};
             std::wstring commandLine = L"\"" + executable + L"\" app-server";
             std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
             mutableCommand.push_back(L'\0');
 
-            BOOL created = CreateProcessW(
-                executable.c_str(),
-                mutableCommand.data(),
-                nullptr,
-                nullptr,
-                TRUE,
-                CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-                nullptr,
-                nullptr,
-                &startup,
-                &processInfo
-            );
+            const BOOL created =
+                UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                    inherited, sizeof(inherited), nullptr, nullptr) &&
+                CreateProcessW(
+                    executable.c_str(),
+                    mutableCommand.data(),
+                    nullptr,
+                    nullptr,
+                    TRUE,
+                    CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                    nullptr,
+                    nullptr,
+                    &startup.StartupInfo,
+                    &processInfo
+                );
 
             if (!created) {
                 detail = LastErrorText("Starting Codex app-server");
+            }
+
+            DeleteProcThreadAttributeList(attributes);
+
+            if (!created) {
                 return false;
             }
 
@@ -435,18 +447,12 @@ namespace {
                         return true;
                     }
 
-                    detail = "Codex app-server exited with code " + std::to_string(exitCode);
-                    if (!m_stderrBuffer.empty()) {
-                        detail += ": " + m_stderrBuffer;
-                    }
+                    detail = "Codex app-server exited with code " + std::to_string(exitCode) + StderrTail();
                     return false;
                 }
 
                 if (GetTickCount64() >= deadline) {
-                    detail = "Timed out waiting for Codex app-server response";
-                    if (!m_stderrBuffer.empty()) {
-                        detail += ": " + m_stderrBuffer;
-                    }
+                    detail = "Timed out waiting for Codex app-server response" + StderrTail();
                     return false;
                 }
 
@@ -455,24 +461,39 @@ namespace {
         }
 
         void Stop() {
+            // Our pipe ends close first, so a child still writing while it
+            // shuts down gets a broken pipe instead of blocking on a full one.
             m_stdinWrite.Reset();
-
-            if (m_process.Valid()) {
-                DWORD exitCode = STILL_ACTIVE;
-                if (GetExitCodeProcess(m_process.Get(), &exitCode) && exitCode == STILL_ACTIVE) {
-                    if (WaitForSingleObject(m_process.Get(), 250) == WAIT_TIMEOUT) {
-                        TerminateProcess(m_process.Get(), 0);
-                        WaitForSingleObject(m_process.Get(), 1000);
-                    }
-                }
-            }
-
             m_stdoutRead.Reset();
             m_stderrRead.Reset();
+
+            if (m_process.Valid() && WaitForSingleObject(m_process.Get(), 250) == WAIT_TIMEOUT) {
+                TerminateProcess(m_process.Get(), 0);
+                WaitForSingleObject(m_process.Get(), 1000);
+            }
+
             m_process.Reset();
         }
 
     private:
+        // ": <last stderr line>", capped: enough to say why without pasting a
+        // log into the status text, where IsRateLimitText would read it too.
+        std::string StderrTail() const {
+            std::string line = Text::get_instance()->TrimCopy(m_stderrBuffer);
+            line.erase(0, line.find_last_of("\r\n") + 1);
+
+            if (line.size() > 200) {
+                line.resize(200);
+
+                // Never end inside a UTF-8 sequence.
+                while (!line.empty() && (static_cast<unsigned char>(line.back()) & 0x80) != 0) {
+                    line.pop_back();
+                }
+            }
+
+            return line.empty() ? std::string{} : ": " + line;
+        }
+
         bool ParseStdoutLines(std::string& detail) {
             for (;;) {
                 size_t newline = m_stdoutBuffer.find('\n');
@@ -502,20 +523,14 @@ namespace {
                     continue;
                 }
 
-                if (!message.contains("id")) {
+                // A response has an id and no method; a server-to-client
+                // request (experimentalApi invites them) has both.
+                if (!message.contains("id") || message.contains("method") || !message.at("id").is_number_integer()) {
                     continue;
                 }
 
-                const json& idValue = message.at("id");
-                if (idValue.is_number_integer()) {
-                    m_responses[idValue.get<long long>()] = std::move(message);
-                }
-                else if (idValue.is_number_unsigned()) {
-                    unsigned long long value = idValue.get<unsigned long long>();
-                    if (value <= static_cast<unsigned long long>(std::numeric_limits<long long>::max())) {
-                        m_responses[static_cast<long long>(value)] = std::move(message);
-                    }
-                }
+                const long long id = message.at("id").get<long long>();
+                m_responses[id] = std::move(message);
             }
         }
 
@@ -683,6 +698,41 @@ Result ReadCurrentAccountRateLimits() {
     result.accountResult = std::move(accountResult);
     result.rateLimitsResult = rateLimitsResponse.at("result");
     result.configResult = std::move(configResult);
+
+    // Optional, like config/read: the token Codex Desktop itself uses for
+    // backend calls (never a forced refresh), and the signed-in sessions.
+    std::string optionalDetail;
+    json authResponse;
+    if (server.Send(json{
+        { "method", "getAuthStatus" },
+        { "id", 5 },
+        { "params", { { "includeToken", true }, { "refreshToken", false } } }
+    }, optionalDetail) &&
+        server.WaitForResponse(5, authResponse, 5000, optionalDetail) &&
+        authResponse.contains("result") && authResponse.at("result").is_object()) {
+        // A null authMethod (signed out) must not throw out of the whole read.
+        const json& auth = authResponse.at("result");
+        const std::string method = JsonUtils::get_instance()->String(auth, "authMethod");
+
+        if (method == "chatgpt" || method == "chatgptAuthTokens") {
+            result.authToken = JsonUtils::get_instance()->String(auth, "authToken");
+        }
+    }
+
+    json sessionsResponse;
+    if (server.Send(json{
+        { "method", "accountSession/list" },
+        { "id", 6 },
+        { "params", { { "refreshWorkspaceMetadata", false } } }
+    }, optionalDetail) &&
+        server.WaitForResponse(6, sessionsResponse, 5000, optionalDetail) &&
+        sessionsResponse.contains("result") && sessionsResponse.at("result").is_object()) {
+        const json& sessions = sessionsResponse.at("result");
+        if (sessions.contains("sessions") && sessions.at("sessions").is_array()) {
+            result.sessionCount = static_cast<int>(sessions.at("sessions").size());
+        }
+    }
+
     return result;
 }
 

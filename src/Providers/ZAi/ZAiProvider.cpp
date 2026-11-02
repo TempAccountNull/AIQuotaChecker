@@ -1,8 +1,8 @@
 #include "Global.hpp"
 #include "ZAiProvider.hpp"
 
-#include "ZAiNotifier.hpp"
 #include "Network.hpp"
+#include "Text.hpp"
 
 #include <exception>
 #include <string>
@@ -11,13 +11,30 @@
 
 namespace
 {
-
-    static ZAiNotifier::QuotaWarningRule ToNotifierRule(const AppSettings::QuotaWarningRule& src)
+    // GLM-5-Turbo has its own rule; every Coding Plan window (GLM-5.3,
+    // GLM-5.3-Flash, the shared 5-hour and weekly windows) uses the main one.
+    std::vector<QuotaNotifier::Point> ZAiPoints(const ZAi::Snapshot& snapshot, const AppSettings::ZAiQuotaWarnings& rules)
     {
-        ZAiNotifier::QuotaWarningRule rule;
-        rule.enabled = src.enabled;
-        rule.percent = src.percent;
-        return rule;
+        std::vector<QuotaNotifier::Point> points;
+
+        for (const ZAi::UsageBar& bar : snapshot.bars) {
+            if (!bar.valid) {
+                continue;
+            }
+
+            QuotaNotifier::Point point;
+            point.key = bar.identity.empty() ? bar.label : bar.identity;
+            point.name = bar.label;
+            point.leftNoun = "balance";
+            point.usedPercent = bar.usedPercent;
+            point.resetAtUnixSeconds = bar.resetAtUnixSeconds;
+            point.rule = Text::get_instance()->CompactLower(bar.label).find("turbo") != std::string::npos
+                ? rules.turbo
+                : rules.glm52;
+            points.push_back(std::move(point));
+        }
+
+        return points;
     }
 }
 
@@ -71,18 +88,7 @@ void ZAiProvider::SaveSettings(AppSettings::Settings& settings) const
 
 void ZAiProvider::ApplyRuntime(NotifyPosition position, int quotaRepeatSeconds)
 {
-    ZAiNotifier::SetPosition(position);
-
-    ZAiNotifier::Config cfg;
-    cfg.enabled = m_notifySettings.enabled;
-    cfg.prepareReset = m_notifySettings.prepareReset;
-    cfg.exactReset = m_notifySettings.exactReset;
-    cfg.prepareMinutes = m_notifySettings.prepareMinutes;
-    cfg.glm52 = ToNotifierRule(m_quotaWarnings.glm52);
-    cfg.turbo = ToNotifierRule(m_quotaWarnings.turbo);
-
-    ZAiNotifier::SetConfig(cfg);
-    ZAiNotifier::SetQuotaNotificationRepeatSeconds(quotaRepeatSeconds);
+    m_notifier.Configure(position, m_notifySettings, quotaRepeatSeconds);
 }
 
 void ZAiProvider::HandleRateLimit(const std::string& detail)
@@ -177,12 +183,14 @@ void ZAiProvider::RefreshContextAsync()
 
 void ZAiProvider::PollNotifications()
 {
-    ZAi::Snapshot snapshot;
+    std::vector<QuotaNotifier::Point> points;
 
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        snapshot = m_snapshot;
+        points = ZAiPoints(m_snapshot, m_quotaWarnings);
     }
 
-    ZAiNotifier::Poll(snapshot);
+    if (m_notifier.Poll(points)) {
+        RefreshAsync();
+    }
 }

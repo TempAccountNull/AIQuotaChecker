@@ -1,23 +1,11 @@
 #include "Global.hpp"
 #include "GrokProvider.hpp"
 
-#include "GrokNotifier.hpp"
 #include "Network.hpp"
 
 #include <exception>
 #include <string>
 #include <thread>
-
-namespace
-{
-    static GrokNotifier::QuotaWarningRule ToNotifierRule(const AppSettings::QuotaWarningRule& src)
-    {
-        GrokNotifier::QuotaWarningRule rule;
-        rule.enabled = src.enabled;
-        rule.percent = src.percent;
-        return rule;
-    }
-}
 
 GrokProvider* GrokProvider::get_instance()
 {
@@ -69,17 +57,7 @@ void GrokProvider::SaveSettings(AppSettings::Settings& settings) const
 
 void GrokProvider::ApplyRuntime(NotifyPosition position, int quotaRepeatSeconds)
 {
-    GrokNotifier::SetPosition(position);
-
-    GrokNotifier::Config cfg;
-    cfg.enabled = m_notifySettings.enabled;
-    cfg.prepareReset = m_notifySettings.prepareReset;
-    cfg.exactReset = m_notifySettings.exactReset;
-    cfg.prepareMinutes = m_notifySettings.prepareMinutes;
-    cfg.weekly = ToNotifierRule(m_quotaWarnings.weekly);
-
-    GrokNotifier::SetConfig(cfg);
-    GrokNotifier::SetQuotaNotificationRepeatSeconds(quotaRepeatSeconds);
+    m_notifier.Configure(position, m_notifySettings, quotaRepeatSeconds);
 }
 
 void GrokProvider::HandleRateLimit(const std::string& detail)
@@ -87,11 +65,6 @@ void GrokProvider::HandleRateLimit(const std::string& detail)
     if (m_rateLimitCallback) {
         m_rateLimitCallback("Grok", detail);
     }
-}
-
-void GrokProvider::RefreshThunk()
-{
-    GrokProvider::get_instance()->RefreshAsync();
 }
 
 void GrokProvider::RefreshAsync()
@@ -135,12 +108,23 @@ void GrokProvider::RefreshAsync()
 
 void GrokProvider::PollNotifications()
 {
-    Grok::Snapshot snapshot;
+    std::vector<QuotaNotifier::Point> points;
 
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        snapshot = m_snapshot;
+
+        if (m_snapshot.weeklyLimit.valid) {
+            QuotaNotifier::Point point;
+            point.key = "weekly";
+            point.name = "weekly limit";
+            point.usedPercent = m_snapshot.weeklyLimit.usedPercent;
+            point.resetAtUnixSeconds = m_snapshot.weeklyLimit.resetAtUnixSeconds;
+            point.rule = m_quotaWarnings.weekly;
+            points.push_back(std::move(point));
+        }
     }
 
-    GrokNotifier::Poll(snapshot, &GrokProvider::RefreshThunk);
+    if (m_notifier.Poll(points)) {
+        RefreshAsync();
+    }
 }

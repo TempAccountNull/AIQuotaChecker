@@ -3,6 +3,7 @@
 
 #include <cctype>
 
+#include "Format.hpp"
 #include "JsonUtils.hpp"
 #include "Math.hpp"
 #include "Network.hpp"
@@ -10,9 +11,7 @@
 
 #include <algorithm>
 #include <filesystem>
-#include <iomanip>
 #include <optional>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -59,51 +58,24 @@ namespace Grok
             return {};
         }
 
-        static std::string FormatMoneyFromCents(double cents)
+        // Weekly and monthly pools get their own wording; anything else is
+        // the generic pool.
+        static void DescribePeriod(UsageWindow& window, const std::string& type)
         {
-            double dollars = cents / 100.0;
+            const std::string lower = Text::get_instance()->ToLowerCopy(type);
 
-            std::ostringstream out;
-            out << '$' << std::fixed << std::setprecision(2) << dollars;
-            return out.str();
-        }
-
-        static bool IsWeeklyPeriod(const std::string& type)
-        {
-            std::string lower = Text::get_instance()->ToLowerCopy(type);
-            return lower.find("weekly") != std::string::npos;
-        }
-
-        static bool IsMonthlyPeriod(const std::string& type)
-        {
-            std::string lower = Text::get_instance()->ToLowerCopy(type);
-            return lower.find("monthly") != std::string::npos;
-        }
-
-        static std::string PeriodTitle(const std::string& type)
-        {
-            if (IsWeeklyPeriod(type)) {
-                return "Weekly Limit";
+            if (lower.find("weekly") != std::string::npos) {
+                window.title = "Weekly Limit";
+                window.subtitle = "Shared Grok usage pool";
             }
-
-            if (IsMonthlyPeriod(type)) {
-                return "Monthly Limit";
+            else if (lower.find("monthly") != std::string::npos) {
+                window.title = "Monthly Limit";
+                window.subtitle = "Monthly Grok usage pool";
             }
-
-            return "Usage";
-        }
-
-        static std::string PeriodSubtitle(const std::string& type)
-        {
-            if (IsWeeklyPeriod(type)) {
-                return "Shared Grok usage pool";
+            else {
+                window.title = "Usage";
+                window.subtitle = "Grok usage pool";
             }
-
-            if (IsMonthlyPeriod(type)) {
-                return "Monthly Grok usage pool";
-            }
-
-            return "Grok usage pool";
         }
 
         static const Json* FindAuthEntry(const Json& root, const std::string& scope)
@@ -116,11 +88,16 @@ namespace Grok
             return entry.is_object() ? &entry : nullptr;
         }
 
-        static GrokAuth LoadAuthFromFile()
+        static GrokAuth LoadAuthFromFile(const std::filesystem::path& authPath)
         {
-            std::filesystem::path authPath = Network::get_instance()->UserProfilePath() / ".grok" / "auth.json";
-            std::string text = Network::get_instance()->ReadRequiredTextFile(authPath);
-            Json root = JsonUtils::get_instance()->ParseRequired(text);
+            // A parse error message would quote the file, token included.
+            const Json root = JsonUtils::get_instance()->ParseOrNull(
+                Network::get_instance()->ReadRequiredTextFile(authPath)
+            );
+
+            if (!root.is_object()) {
+                throw std::runtime_error("%USERPROFILE%\\.grok\\auth.json is not valid JSON");
+            }
 
             const Json* entry = FindAuthEntry(root, kOidcScope);
 
@@ -157,10 +134,11 @@ namespace Grok
         {
             // The signed-in CLI account is represented by auth.json. Prefer it over
             // inherited environment variables that can still reference an old account.
-            std::filesystem::path authPath = Network::get_instance()->UserProfilePath() / ".grok" / "auth.json";
+            const std::filesystem::path authPath = Network::get_instance()->UserProfilePath() / ".grok" / "auth.json";
+            std::error_code ec;
 
-            if (std::filesystem::exists(authPath)) {
-                return LoadAuthFromFile();
+            if (std::filesystem::exists(authPath, ec)) {
+                return LoadAuthFromFile(authPath);
             }
 
             GrokAuth auth;
@@ -176,6 +154,7 @@ namespace Grok
 
         static std::wstring BuildHeaders(const GrokAuth& auth)
         {
+            const std::string version = kClientVersion;
             std::string headers;
             headers += "Authorization: Bearer " + Network::get_instance()->StripHeaderValue(auth.key) + "\r\n";
             headers += "X-Xai-Token-Auth: xai-grok-cli\r\n";
@@ -184,82 +163,17 @@ namespace Grok
                 headers += "X-Userid: " + Network::get_instance()->StripHeaderValue(auth.userId) + "\r\n";
             }
 
-            headers += "X-Grok-Client-Version: ";
-            headers += kClientVersion;
-            headers += "\r\n";
+            headers += "X-Grok-Client-Version: " + version + "\r\n";
             headers += "Accept: */*\r\n";
             headers += "Accept-Encoding: gzip, deflate\r\n";
-            headers += "User-Agent: grok-pager/0.2.87 grok-shell/0.2.87 (windows; x86_64)\r\n";
+            headers += "User-Agent: grok-pager/" + version + " grok-shell/" + version + " (windows; x86_64)\r\n";
 
             return Network::get_instance()->Utf8ToWide(headers);
-        }
-
-        static bool HasProductUsagePercent(const Json& config)
-        {
-            if (!config.is_object() || !config.contains("productUsage") ||
-                !config.at("productUsage").is_array()) {
-                return false;
-            }
-
-            for (const Json& item : config.at("productUsage")) {
-                if (item.is_object() && JsonUtils::get_instance()->NumberOpt(item, "usagePercent")) {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        static float ProductUsageFallback(const Json& config)
-        {
-            if (!config.is_object() || !config.contains("productUsage") || !config.at("productUsage").is_array()) {
-                return 0.0f;
-            }
-
-            double highest = 0.0;
-
-            for (const Json& item : config.at("productUsage")) {
-                if (!item.is_object()) {
-                    continue;
-                }
-
-                std::optional<double> value = JsonUtils::get_instance()->NumberOpt(item, "usagePercent");
-
-                if (value) {
-                    highest = std::max(highest, *value);
-                }
-            }
-
-            return static_cast<float>(Math::get_instance()->ClampPercentDouble(highest));
-        }
-
-        static void AddProductUsage(Snapshot& snapshot, const Json& config)
-        {
-            if (!config.is_object() || !config.contains("productUsage") || !config.at("productUsage").is_array()) {
-                return;
-            }
-
-            for (const Json& item : config.at("productUsage")) {
-                if (!item.is_object()) {
-                    continue;
-                }
-
-                ProductUsage usage;
-                usage.product = JsonUtils::get_instance()->String(item, "product");
-                usage.usagePercent = static_cast<float>(Math::get_instance()->ClampPercentDouble(
-                    JsonUtils::get_instance()->Number(item, "usagePercent", 0.0)
-                ));
-
-                if (!usage.product.empty()) {
-                    snapshot.products.push_back(usage);
-                }
-            }
         }
 
         static Snapshot ParseBillingResponse(const Json& root)
         {
             Snapshot snapshot;
-            snapshot.plan = "Grok";
             snapshot.statusText = "Updated";
             snapshot.lastUpdated = "just now";
 
@@ -274,18 +188,43 @@ namespace Grok
                 currentPeriod = &config.at("currentPeriod");
             }
 
-            std::string periodType = currentPeriod ? JsonUtils::get_instance()->String(*currentPeriod, "type") : std::string();
+            // productUsage: per-product percentages. The highest stands in for
+            // a missing creditUsagePercent.
+            bool hasProductPercent = false;
+            double highestProductPercent = 0.0;
 
-            bool hasUsagePercent =
+            if (config.contains("productUsage") && config.at("productUsage").is_array()) {
+                for (const Json& item : config.at("productUsage")) {
+                    const std::optional<double> percent = JsonUtils::get_instance()->NumberOpt(item, "usagePercent");
+
+                    if (percent) {
+                        hasProductPercent = true;
+                        highestProductPercent = std::max(highestProductPercent, *percent);
+                    }
+
+                    ProductUsage usage;
+                    usage.product = JsonUtils::get_instance()->String(item, "product");
+                    usage.usagePercent = static_cast<float>(
+                        Math::get_instance()->ClampPercentDouble(percent.value_or(0.0)));
+
+                    if (!usage.product.empty()) {
+                        snapshot.products.push_back(usage);
+                    }
+                }
+            }
+
+            const bool hasUsagePercent =
                 JsonUtils::get_instance()->NumberOpt(config, "creditUsagePercent").has_value() ||
-                HasProductUsagePercent(config);
-            bool hasPeriod = currentPeriod != nullptr || config.contains("billingPeriodEnd");
+                hasProductPercent;
+            const bool hasPeriod = currentPeriod != nullptr || config.contains("billingPeriodEnd");
 
             snapshot.weeklyLimit.valid = hasUsagePercent || hasPeriod;
-            snapshot.weeklyLimit.title = PeriodTitle(periodType);
-            snapshot.weeklyLimit.subtitle = PeriodSubtitle(periodType);
+            DescribePeriod(
+                snapshot.weeklyLimit,
+                currentPeriod ? JsonUtils::get_instance()->String(*currentPeriod, "type") : std::string()
+            );
             snapshot.weeklyLimit.usedPercent = static_cast<float>(Math::get_instance()->ClampPercentDouble(
-                JsonUtils::get_instance()->Number(config, "creditUsagePercent", ProductUsageFallback(config))
+                JsonUtils::get_instance()->Number(config, "creditUsagePercent", highestProductPercent)
             ));
 
             if (currentPeriod) {
@@ -300,26 +239,19 @@ namespace Grok
                 snapshot.weeklyLimit.resetText = "Resets";
             }
 
-            double prepaidBalance = 0.0;
+            // Both amounts are in cents.
+            const bool hasPrepaid = config.contains("prepaidBalance") && config.at("prepaidBalance").is_object();
+            const bool hasOnDemand = config.contains("onDemandUsed") && config.at("onDemandUsed").is_object();
+            const double prepaidBalance = hasPrepaid
+                ? JsonUtils::get_instance()->Number(config.at("prepaidBalance"), "val", 0.0)
+                : 0.0;
+            const double onDemandUsed = hasOnDemand
+                ? JsonUtils::get_instance()->Number(config.at("onDemandUsed"), "val", 0.0)
+                : 0.0;
 
-            if (config.contains("prepaidBalance") && config.at("prepaidBalance").is_object()) {
-                prepaidBalance = JsonUtils::get_instance()->Number(config.at("prepaidBalance"), "val", 0.0);
-            }
-
-            double onDemandUsed = 0.0;
-
-            if (config.contains("onDemandUsed") && config.at("onDemandUsed").is_object()) {
-                onDemandUsed = JsonUtils::get_instance()->Number(config.at("onDemandUsed"), "val", 0.0);
-            }
-
-            snapshot.extraCredits.valid =
-                (config.contains("prepaidBalance") && config.at("prepaidBalance").is_object()) ||
-                (config.contains("onDemandUsed") && config.at("onDemandUsed").is_object());
-            snapshot.extraCredits.balanceText = FormatMoneyFromCents(prepaidBalance);
-            snapshot.extraCredits.usedText = FormatMoneyFromCents(onDemandUsed);
-            snapshot.extraCredits.usedPercent = 0.0f;
-
-            AddProductUsage(snapshot, config);
+            snapshot.extraCredits.valid = hasPrepaid || hasOnDemand;
+            snapshot.extraCredits.balanceText = Format::get_instance()->Dollars(prepaidBalance / 100.0);
+            snapshot.extraCredits.usedText = Format::get_instance()->Dollars(onDemandUsed / 100.0);
 
             if (!snapshot.weeklyLimit.valid && !snapshot.extraCredits.valid &&
                 snapshot.products.empty()) {
@@ -374,8 +306,6 @@ namespace Grok
         catch (const std::exception& e) {
             snapshot.statusText = std::string("Grok error: ") + e.what();
             snapshot.access = UsageTelemetry::FromText(snapshot.statusText);
-            snapshot.weeklyLimit.valid = false;
-            snapshot.extraCredits.valid = false;
             return snapshot;
         }
     }

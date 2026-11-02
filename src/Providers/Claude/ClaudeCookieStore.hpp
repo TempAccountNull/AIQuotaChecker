@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -25,5 +26,11 @@ namespace ClaudeCookieStore {
     // The implementation is strictly read-only: it does not copy, snapshot,
     // rename, create, modify, or persist any credential-bearing file.
     ReadResult ReadLive(const std::filesystem::path& cookiePath);
+
+    // Reads a text file another process may be writing without ever getting
+    // in its way: its own handle, shared read/write/delete, read-only. tail
+    // keeps the last maxBytes, starting at a line boundary; otherwise a larger
+    // file reads as empty. Empty on any failure.
+    std::string ReadSharedText(const std::filesystem::path& path, std::uint64_t maxBytes, bool tail = false);
 
 }

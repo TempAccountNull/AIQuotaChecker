@@ -19,6 +19,11 @@ namespace Network
         bool IsRateLimitText(const std::string& text) const;
 
         std::string GetEnvText(const char* name) const;
+        // Path-valued variables, read from the wide environment so folders
+        // outside the ANSI code page survive. Empty when unset.
+        std::filesystem::path EnvPath(const char* name) const;
+        // Text-valued variables, likewise read wide, returned as UTF-8.
+        std::string EnvText(const char* name) const;
         std::filesystem::path UserProfilePath() const;
         std::string ReadTextFile(const std::filesystem::path& path) const;
         std::string ReadRequiredTextFile(const std::filesystem::path& path) const;
@@ -50,21 +55,17 @@ namespace Network
             const std::string& body = {},
             bool followRedirects = true
         ) const;
+
+        // RequestUrl for best-effort calls: a transport failure (offline,
+        // timeout, TLS) comes back as status 0 instead of an exception.
+        HttpResponse TryRequestUrl(
+            const std::string& url,
+            const std::string& method,
+            const std::wstring& headers,
+            const std::string& body = {},
+            bool followRedirects = true
+        ) const;
     };
 
     Client* get_instance();
-
-    // Compatibility wrappers for older call sites while refactors move to get_instance()->.
-    std::string ToLowerCopy(std::string text);
-    bool IsRateLimitText(const std::string& text);
-    std::string GetEnvText(const char* name);
-    std::filesystem::path UserProfilePath();
-    std::string ReadTextFile(const std::filesystem::path& path);
-    std::string ReadRequiredTextFile(const std::filesystem::path& path);
-    std::wstring Utf8ToWide(const std::string& value);
-    std::string StripHeaderValue(std::string value);
-    std::wstring JsonHeaders(const std::string& authorizationHeader, const std::string& origin, const std::string& referer);
-    std::wstring BearerJsonHeaders(const std::string& token, const std::string& origin, const std::string& referer);
-    std::wstring RawAuthorizationJsonHeaders(const std::string& token, const std::string& origin, const std::string& referer);
-    HttpResponse RequestUrl(const std::string& url, const std::string& method, const std::wstring& headers, const std::string& body = {}, bool followRedirects = true);
 }

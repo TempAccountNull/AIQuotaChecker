@@ -42,19 +42,4 @@ namespace UsageWindowModel
         return window_;
     }
 
-    Claude::UsageWindow Placeholder(const std::string& title, const std::string& subtitle, bool valid)
-    {
-        return Builder()
-            .Title(title)
-            .Subtitle(subtitle)
-            .UsedPercent(0.0f)
-            .Reset(0, "")
-            .Valid(valid)
-            .Build();
-    }
-
-    Claude::UsageWindow FablePlaceholder()
-    {
-        return Placeholder("Fable", "You haven't used Fable yet", true);
-    }
 }

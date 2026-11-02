@@ -4,6 +4,7 @@
 #include "ClaudeCookieStore.hpp"
 #include "JsonUtils.hpp"
 #include "Network.hpp"
+#include "Text.hpp"
 
 #include <bcrypt.h>
 #include <wincrypt.h>
@@ -12,7 +13,6 @@
 #include <array>
 #include <limits>
 #include <optional>
-#include <sstream>
 #include <utility>
 
 #pragma comment(lib, "bcrypt.lib")
@@ -24,15 +24,9 @@ namespace ClaudeDesktopAuth {
 namespace {
 
     constexpr long long kChromeEpochOffsetMicroseconds = 11644473600000000LL;
+    constexpr std::uint64_t kMaximumJsonBytes = 64ULL * 1024ULL * 1024ULL;
 
-    struct CookieRecord {
-        std::string name;
-        std::string hostKey;
-        std::string value;
-        long long expiresUtc = 0;
-        long long lastAccessUtc = 0;
-        long long creationUtc = 0;
-    };
+    using Cookie = ClaudeCookieStore::RawCookie;
 
     struct DesktopIdentity {
         std::string organizationId;
@@ -46,250 +40,6 @@ namespace {
         using namespace std::chrono;
         const long long unixMicros = duration_cast<microseconds>(system_clock::now().time_since_epoch()).count();
         return unixMicros + kChromeEpochOffsetMicroseconds;
-    }
-
-    static std::string ToLowerAscii(std::string text) {
-        for (char& c : text) {
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        }
-        return text;
-    }
-
-    static std::string WideToUtf8(const std::wstring& value) {
-        if (value.empty()) {
-            return {};
-        }
-
-        int needed = WideCharToMultiByte(
-            CP_UTF8,
-            0,
-            value.data(),
-            static_cast<int>(value.size()),
-            nullptr,
-            0,
-            nullptr,
-            nullptr
-        );
-
-        if (needed <= 0) {
-            throw std::runtime_error("Could not convert a Claude Desktop path to UTF-8");
-        }
-
-        std::string output(static_cast<size_t>(needed), '\0');
-
-        if (WideCharToMultiByte(
-            CP_UTF8,
-            0,
-            value.data(),
-            static_cast<int>(value.size()),
-            output.data(),
-            needed,
-            nullptr,
-            nullptr
-        ) != needed) {
-            throw std::runtime_error("Could not convert a Claude Desktop path to UTF-8");
-        }
-
-        return output;
-    }
-
-
-    class UniqueHandle final {
-    public:
-        UniqueHandle() = default;
-        explicit UniqueHandle(HANDLE handle) : m_handle(handle) {}
-
-        ~UniqueHandle() {
-            Reset();
-        }
-
-        UniqueHandle(const UniqueHandle&) = delete;
-        UniqueHandle& operator=(const UniqueHandle&) = delete;
-
-        UniqueHandle(UniqueHandle&& other) noexcept
-            : m_handle(other.Release()) {
-        }
-
-        UniqueHandle& operator=(UniqueHandle&& other) noexcept {
-            if (this != &other) {
-                Reset(other.Release());
-            }
-            return *this;
-        }
-
-        bool Valid() const {
-            return m_handle != nullptr && m_handle != INVALID_HANDLE_VALUE;
-        }
-
-        HANDLE Get() const {
-            return m_handle;
-        }
-
-        HANDLE Release() {
-            HANDLE handle = m_handle;
-            m_handle = INVALID_HANDLE_VALUE;
-            return handle;
-        }
-
-        void Reset(HANDLE handle = INVALID_HANDLE_VALUE) {
-            if (Valid()) {
-                CloseHandle(m_handle);
-            }
-            m_handle = handle;
-        }
-
-    private:
-        HANDLE m_handle = INVALID_HANDLE_VALUE;
-    };
-
-    static std::string TrimWindowsMessage(std::wstring message) {
-        while (!message.empty() &&
-               (message.back() == L'\r' || message.back() == L'\n' ||
-                message.back() == L' ' || message.back() == L'\t')) {
-            message.pop_back();
-        }
-
-        return WideToUtf8(message);
-    }
-
-    static std::string Win32Failure(
-        const std::string& operation,
-        const std::filesystem::path& path,
-        DWORD error
-    ) {
-        wchar_t* rawMessage = nullptr;
-        DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER |
-            FORMAT_MESSAGE_FROM_SYSTEM |
-            FORMAT_MESSAGE_IGNORE_INSERTS;
-
-        DWORD length = FormatMessageW(
-            flags,
-            nullptr,
-            error,
-            MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-            reinterpret_cast<LPWSTR>(&rawMessage),
-            0,
-            nullptr
-        );
-
-        std::wstring message;
-        if (length > 0 && rawMessage) {
-            message.assign(rawMessage, rawMessage + length);
-        }
-
-        if (rawMessage) {
-            LocalFree(rawMessage);
-        }
-
-        std::ostringstream detail;
-        detail << operation << " \"" << path.string() << "\" failed (Win32 "
-               << error << ")";
-
-        if (!message.empty()) {
-            detail << ": " << TrimWindowsMessage(std::move(message));
-        }
-
-        return detail.str();
-    }
-
-    static UniqueHandle OpenSharedReadHandle(
-        const std::filesystem::path& path,
-        bool optional
-    ) {
-        const std::wstring nativePath = path.wstring();
-
-        HANDLE handle = CreateFileW(
-            nativePath.c_str(),
-            GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            nullptr,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
-            nullptr
-        );
-
-        if (handle == INVALID_HANDLE_VALUE) {
-            DWORD error = GetLastError();
-
-            if (optional &&
-                (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)) {
-                return {};
-            }
-
-            throw std::runtime_error(
-                Win32Failure("Opening shared Claude Desktop file", path, error)
-            );
-        }
-
-        return UniqueHandle(handle);
-    }
-
-    static std::string ReadTextFileWithSharedRead(
-        const std::filesystem::path& path,
-        size_t maximumBytes
-    ) {
-        UniqueHandle source = OpenSharedReadHandle(path, false);
-
-        LARGE_INTEGER sourceSize{};
-        if (!GetFileSizeEx(source.Get(), &sourceSize) || sourceSize.QuadPart < 0) {
-            throw std::runtime_error(
-                Win32Failure(
-                    "Reading Claude Desktop file size",
-                    path,
-                    GetLastError()
-                )
-            );
-        }
-
-        if (static_cast<unsigned long long>(sourceSize.QuadPart) >
-            static_cast<unsigned long long>(maximumBytes)) {
-            throw std::runtime_error(
-                "Claude Desktop file is unexpectedly large: " + path.string()
-            );
-        }
-
-        std::string output(
-            static_cast<size_t>(sourceSize.QuadPart),
-            '\0'
-        );
-
-        size_t offset = 0;
-        while (offset < output.size()) {
-            DWORD request = static_cast<DWORD>(
-                std::min<size_t>(
-                    output.size() - offset,
-                    1024 * 1024
-                )
-            );
-
-            DWORD bytesRead = 0;
-            if (!ReadFile(
-                source.Get(),
-                output.data() + offset,
-                request,
-                &bytesRead,
-                nullptr
-            )) {
-                throw std::runtime_error(
-                    Win32Failure(
-                        "Reading shared Claude Desktop file",
-                        path,
-                        GetLastError()
-                    )
-                );
-            }
-
-            if (bytesRead == 0) {
-                throw std::runtime_error(
-                    "Claude Desktop changed \"" + path.string() +
-                    "\" while it was being read"
-                );
-            }
-
-            offset += static_cast<size_t>(bytesRead);
-        }
-
-        return output;
     }
 
     static std::filesystem::path ClaudeDesktopUserDataPath() {
@@ -374,6 +124,7 @@ namespace {
         }
 
         std::vector<unsigned char> result(output.pbData, output.pbData + output.cbData);
+        SecureZeroMemory(output.pbData, output.cbData);
         LocalFree(output.pbData);
         return result;
     }
@@ -461,39 +212,15 @@ namespace {
         return Sha256(reinterpret_cast<const unsigned char*>(value.data()), value.size());
     }
 
-    static std::vector<unsigned char> RandomBytes(size_t size) {
-        if (size > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
-            throw std::runtime_error("Claude Desktop random request is too large");
-        }
-
-        std::vector<unsigned char> output(size);
-
-        if (size > 0) {
-            NTSTATUS status = BCryptGenRandom(
-                nullptr,
-                output.data(),
-                static_cast<ULONG>(output.size()),
-                BCRYPT_USE_SYSTEM_PREFERRED_RNG
-            );
-
-            if (status < 0) {
-                throw std::runtime_error("Could not generate secure random data for Claude Desktop OAuth");
-            }
-        }
-
-        return output;
-    }
-
     static std::vector<unsigned char> LoadChromiumMasterKey(const std::filesystem::path& userDataPath) {
-        std::filesystem::path localStatePath = userDataPath / "Local State";
-
-        if (!std::filesystem::exists(localStatePath)) {
-            throw std::runtime_error("Claude Desktop Local State was not found");
-        }
-
-        json root = JsonUtils::get_instance()->ParseRequired(
-            ReadTextFileWithSharedRead(localStatePath, 64ULL * 1024ULL * 1024ULL)
+        // Fixed messages: a parse error would quote the file's bytes.
+        const json root = JsonUtils::get_instance()->ParseOrNull(
+            ClaudeCookieStore::ReadSharedText(userDataPath / "Local State", kMaximumJsonBytes)
         );
+
+        if (!root.is_object()) {
+            throw std::runtime_error("Claude Desktop Local State was not found or could not be read");
+        }
 
         if (!root.contains("os_crypt") || !root.at("os_crypt").is_object()) {
             throw std::runtime_error("Claude Desktop Local State has no os_crypt section");
@@ -522,6 +249,42 @@ namespace {
 
         return key;
     }
+
+    // The AES key for v10/v11 values, unwrapped at most once per
+    // AcquireCurrentSession and only when a value actually needs it.
+    class MasterKey final {
+    public:
+        explicit MasterKey(std::filesystem::path userDataPath)
+            : m_userDataPath(std::move(userDataPath)) {
+        }
+
+        ~MasterKey() {
+            SecureZeroMemory(m_key.data(), m_key.size());
+        }
+
+        MasterKey(const MasterKey&) = delete;
+        MasterKey& operator=(const MasterKey&) = delete;
+
+        // The first failure throws its real reason; later calls do not
+        // retry the Local State read and DPAPI round trip.
+        const std::vector<unsigned char>& Get() {
+            if (!m_attempted) {
+                m_attempted = true;
+                m_key = LoadChromiumMasterKey(m_userDataPath);
+            }
+
+            if (m_key.empty()) {
+                throw std::runtime_error("Claude Desktop encryption key is unavailable");
+            }
+
+            return m_key;
+        }
+
+    private:
+        std::filesystem::path m_userDataPath;
+        std::vector<unsigned char> m_key;
+        bool m_attempted = false;
+    };
 
     static std::vector<unsigned char> AesGcmDecrypt(
         const std::vector<unsigned char>& key,
@@ -631,7 +394,7 @@ namespace {
 
     static std::vector<unsigned char> DecryptElectronBlob(
         const std::vector<unsigned char>& encrypted,
-        const std::filesystem::path& userDataPath
+        MasterKey& masterKey
     ) {
         if (encrypted.empty()) {
             return {};
@@ -652,14 +415,13 @@ namespace {
                 throw std::runtime_error("Claude Desktop encrypted value is truncated");
             }
 
-            std::vector<unsigned char> key = LoadChromiumMasterKey(userDataPath);
             const unsigned char* nonce = encrypted.data() + prefixSize;
             const unsigned char* ciphertext = nonce + nonceSize;
             const size_t ciphertextSize = encrypted.size() - prefixSize - nonceSize - tagSize;
             const unsigned char* tag = encrypted.data() + encrypted.size() - tagSize;
 
             return AesGcmDecrypt(
-                key,
+                masterKey.Get(),
                 nonce,
                 nonceSize,
                 ciphertext,
@@ -673,28 +435,26 @@ namespace {
     }
 
     static std::string DecryptCookieValue(
-        const std::string& plainValue,
-        const std::vector<unsigned char>& encryptedValue,
-        const std::string& hostKey,
+        const Cookie& cookie,
         int databaseVersion,
-        const std::filesystem::path& userDataPath
+        MasterKey& masterKey
     ) {
-        if (!plainValue.empty()) {
-            return plainValue;
+        if (!cookie.value.empty()) {
+            return cookie.value;
         }
 
-        if (encryptedValue.empty()) {
+        if (cookie.encryptedValue.empty()) {
             return {};
         }
 
         std::vector<unsigned char> decrypted =
-            DecryptElectronBlob(encryptedValue, userDataPath);
+            DecryptElectronBlob(cookie.encryptedValue, masterKey);
 
         // Chromium cookie database version 24+ binds the plaintext to
         // host_key by prefixing SHA-256(host_key). Remove the prefix only
         // after it verifies; otherwise preserve the decrypted bytes.
         if (databaseVersion >= 24 && decrypted.size() >= 32) {
-            const std::array<unsigned char, 32> hostDigest = Sha256(hostKey);
+            const std::array<unsigned char, 32> hostDigest = Sha256(cookie.hostKey);
             if (std::equal(hostDigest.begin(), hostDigest.end(), decrypted.begin())) {
                 decrypted.erase(decrypted.begin(), decrypted.begin() + 32);
             }
@@ -703,38 +463,25 @@ namespace {
         return std::string(decrypted.begin(), decrypted.end());
     }
 
-    static std::vector<CookieRecord> ReadCookiesLive(
+    // Unexpired cookies with their values decrypted in place.
+    static std::vector<Cookie> ReadCookiesLive(
         const std::filesystem::path& cookiePath,
-        const std::filesystem::path& userDataPath
+        MasterKey& masterKey
     ) {
         ClaudeCookieStore::ReadResult readResult =
             ClaudeCookieStore::ReadLive(cookiePath);
-        std::vector<ClaudeCookieStore::RawCookie>& rawCookies = readResult.cookies;
 
-        std::vector<CookieRecord> records;
+        std::vector<Cookie> records;
         std::string firstDecryptError;
         bool encryptedRowsSeen = false;
 
-        for (ClaudeCookieStore::RawCookie& raw : rawCookies) {
-            if (!raw.encryptedValue.empty()) {
+        for (Cookie& cookie : readResult.cookies) {
+            if (!cookie.encryptedValue.empty()) {
                 encryptedRowsSeen = true;
             }
 
-            CookieRecord record;
-            record.name = std::move(raw.name);
-            record.hostKey = std::move(raw.hostKey);
-            record.expiresUtc = raw.expiresUtc;
-            record.lastAccessUtc = raw.lastAccessUtc;
-            record.creationUtc = raw.creationUtc;
-
             try {
-                record.value = DecryptCookieValue(
-                    raw.value,
-                    raw.encryptedValue,
-                    record.hostKey,
-                    readResult.databaseVersion,
-                    userDataPath
-                );
+                cookie.value = DecryptCookieValue(cookie, readResult.databaseVersion, masterKey);
             }
             catch (const std::exception& error) {
                 if (firstDecryptError.empty()) {
@@ -743,13 +490,13 @@ namespace {
                 continue;
             }
 
-            if (record.expiresUtc > 0 &&
-                record.expiresUtc <= NowChromeMicroseconds()) {
+            if (cookie.expiresUtc > 0 &&
+                cookie.expiresUtc <= NowChromeMicroseconds()) {
                 continue;
             }
 
-            if (!record.value.empty()) {
-                records.push_back(std::move(record));
+            if (!cookie.value.empty()) {
+                records.push_back(std::move(cookie));
             }
         }
 
@@ -781,7 +528,7 @@ namespace {
     }
 
     static std::string CookieRoot(const std::string& hostKey) {
-        const std::string lower = ToLowerAscii(hostKey);
+        const std::string lower = Text::get_instance()->ToLowerCopy(hostKey);
         if (lower.find("claude.com") != std::string::npos) return "claude.com";
         if (lower.find("claude.ai") != std::string::npos) return "claude.ai";
         return {};
@@ -881,7 +628,7 @@ namespace {
     static json DecryptSafeStorageJson(
         const json& config,
         const char* key,
-        const std::filesystem::path& userDataPath
+        MasterKey& masterKey
     ) {
         if (!config.contains(key) || !config.at(key).is_string()) {
             return json();
@@ -892,18 +639,24 @@ namespace {
             return json();
         }
 
-        std::vector<unsigned char> encrypted = Base64Decode(encoded);
-
         // Electron safeStorage is not always a raw DPAPI blob. Current Windows
         // builds may store the same v10/v11 AES-GCM envelope used by Chromium,
         // with its master key protected in Local State. Reuse the Electron blob
         // decoder so the Desktop OAuth cache remains readable while Claude is
         // open and its Cookies database is busy.
-        std::vector<unsigned char> decrypted =
-            DecryptElectronBlob(encrypted, userDataPath);
+        const std::vector<unsigned char> decrypted =
+            DecryptElectronBlob(Base64Decode(encoded), masterKey);
 
-        std::string text(decrypted.begin(), decrypted.end());
-        return JsonUtils::get_instance()->ParseRequired(text);
+        // A parse error message would quote the decrypted tokens.
+        const json cache = JsonUtils::get_instance()->ParseOrNull(
+            std::string(decrypted.begin(), decrypted.end())
+        );
+
+        if (cache.is_null()) {
+            throw std::runtime_error("Claude Desktop token cache could not be parsed");
+        }
+
+        return cache;
     }
 
     // The subscription is an account fact, not a session one: every cache entry
@@ -915,57 +668,53 @@ namespace {
     {
         std::string subscriptionType;
         std::string rateLimitTier;
-
-        bool empty() const { return subscriptionType.empty() && rateLimitTier.empty(); }
     };
 
+    // Given an organization, only its own entries count: another account's
+    // plan must never label this one.
     static OAuthPlanHint HarvestPlanHint(
         const std::vector<OAuthCandidate>& candidates,
-        const std::string& preferredOrganizationId
+        const std::string& organizationId
     ) {
         OAuthPlanHint hint;
 
-        // Two passes: an entry for the organization we actually selected wins
-        // over any other account signed in on this machine.
-        for (bool matchingOrgOnly : { true, false }) {
-            if (matchingOrgOnly && preferredOrganizationId.empty()) {
+        for (const OAuthCandidate& candidate : candidates) {
+            if (!organizationId.empty() && candidate.organizationId != organizationId) {
                 continue;
             }
-
-            for (const OAuthCandidate& candidate : candidates) {
-                if (matchingOrgOnly && candidate.organizationId != preferredOrganizationId) {
-                    continue;
-                }
-                if (hint.subscriptionType.empty()) {
-                    hint.subscriptionType = candidate.subscriptionType;
-                }
-                if (hint.rateLimitTier.empty()) {
-                    hint.rateLimitTier = candidate.rateLimitTier;
-                }
+            if (hint.subscriptionType.empty()) {
+                hint.subscriptionType = candidate.subscriptionType;
             }
-
-            if (!hint.empty()) break;
+            if (hint.rateLimitTier.empty()) {
+                hint.rateLimitTier = candidate.rateLimitTier;
+            }
         }
 
         return hint;
     }
 
-    static std::optional<OAuthCandidate> ReadOAuthCache(
+    // Every token-cache entry of the active account; config.json is read and
+    // decrypted once per AcquireCurrentSession.
+    static std::vector<OAuthCandidate> ReadOAuthCandidates(
         const std::filesystem::path& userDataPath,
-        const std::string& preferredOrganizationId,
-        bool& cacheEntriesFound,
-        OAuthPlanHint& planHint
+        MasterKey& masterKey,
+        bool& cacheEntriesFound
     ) {
         cacheEntriesFound = false;
         const std::filesystem::path configPath = userDataPath / "config.json";
+        std::error_code ec;
 
-        if (!std::filesystem::exists(configPath)) {
-            return std::nullopt;
+        if (!std::filesystem::exists(configPath, ec)) {
+            return {};
         }
 
-        json config = JsonUtils::get_instance()->ParseRequired(
-            ReadTextFileWithSharedRead(configPath, 64ULL * 1024ULL * 1024ULL)
+        const json config = JsonUtils::get_instance()->ParseOrNull(
+            ClaudeCookieStore::ReadSharedText(configPath, kMaximumJsonBytes)
         );
+
+        if (!config.is_object()) {
+            throw std::runtime_error("Claude Desktop config.json could not be read");
+        }
 
         std::vector<OAuthCandidate> candidates;
 
@@ -978,14 +727,10 @@ namespace {
             }
 
             cacheEntriesFound = CollectOAuthCandidates(
-                DecryptSafeStorageJson(config, item.first, userDataPath),
+                DecryptSafeStorageJson(config, item.first, masterKey),
                 item.second,
                 candidates
             ) || cacheEntriesFound;
-        }
-
-        if (candidates.empty()) {
-            return std::nullopt;
         }
 
         // Several accounts can be signed in; Desktop records the active one in
@@ -1004,68 +749,58 @@ namespace {
             );
         }
 
-        // Before any filtering: expiry and organization filters can leave
-        // nothing behind, and the plan is still knowable in that case.
-        planHint = HarvestPlanHint(candidates, preferredOrganizationId);
+        return candidates;
+    }
 
+    // The best live token that can read usage, for one organization or (with
+    // an empty id) any. Desktop marks a token that drew a 401 dead by zeroing
+    // expiresAt and only trusts now < expiresAt, so 0 or a missing expiry is
+    // not usable.
+    static std::optional<OAuthCandidate> BestUsableToken(
+        const std::vector<OAuthCandidate>& candidates,
+        const std::string& organizationId
+    ) {
         using namespace std::chrono;
         const double nowMs = static_cast<double>(duration_cast<milliseconds>(
             system_clock::now().time_since_epoch()
         ).count());
 
-        // Desktop marks a token that drew a 401 dead by zeroing expiresAt and
-        // only trusts now < expiresAt, so 0 or a missing expiry is not usable.
-        candidates.erase(
-            std::remove_if(
-                candidates.begin(),
-                candidates.end(),
-                [&](const OAuthCandidate& candidate) {
-                    return candidate.expiresAtMs <= nowMs || !candidate.canReadUsage;
-                }
-            ),
-            candidates.end()
-        );
-
-        if (!preferredOrganizationId.empty()) {
-            candidates.erase(
-                std::remove_if(
-                    candidates.begin(),
-                    candidates.end(),
-                    [&](const OAuthCandidate& candidate) {
-                        return candidate.organizationId != preferredOrganizationId;
-                    }
-                ),
-                candidates.end()
-            );
-        }
-
-        if (candidates.empty()) {
-            return std::nullopt;
-        }
-
-        auto better = [](const OAuthCandidate& a, const OAuthCandidate& b) {
+        auto worse = [](const OAuthCandidate& a, const OAuthCandidate& b) {
             if (a.scopeScore != b.scopeScore) return a.scopeScore < b.scopeScore;
             if (a.scopedCache != b.scopedCache) return !a.scopedCache && b.scopedCache;
             return a.expiresAtMs < b.expiresAtMs;
         };
 
-        return *std::max_element(candidates.begin(), candidates.end(), better);
+        const OAuthCandidate* best = nullptr;
+
+        for (const OAuthCandidate& candidate : candidates) {
+            if (candidate.expiresAtMs <= nowMs || !candidate.canReadUsage ||
+                (!organizationId.empty() && candidate.organizationId != organizationId)) {
+                continue;
+            }
+
+            if (!best || worse(*best, candidate)) {
+                best = &candidate;
+            }
+        }
+
+        return best ? std::optional<OAuthCandidate>(*best) : std::nullopt;
     }
 
-    static long long CookieRecency(const CookieRecord& record) {
+    static long long CookieRecency(const Cookie& record) {
         return std::max(record.lastAccessUtc, record.creationUtc);
     }
 
-    static DesktopIdentity ResolveIdentity(const std::filesystem::path& userDataPath) {
+    static DesktopIdentity ResolveIdentity(
+        const std::filesystem::path& userDataPath,
+        MasterKey& masterKey
+    ) {
         DesktopIdentity identity;
-        std::vector<std::filesystem::path> candidates = {
-            userDataPath / "Network" / "Cookies",
-            userDataPath / "Cookies"
-        };
-
         std::filesystem::path cookiePath;
-        for (const auto& candidate : candidates) {
-            if (std::filesystem::exists(candidate)) {
+
+        for (const auto& candidate : { userDataPath / "Network" / "Cookies", userDataPath / "Cookies" }) {
+            std::error_code ec;
+            if (std::filesystem::exists(candidate, ec)) {
                 cookiePath = candidate;
                 break;
             }
@@ -1076,13 +811,13 @@ namespace {
             return identity;
         }
 
-        std::vector<CookieRecord> records = ReadCookiesLive(cookiePath, userDataPath);
+        std::vector<Cookie> records = ReadCookiesLive(cookiePath, masterKey);
         identity.cookieRowsFound = !records.empty();
 
-        std::vector<const CookieRecord*> organizations;
-        std::vector<const CookieRecord*> sessions;
+        std::vector<const Cookie*> organizations;
+        std::vector<const Cookie*> sessions;
 
-        for (const CookieRecord& record : records) {
+        for (const Cookie& record : records) {
             if (record.name == "lastActiveOrg" && IsOrganizationId(record.value)) {
                 organizations.push_back(&record);
             }
@@ -1094,18 +829,18 @@ namespace {
             }
         }
 
-        const CookieRecord* activeOrganization = nullptr;
+        const Cookie* activeOrganization = nullptr;
 
         // Prefer the newest active-organization cookie whose Claude root domain
         // also has at least one readable session cookie. This avoids combining
         // an old claude.ai organization with a newer claude.com session (or the
         // reverse) during domain migrations.
-        for (const CookieRecord* organization : organizations) {
+        for (const Cookie* organization : organizations) {
             const std::string root = CookieRoot(organization->hostKey);
             const bool hasMatchingSession = std::any_of(
                 sessions.begin(),
                 sessions.end(),
-                [&](const CookieRecord* session) {
+                [&](const Cookie* session) {
                     return CookieRoot(session->hostKey) == root;
                 }
             );
@@ -1124,7 +859,7 @@ namespace {
             activeOrganization = *std::max_element(
                 organizations.begin(),
                 organizations.end(),
-                [](const CookieRecord* a, const CookieRecord* b) {
+                [](const Cookie* a, const Cookie* b) {
                     return CookieRecency(*a) < CookieRecency(*b);
                 }
             );
@@ -1138,9 +873,9 @@ namespace {
             // selected domain. Preserve that behavior instead of betting on only
             // one cookie generation. The order matches Claude Desktop's own list.
             for (const char* cookieName : { "sessionKeyV2", "sessionKey", "sessionKeyV3" }) {
-                const CookieRecord* newest = nullptr;
+                const Cookie* newest = nullptr;
 
-                for (const CookieRecord* session : sessions) {
+                for (const Cookie* session : sessions) {
                     if (session->name != cookieName ||
                         CookieRoot(session->hostKey) != identity.rootDomain) {
                         continue;
@@ -1169,7 +904,7 @@ namespace {
             const bool sessionsOnAnotherDomain = std::any_of(
                 sessions.begin(),
                 sessions.end(),
-                [&](const CookieRecord* session) {
+                [&](const Cookie* session) {
                     return CookieRoot(session->hostKey) != identity.rootDomain;
                 }
             );
@@ -1198,18 +933,21 @@ Result AcquireCurrentSession() {
         return result;
     }
 
-    if (!std::filesystem::exists(userDataPath)) {
+    std::error_code existsError;
+
+    if (!std::filesystem::exists(userDataPath, existsError)) {
         Result result;
         result.kind = ResultKind::NoDesktopSession;
         result.detail = "Claude Desktop data directory was not found";
         return result;
     }
 
+    MasterKey masterKey(userDataPath);
     DesktopIdentity identity;
     std::string cookieError;
 
     try {
-        identity = ResolveIdentity(userDataPath);
+        identity = ResolveIdentity(userDataPath, masterKey);
     }
     catch (const std::exception& e) {
         cookieError = e.what();
@@ -1218,9 +956,9 @@ Result AcquireCurrentSession() {
     // Claude Desktop keeps its Cookies database open, and recent builds deny
     // shared reads outright (Win32 32). That is not a signed-out state: the
     // OAuth cache in config.json is still readable, it just needs to know which
-    // organization is active. plan-usage-history.json is plain JSON that
-    // Desktop rewrites every few minutes, so its newest sample supplies exactly
-    // that - and it tracks an account switch immediately.
+    // organization is active. The newest plan-usage-history.json sample (the
+    // gated tray poller's, see ReadLatestPlanUsage) names the organization that
+    // was active when it was taken.
     if (identity.organizationId.empty()) {
         const PlanUsageSample planUsage = ReadLatestPlanUsage();
 
@@ -1230,30 +968,14 @@ Result AcquireCurrentSession() {
     }
 
     bool cacheEntriesFound = false;
-    std::optional<OAuthCandidate> oauth;
-    OAuthPlanHint planHint;
+    std::vector<OAuthCandidate> candidates;
     std::string cacheError;
 
     try {
-        oauth = ReadOAuthCache(userDataPath, identity.organizationId, cacheEntriesFound, planHint);
+        candidates = ReadOAuthCandidates(userDataPath, masterKey, cacheEntriesFound);
     }
     catch (const std::exception& e) {
         cacheError = e.what();
-    }
-
-    // An organization that no longer has a matching cache entry (stale sample,
-    // just-switched account) must not hide a usable token.
-    if (!oauth && !identity.organizationId.empty()) {
-        try {
-            OAuthPlanHint fallbackHint;
-            oauth = ReadOAuthCache(userDataPath, std::string{}, cacheEntriesFound, fallbackHint);
-            if (planHint.empty()) planHint = fallbackHint;
-        }
-        catch (const std::exception& e) {
-            if (cacheError.empty()) {
-                cacheError = e.what();
-            }
-        }
     }
 
     if (!identity.organizationId.empty() && !identity.sessionCookies.empty()) {
@@ -1289,19 +1011,33 @@ Result AcquireCurrentSession() {
             : "https://claude.ai";
         result.cookieHeader = std::move(cookieHeader);
 
-        if (oauth) {
+        // Only this organization's own token and plan may ride along with its
+        // cookie session; another account's would mislabel it.
+        if (const std::optional<OAuthCandidate> oauth = BestUsableToken(candidates, identity.organizationId)) {
             result.accessToken = oauth->accessToken;
             result.subscriptionType = oauth->subscriptionType;
             result.rateLimitTier = oauth->rateLimitTier;
         }
 
-        if (result.subscriptionType.empty()) result.subscriptionType = planHint.subscriptionType;
-        if (result.rateLimitTier.empty()) result.rateLimitTier = planHint.rateLimitTier;
+        const OAuthPlanHint plan = HarvestPlanHint(candidates, identity.organizationId);
+        if (result.subscriptionType.empty()) result.subscriptionType = plan.subscriptionType;
+        if (result.rateLimitTier.empty()) result.rateLimitTier = plan.rateLimitTier;
 
         return result;
     }
 
+    // Without cookies the token is the whole session. An organization with no
+    // usable entry (stale sample, just-switched account) must not hide another
+    // usable token; the result then follows that token's organization.
+    std::optional<OAuthCandidate> oauth = BestUsableToken(candidates, identity.organizationId);
+
+    if (!oauth && !identity.organizationId.empty()) {
+        oauth = BestUsableToken(candidates, std::string{});
+    }
+
     if (oauth) {
+        const OAuthPlanHint plan = HarvestPlanHint(candidates, oauth->organizationId);
+
         Result result;
         result.kind = ResultKind::Success;
         result.source = AuthSource::OAuthCache;
@@ -1309,9 +1045,9 @@ Result AcquireCurrentSession() {
         result.baseUrl = "https://claude.ai";
         result.accessToken = oauth->accessToken;
         result.subscriptionType = oauth->subscriptionType.empty()
-            ? planHint.subscriptionType : oauth->subscriptionType;
+            ? plan.subscriptionType : oauth->subscriptionType;
         result.rateLimitTier = oauth->rateLimitTier.empty()
-            ? planHint.rateLimitTier : oauth->rateLimitTier;
+            ? plan.rateLimitTier : oauth->rateLimitTier;
         return result;
     }
 
@@ -1353,23 +1089,9 @@ PlanUsageSample ReadLatestPlanUsage() {
         return sample;
     }
 
-    const std::filesystem::path historyPath = userDataPath / "plan-usage-history.json";
-    std::error_code ec;
-
-    if (!std::filesystem::exists(historyPath, ec) || ec) {
-        return sample;
-    }
-
-    json root;
-
-    try {
-        root = JsonUtils::get_instance()->ParseRequired(
-            ReadTextFileWithSharedRead(historyPath, 64ULL * 1024ULL * 1024ULL)
-        );
-    }
-    catch (const std::exception&) {
-        return sample;
-    }
+    const json root = JsonUtils::get_instance()->ParseOrNull(
+        ClaudeCookieStore::ReadSharedText(userDataPath / "plan-usage-history.json", kMaximumJsonBytes)
+    );
 
     if (!root.is_object() || !root.contains("samples") || !root.at("samples").is_array()) {
         return sample;
@@ -1447,13 +1169,9 @@ PlanUsageSample ReadLatestPlanUsage() {
             continue;
         }
 
-        if (!sample.organizationId.empty()) {
-            const auto org = entry.find("org");
-
-            if (org == entry.end() || !org->is_string() ||
-                org->get<std::string>() != sample.organizationId) {
-                continue;
-            }
+        if (!sample.organizationId.empty() &&
+            JsonUtils::get_instance()->String(entry, "org") != sample.organizationId) {
+            continue;
         }
 
         series.emplace_back(static_cast<long long>(t->get<double>()), &entry);
@@ -1599,11 +1317,12 @@ std::vector<std::filesystem::path> UserDataCandidates() {
 
         add(local / "Claude-Data");
 
+        // Range-for would use the throwing increment.
         std::error_code ec;
-        for (const auto& entry : std::filesystem::directory_iterator(local / "Claude-Data", ec)) {
-            if (entry.is_directory(ec)) {
-                add(entry.path());
-            }
+        for (auto it = std::filesystem::directory_iterator(local / "Claude-Data", ec);
+             !ec && it != std::filesystem::directory_iterator();
+             it.increment(ec)) {
+            add(it->path());
         }
     }
 

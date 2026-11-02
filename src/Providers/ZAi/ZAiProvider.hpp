@@ -6,6 +6,7 @@
 
 #include "AppSettings.hpp"
 #include "NotifyGUI.hpp"
+#include "QuotaNotifier.hpp"
 #include "ZAi.hpp"
 
 class ZAiProvider
@@ -44,6 +45,7 @@ private:
 
     AppSettings::ProviderNotifications m_notifySettings;
     AppSettings::ZAiQuotaWarnings m_quotaWarnings;
+    QuotaNotifier m_notifier{ "Z.Ai" };
 
     RateLimitCallback m_rateLimitCallback = nullptr;
 };

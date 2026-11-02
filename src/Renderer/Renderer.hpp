@@ -18,8 +18,6 @@ namespace Renderer
     struct State
     {
         bool* shouldClose = nullptr;
-        bool* minimizeRequest = nullptr;
-        bool* widgetMode = nullptr;
         bool* widgetPinned = nullptr;
         bool* widgetAlwaysOnTop = nullptr;
         // AppSettings::WidgetAnchor: which edge the panel parks against.
@@ -28,7 +26,6 @@ namespace Renderer
         int* widgetMonitor = nullptr;
         const char* const* widgetMonitorNames = nullptr;
         int widgetMonitorCount = 0;
-        std::string* widgetOrder = nullptr;
         // Ordered "<provider>:<window>" keys shown in the collapsed bar.
         std::string* widgetBarRows = nullptr;
         int* uiFontSize = nullptr;
@@ -73,7 +70,6 @@ namespace Renderer
         NotifyPosition* notifyPosition = nullptr;
         const char* const* notifyPositionNames = nullptr;
         int notifyPositionCount = 0;
-        NotifyPosition* notifyPositions = nullptr;
 
         AppSettings::ProviderNotifications* codexNotifySettings = nullptr;
         AppSettings::ProviderNotifications* claudeNotifySettings = nullptr;
@@ -95,10 +91,9 @@ namespace Renderer
         void (*repositionWidget)() = nullptr;
     };
 
+    // Style only, for the current context: ReloadFonts / LoadSettingsFont build
+    // the font atlas.
     void ApplyStyle();
-    // Style only (no font atlas work) - for a second ImGui context whose
-    // atlas is separate from the widget's.
-    void ApplyStyleColorsOnly();
     // Full-window settings UI, rendered into its own window/context.
     void RenderSettingsUi(State& state);
     // Rebuild the interface font atlas at the configured size. The caller

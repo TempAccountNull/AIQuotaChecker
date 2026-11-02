@@ -1,6 +1,6 @@
 #include "Global.hpp"
 #include "NotifyGUI.hpp"
-
+#include "Text.hpp"
 
 #include <windows.h>
 #include <imgui.h>
@@ -12,21 +12,14 @@
 #include <mutex>
 #include <string>
 #include <vector>
-#include "KSharedClock.hpp"
 
-// ---------------------------------------------------------------------------
-// KUSER_SHARED_DATA � the kernel maps this read-only page into every process
-// at 0x7FFE0000.  InterruptTime is a 64-bit counter in 100-nanosecond units
-// (10,000,000 ticks per second).  We define only the fields we need; no
-// winternl.h or ntddk.h required, and zero import-table entries are added.
-// ---------------------------------------------------------------------------
 namespace
 {
-    // Tear-safe 64-bit read of InterruptTime using the High1/Low/High2
-    // spinlock exactly as NTDLL does internally.
-    static float GetNow()
+    // Seconds since boot as a double: a float clock loses sub-second
+    // resolution after a few weeks of uptime and fades start to step.
+    static double GetNow()
     {
-        return KSharedClock::InterruptSeconds();
+        return static_cast<double>(GetTickCount64()) / 1000.0;
     }
 
     // ---------------------------------------------------------------------------
@@ -36,7 +29,7 @@ namespace
     {
         char           message[256];
         NotifyPosition position;
-        float          startTime;  // seconds (InterruptTime epoch)
+        double         startTime;  // GetNow() seconds
         float          duration;   // total display time in seconds
         ImU32          color;      // text colour, ImGui ABGR packing
     };
@@ -75,6 +68,8 @@ namespace
     static bool g_NativeClassRegistered = false;
 
     static std::atomic_bool g_ShowInsideWindow = false;
+    // Native toasts appear on this window's monitor (the widget's).
+    static std::atomic<HWND> g_AnchorWindow = nullptr;
 
     // Scale the alpha component of an ImU32 colour by [0..1].
     static ImU32 ScaleAlpha(ImU32 col, float factor)
@@ -93,98 +88,69 @@ namespace
         return RGB(GetR(col), GetG(col), GetB(col));
     }
 
-    static constexpr std::uint32_t kProviderCodexColor = NOTIFY_COL32(0, 220, 255, 255);
-    static constexpr std::uint32_t kProviderClaudeColor = NOTIFY_COL32(255, 154, 60, 255);
-    static constexpr std::uint32_t kProviderZAiColor = NOTIFY_COL32(68, 215, 128, 255);
-
-    static bool StartsWithAscii(const char* text, const char* prefix)
+    // A toast that starts with a provider name shows the name in its colour.
+    struct ProviderPrefix
     {
-        if (!text || !prefix) return false;
+        const char* name;
+        size_t length;
+        std::uint32_t color;
+    };
 
-        while (*prefix) {
-            if (*text != *prefix) return false;
-            ++text;
-            ++prefix;
+    static constexpr ProviderPrefix kProviderPrefixes[] = {
+        { "Codex", 5, NOTIFY_COL32(0, 220, 255, 255) },
+        { "Claude", 6, NOTIFY_COL32(255, 154, 60, 255) },
+        { "Z.Ai", 4, NOTIFY_COL32(68, 215, 128, 255) },
+        { "Grok", 4, NOTIFY_COL32(190, 170, 255, 255) },
+    };
+
+    static const ProviderPrefix* FindProviderPrefix(const char* text)
+    {
+        for (const ProviderPrefix& prefix : kProviderPrefixes) {
+            if (text && std::strncmp(text, prefix.name, prefix.length) == 0) {
+                return &prefix;
+            }
         }
 
-        return true;
-    }
-
-    static bool StartsWithWide(const std::wstring& text, const wchar_t* prefix)
-    {
-        if (!prefix) return false;
-
-        size_t len = wcslen(prefix);
-
-        if (text.size() < len) {
-            return false;
-        }
-
-        return text.compare(0, len, prefix) == 0;
+        return nullptr;
     }
 
     static bool GetProviderPrefixStyle(const char* text, size_t& prefixLen, ImU32& prefixColor)
     {
-        if (StartsWithAscii(text, "Codex")) {
-            prefixLen = 5;
-            prefixColor = static_cast<ImU32>(kProviderCodexColor);
-            return true;
+        const ProviderPrefix* prefix = FindProviderPrefix(text);
+
+        if (!prefix) {
+            return false;
         }
 
-        if (StartsWithAscii(text, "Claude")) {
-            prefixLen = 6;
-            prefixColor = static_cast<ImU32>(kProviderClaudeColor);
-            return true;
-        }
-
-        if (StartsWithAscii(text, "Z.Ai")) {
-            prefixLen = 4;
-            prefixColor = static_cast<ImU32>(kProviderZAiColor);
-            return true;
-        }
-
-        return false;
+        prefixLen = prefix->length;
+        prefixColor = static_cast<ImU32>(prefix->color);
+        return true;
     }
 
     static bool GetProviderPrefixStyle(const std::wstring& text, size_t& prefixLen, COLORREF& prefixColor)
     {
-        if (StartsWithWide(text, L"Codex")) {
-            prefixLen = 5;
-            prefixColor = ToColorRef(kProviderCodexColor);
-            return true;
+        // Provider names are ASCII, so their wide length matches.
+        const ProviderPrefix* prefix = FindProviderPrefix(Text::get_instance()->WideToUtf8(text.substr(0, 8)).c_str());
+
+        if (!prefix) {
+            return false;
         }
 
-        if (StartsWithWide(text, L"Claude")) {
-            prefixLen = 6;
-            prefixColor = ToColorRef(kProviderClaudeColor);
-            return true;
-        }
-
-        if (StartsWithWide(text, L"Z.Ai")) {
-            prefixLen = 4;
-            prefixColor = ToColorRef(kProviderZAiColor);
-            return true;
-        }
-
-        return false;
-    }
-
-    static std::wstring Utf8ToWide(const char* text)
-    {
-        if (!text || !*text) return L"";
-
-        int needed = MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
-        if (needed <= 0) return L"";
-
-        std::wstring out(static_cast<size_t>(needed), L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, text, -1, out.data(), needed);
-
-        if (!out.empty() && out.back() == L'\0') out.pop_back();
-        return out;
+        prefixLen = prefix->length;
+        prefixColor = ToColorRef(prefix->color);
+        return true;
     }
 
     static RECT GetWorkArea()
     {
+        MONITORINFO info{};
+        info.cbSize = sizeof(info);
+        const HMONITOR monitor = MonitorFromWindow(g_AnchorWindow.load(), MONITOR_DEFAULTTOPRIMARY);
+
+        if (GetMonitorInfoW(monitor, &info)) {
+            return info.rcWork;
+        }
+
         RECT rc{};
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &rc, 0);
         return rc;
@@ -458,7 +424,7 @@ namespace
 
     static void AddNativeNow(const char* message, NotifyPosition position, float duration, std::uint32_t color)
     {
-        std::wstring text = Utf8ToWide(message);
+        std::wstring text = Text::get_instance()->Utf8ToWide(message ? message : "");
         if (text.empty()) return;
 
         RegisterNativeClass();
@@ -539,9 +505,9 @@ namespace NotifyGUI
         g_ShowInsideWindow.store(enabled);
     }
 
-    bool GetInsideWindow()
+    void SetAnchorWindow(HWND window)
     {
-        return g_ShowInsideWindow.load();
+        g_AnchorWindow.store(window);
     }
 
     void Add(const char* message, NotifyPosition position, float duration, std::uint32_t color)
@@ -572,7 +538,7 @@ namespace NotifyGUI
             if (g_Count == 0) return;
 
             // Expire in-place, compact survivors.
-            float now = GetNow();
+            const double now = GetNow();
             int dst = 0;
 
             for (int i = 0; i < g_Count; ++i) {
@@ -590,7 +556,7 @@ namespace NotifyGUI
         // -----------------------------------------------------------------------
         ImDrawList* dl = ImGui::GetForegroundDrawList();
         const ImGuiIO& io = ImGui::GetIO();
-        const float now = GetNow();
+        const double now = GetNow();
         const float screenW = io.DisplaySize.x;
         const float screenH = io.DisplaySize.y;
 
@@ -609,7 +575,7 @@ namespace NotifyGUI
 
         for (int i = 0; i < count; ++i) {
             const Notification& n = local[i];
-            float elapsed = now - n.startTime;
+            const float elapsed = static_cast<float>(now - n.startTime);
             if (elapsed >= n.duration) continue; // expired between snapshot and draw; skip
 
             // Fade out over the final 1 second of life.

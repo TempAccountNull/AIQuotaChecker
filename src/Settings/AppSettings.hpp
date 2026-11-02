@@ -49,7 +49,6 @@ namespace AppSettings
     {
         bool showRemaining = false;
         bool showResetDateDetails = false;
-        bool widgetMode = false;
         bool widgetPinned = false;
         // Whether the widget floats above other windows. Off puts it in the
         // normal z-order, where it can be covered like any other window.
@@ -67,8 +66,6 @@ namespace AppSettings
         // list of "<provider>:<window>" keys. Empty means "whatever host is
         // selected", the original single-row behaviour.
         std::string widgetBarRows;
-        // Host order in the widget, as a comma-separated key list.
-        std::string widgetOrder = "codex,claude,zai,grok";
         int resetDisplayMode = 0;
         bool notificationsInsideWindow = false;
         int notificationPositionIndex = 3;

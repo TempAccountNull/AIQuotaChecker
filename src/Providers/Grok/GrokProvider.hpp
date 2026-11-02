@@ -7,6 +7,7 @@
 #include "AppSettings.hpp"
 #include "Grok.hpp"
 #include "NotifyGUI.hpp"
+#include "QuotaNotifier.hpp"
 
 class GrokProvider
 {
@@ -34,7 +35,6 @@ public:
 private:
     GrokProvider() = default;
 
-    static void RefreshThunk();
     void HandleRateLimit(const std::string& detail);
 
     std::mutex m_mutex;
@@ -43,6 +43,7 @@ private:
 
     AppSettings::ProviderNotifications m_notifySettings;
     AppSettings::GrokQuotaWarnings m_quotaWarnings;
+    QuotaNotifier m_notifier{ "Grok" };
 
     RateLimitCallback m_rateLimitCallback = nullptr;
 };

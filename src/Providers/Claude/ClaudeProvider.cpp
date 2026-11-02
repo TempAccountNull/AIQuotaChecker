@@ -1,8 +1,8 @@
 #include "Global.hpp"
 #include "ClaudeProvider.hpp"
 
-#include "ClaudeNotifier.hpp"
 #include "Network.hpp"
+#include "Text.hpp"
 
 #include <exception>
 #include <ctime>
@@ -11,13 +11,51 @@
 
 namespace
 {
-
-    static ClaudeNotifier::QuotaWarningRule ToNotifierRule(const AppSettings::QuotaWarningRule& src)
+    void AddWindow(std::vector<QuotaNotifier::Point>& points, const Claude::UsageWindow& window,
+        const AppSettings::QuotaWarningRule& rule, std::string key, std::string name)
     {
-        ClaudeNotifier::QuotaWarningRule rule;
-        rule.enabled = src.enabled;
-        rule.percent = src.percent;
-        return rule;
+        if (!window.valid) {
+            return;
+        }
+
+        QuotaNotifier::Point point;
+        point.key = std::move(key);
+        point.name = std::move(name);
+        point.usedPercent = window.usedPercent;
+        point.resetAtUnixSeconds = window.resetAtUnixSeconds;
+        point.rule = rule;
+        points.push_back(std::move(point));
+    }
+
+    std::vector<QuotaNotifier::Point> ClaudePoints(const Claude::Snapshot& snapshot, const AppSettings::ClaudeQuotaWarnings& rules)
+    {
+        std::vector<QuotaNotifier::Point> points;
+
+        AddWindow(points, snapshot.currentSession, rules.currentSession, "5_hour", "5-hour limit/session");
+        AddWindow(points, snapshot.weeklyAllModels, rules.allModels, "weekly_all_models", "weekly - all models");
+        AddWindow(points, snapshot.weeklySonnet, rules.sonnet, "weekly_sonnet", "weekly - Sonnet");
+        AddWindow(points, snapshot.weeklyFable, rules.fable, "weekly_fable", "weekly - Fable");
+
+        // Rows beyond the fixed four (Opus, Claude Design, the 3P token cap...)
+        // follow the all-models rule. Title and subtitle together identify one:
+        // an "Opus" 5-hour and an "Opus" weekly row are different windows.
+        for (const Claude::UsageWindow& limit : snapshot.additionalLimits) {
+            AddWindow(points, limit, rules.allModels,
+                "limit:" + Text::get_instance()->CompactLower(limit.title + "|" + limit.subtitle, false),
+                limit.title + (limit.subtitle.empty() ? "" : " (" + limit.subtitle + ")"));
+        }
+
+        if (snapshot.credits.valid && snapshot.credits.enabled && snapshot.credits.hasUsedPercent) {
+            QuotaNotifier::Point point;
+            point.key = "usage_credits";
+            point.name = "usage credits/extra usage";
+            point.usedPercent = snapshot.credits.usedPercent;
+            point.resetAtUnixSeconds = snapshot.credits.resetAtUnixSeconds;
+            point.rule = rules.credits;
+            points.push_back(std::move(point));
+        }
+
+        return points;
     }
 }
 
@@ -71,7 +109,7 @@ void ClaudeProvider::SetAccountSource(int source)
     if (changed) {
         // Warning state belongs to the selected account. Never let a warning
         // already sent for one account suppress the same threshold on another.
-        ClaudeNotifier::ResetState();
+        m_notifier.Reset();
 
         Claude::Snapshot switching;
 
@@ -99,17 +137,11 @@ void ClaudeProvider::SetAccountSource(int source)
         m_lastSuccessfulAccountKey.clear();
         m_compactionLatched = false;
         m_compactionStartedAtUnixSeconds = 0;
-        m_lastActiveRunSeenAtUnixSeconds = 0;
         m_compactionNoticeAtUnixSeconds = 0;
         m_compactionNoticeEligible = false;
         m_lastCompactionSavedTokens = 0;
         m_lastCompactionEventId.clear();
     }
-}
-
-int ClaudeProvider::AccountSource() const
-{
-    return AppSettings::ClampClaudeAccountSource(m_accountSource.load());
 }
 
 void ClaudeProvider::SetRateLimitCallback(RateLimitCallback callback)
@@ -131,21 +163,7 @@ void ClaudeProvider::SaveSettings(AppSettings::Settings& settings) const
 
 void ClaudeProvider::ApplyRuntime(NotifyPosition position, int quotaRepeatSeconds)
 {
-    ClaudeNotifier::SetPosition(position);
-
-    ClaudeNotifier::Config cfg;
-    cfg.enabled = m_notifySettings.enabled;
-    cfg.prepareReset = m_notifySettings.prepareReset;
-    cfg.exactReset = m_notifySettings.exactReset;
-    cfg.prepareMinutes = m_notifySettings.prepareMinutes;
-    cfg.currentSession = ToNotifierRule(m_quotaWarnings.currentSession);
-    cfg.allModels = ToNotifierRule(m_quotaWarnings.allModels);
-    cfg.sonnet = ToNotifierRule(m_quotaWarnings.sonnet);
-    cfg.fable = ToNotifierRule(m_quotaWarnings.fable);
-    cfg.credits = ToNotifierRule(m_quotaWarnings.credits);
-
-    ClaudeNotifier::SetConfig(cfg);
-    ClaudeNotifier::SetQuotaNotificationRepeatSeconds(quotaRepeatSeconds);
+    m_notifier.Configure(position, m_notifySettings, quotaRepeatSeconds);
 }
 
 void ClaudeProvider::HandleRateLimit(const std::string& detail)
@@ -153,11 +171,6 @@ void ClaudeProvider::HandleRateLimit(const std::string& detail)
     if (m_rateLimitCallback) {
         m_rateLimitCallback("Claude", detail);
     }
-}
-
-void ClaudeProvider::RefreshThunk()
-{
-    ClaudeProvider::get_instance()->RefreshAsync();
 }
 
 void ClaudeProvider::ApplyLocalTelemetryLocked(
@@ -171,14 +184,6 @@ void ClaudeProvider::ApplyLocalTelemetryLocked(
     const bool hasBoundary = !incoming.compactionEventId.empty();
     const bool newBoundary = hasBoundary &&
         incoming.compactionEventId != m_lastCompactionEventId;
-
-    // AQC's parser already knows when a foreground user turn is still alive.
-    // Remember that fact independently of the most recent content block: when
-    // Claude enters auto-compaction it can stop touching the JSONL for several
-    // minutes, which otherwise makes the status fall back to AVAILABLE.
-    if (local.run.valid && local.run.running) {
-        m_lastActiveRunSeenAtUnixSeconds = now;
-    }
 
     // Never synthesize COMPACTING from context percentage alone. Claude can
     // expose 200K and 1M variants of the same model, and a stale/guessed limit
@@ -378,7 +383,6 @@ void ClaudeProvider::RefreshAsync()
                         snapshot.run = {};
                         self->m_compactionLatched = false;
                         self->m_compactionStartedAtUnixSeconds = 0;
-                        self->m_lastActiveRunSeenAtUnixSeconds = 0;
                         self->m_compactionNoticeAtUnixSeconds = 0;
                         self->m_compactionNoticeEligible = false;
                         self->m_lastCompactionSavedTokens = 0;
@@ -410,7 +414,7 @@ void ClaudeProvider::RefreshAsync()
                 }
 
                 if (accountChanged) {
-                    ClaudeNotifier::ResetState();
+                    self->m_notifier.Reset();
                 }
             }
         }
@@ -438,7 +442,9 @@ void ClaudeProvider::RefreshAsync()
 
         // The user changed account source while this request was in flight.
         // Never commit the old account; immediately query the new selection.
-        if (sourceChanged) {
+        // Re-read after clearing Loading: a switch that landed in between saw a
+        // refresh in flight and skipped its own.
+        if (sourceChanged || self->m_sourceGeneration.load() != sourceGeneration) {
             self->RefreshAsync();
         }
     }).detach();
@@ -470,12 +476,14 @@ void ClaudeProvider::RefreshContextAsync()
 
 void ClaudeProvider::PollNotifications()
 {
-    Claude::Snapshot snapshot;
+    std::vector<QuotaNotifier::Point> points;
 
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        snapshot = m_snapshot;
+        points = ClaudePoints(m_snapshot, m_quotaWarnings);
     }
 
-    ClaudeNotifier::Poll(snapshot, &ClaudeProvider::RefreshThunk);
+    if (m_notifier.Poll(points)) {
+        RefreshAsync();
+    }
 }

@@ -5,7 +5,6 @@
 #include "Math.hpp"
 #include "Format.hpp"
 #include "ResetTime.hpp"
-#include "Network.hpp"
 
 #include <windows.h>
 #include <commdlg.h>
@@ -17,26 +16,20 @@
 #include <array>
 #include <chrono>
 #include <cctype>
-#include <cstdlib>
-#include <fstream>
+#include <cstdint>
 #include <cstring>
 #include <cmath>
 #include <ctime>
+#include <initializer_list>
 #include <iomanip>
 #include <mutex>
 #include <sstream>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include <imgui.h>
 
 #include "NotifyGUI.hpp"
-#include "Resource.h"
-#include "CodexNotifier.hpp"
-#include "ClaudeNotifier.hpp"
-#include "ZAiNotifier.hpp"
-#include "GrokNotifier.hpp"
 #include "AppSettings.hpp"
 
 #pragma comment(lib, "windowscodecs.lib")
@@ -81,52 +74,20 @@ namespace Renderer
         }
     }
 
-    static std::string WideToUtf8(const std::wstring& value)
-    {
-        if (value.empty()) {
-            return {};
-        }
-
-        int size = WideCharToMultiByte(
-            CP_UTF8,
-            0,
-            value.data(),
-            static_cast<int>(value.size()),
-            nullptr,
-            0,
-            nullptr,
-            nullptr
-        );
-
-        if (size <= 0) {
-            return {};
-        }
-
-        std::string result(static_cast<size_t>(size), '\0');
-        WideCharToMultiByte(
-            CP_UTF8,
-            0,
-            value.data(),
-            static_cast<int>(value.size()),
-            result.data(),
-            size,
-            nullptr,
-            nullptr
-        );
-        return result;
-    }
-
     static bool BrowseForCodexAuthJson(std::string& selectedPath)
     {
         std::array<wchar_t, 32768> fileBuffer{};
 
         if (!selectedPath.empty()) {
-            std::wstring current = Network::get_instance()->Utf8ToWide(selectedPath);
+            std::wstring current = Text::get_instance()->Utf8ToWide(selectedPath);
             wcsncpy_s(fileBuffer.data(), fileBuffer.size(), current.c_str(), _TRUNCATE);
         }
 
         OPENFILENAMEW dialog{};
         dialog.lStructSize = sizeof(dialog);
+        // Owned, so it opens above the topmost Settings window and disables it
+        // while the dialog runs its own modal loop.
+        dialog.hwndOwner = GetActiveWindow();
         dialog.lpstrFilter = L"JSON files (*.json)\0*.json\0All files (*.*)\0*.*\0\0";
         dialog.lpstrFile = fileBuffer.data();
         dialog.nMaxFile = static_cast<DWORD>(fileBuffer.size());
@@ -137,7 +98,7 @@ namespace Renderer
             return false;
         }
 
-        selectedPath = WideToUtf8(fileBuffer.data());
+        selectedPath = Text::get_instance()->WideToUtf8(fileBuffer.data());
         return !selectedPath.empty();
     }
 
@@ -313,8 +274,6 @@ namespace Renderer
     }
 
 #define g_shouldClose (*R().shouldClose)
-#define g_minimizeRequest (*R().minimizeRequest)
-#define g_widgetMode (*R().widgetMode)
 #define g_widgetPinned (*R().widgetPinned)
 #define g_settingsWindowOpen (*R().settingsWindowOpen)
 #define g_codexMutex (*R().codexMutex)
@@ -346,7 +305,6 @@ namespace Renderer
 #define g_notifyPositionIndex (*R().notifyPositionIndex)
 #define g_notifyPosition (*R().notifyPosition)
 #define g_notifyPositionNames (R().notifyPositionNames)
-#define g_notifyPositions (R().notifyPositions)
 #define g_codexNotifySettings (*R().codexNotifySettings)
 #define g_claudeNotifySettings (*R().claudeNotifySettings)
 #define g_zaiNotifySettings (*R().zaiNotifySettings)
@@ -374,572 +332,13 @@ namespace Renderer
         return *R().autoRefreshWarning;
     }
 
-struct UiBar {
-    std::string label;
-    std::string sublabel;
-    std::string rightText;
-    long long resetAtUnixSeconds = 0;
-    std::string detailValue1;
-    std::string detailLabel1;
-    std::string detailValue2;
-    std::string detailLabel2;
-    float usedPercent = 0.0f;
-    bool valid = true;
-    bool red = false;
-    bool white = false;
-    bool green = false;
-    bool thin = false;
-};
-
-
-
-static const char* AccessStateLabel(UsageTelemetry::AccessState state)
-{
-    switch (state) {
-    case UsageTelemetry::AccessState::Available: return "AVAILABLE";
-    case UsageTelemetry::AccessState::RateLimited: return "RATE LIMITED";
-    case UsageTelemetry::AccessState::OutOfUsage: return "OUT OF USAGE";
-    case UsageTelemetry::AccessState::Unavailable: return "UNAVAILABLE";
-    default: return "";
-    }
-}
-
-static ImVec4 AccessStateColor(UsageTelemetry::AccessState state)
-{
-    switch (state) {
-    case UsageTelemetry::AccessState::Available: return ImVec4(0.27f, 0.84f, 0.50f, 1.0f);
-    case UsageTelemetry::AccessState::RateLimited: return ImVec4(1.00f, 0.69f, 0.24f, 1.0f);
-    case UsageTelemetry::AccessState::OutOfUsage: return ImVec4(0.96f, 0.30f, 0.30f, 1.0f);
-    case UsageTelemetry::AccessState::Unavailable: return ImVec4(0.62f, 0.62f, 0.62f, 1.0f);
-    default: return ImVec4(0.62f, 0.62f, 0.62f, 1.0f);
-    }
-}
-
-// Right-aligned telemetry rows leave the cursor at the far right edge, so a
-// following SameLine()+TextWrapped() gets ~2px of wrap width and renders one
-// glyph per line down the edge. Always wrap the trailing detail against the
-// full row instead: continue on the status line only when it actually fits.
-static void DrawStatusDetailText(
-    const char* detail,
-    float contentStartX,
-    float contentRightX
-)
-{
-    const float sameLineX = ImGui::GetCursorPosX() + ImGui::GetStyle().ItemSpacing.x;
-
-    if (sameLineX + ImGui::CalcTextSize(detail).x <= contentRightX) {
-        ImGui::SameLine();
-    }
-    else {
-        ImGui::SetCursorPosX(contentStartX);
-    }
-
-    ImGui::PushTextWrapPos(contentRightX);
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
-    ImGui::TextWrapped("%s", detail);
-    ImGui::PopStyleColor();
-    ImGui::PopTextWrapPos();
-}
-
-static void DrawProviderAccessStatus(const UsageTelemetry::AccessStatus& access)
-{
-    const float contentStartX = ImGui::GetCursorPosX();
-    const float contentRightX = contentStartX + ImGui::GetContentRegionAvail().x;
-
-    const char* label = AccessStateLabel(access.state);
-
-    if (!label || !*label) {
-        return;
-    }
-
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f, 0.92f, 0.92f, 1.0f));
-    ImGui::TextUnformatted("Status:");
-    ImGui::PopStyleColor();
-    ImGui::SameLine(0.0f, 5.0f);
-    ImGui::PushStyleColor(ImGuiCol_Text, AccessStateColor(access.state));
-    ImGui::TextUnformatted(label);
-    ImGui::PopStyleColor();
-
-    if (!access.detail.empty()) {
-        DrawStatusDetailText(access.detail.c_str(), contentStartX, contentRightX);
-    }
-}
-
-static std::string FormatTokenCount(long long value)
-{
-    value = std::max<long long>(0, value);
-    std::string digits = std::to_string(value);
-
-    for (std::ptrdiff_t i = static_cast<std::ptrdiff_t>(digits.size()) - 3; i > 0; i -= 3) {
-        digits.insert(static_cast<size_t>(i), 1, ',');
-    }
-
-    return digits;
-}
-
 static ImU32 Color(int r, int g, int b, int a = 255) {
     return IM_COL32(r, g, b, a);
 }
 
-static std::string FormatPercent(float value) {
-    return Format::get_instance()->Percent(value);
-}
-
-static std::string FormatDetailedPercent(double value) {
-    std::ostringstream out;
-    const double rounded = std::round(value);
-    if (std::fabs(value - rounded) < 0.05) {
-        out << std::fixed << std::setprecision(0) << value;
-    }
-    else {
-        out << std::fixed << std::setprecision(1) << value;
-    }
-    out << "%";
-    return out.str();
-}
-
-static float DisplayPercentValue(float usedPercent) {
-    usedPercent = Math::get_instance()->ClampPercentFloat(usedPercent);
-
-    if (g_showRemaining) {
-        return 100.0f - usedPercent;
-    }
-
-    return usedPercent;
-}
-
-static std::string FormatDisplayPercent(float usedPercent) {
-    std::string text = FormatPercent(DisplayPercentValue(usedPercent));
-
-    if (g_showRemaining) {
-        text += " remaining";
-    }
-    else {
-        text += " used";
-    }
-
-    return text;
-}
-
-static std::string PrefixBeforeTrailingPercent(const std::string& text) {
-    size_t pct = text.rfind('%');
-
-    if (pct == std::string::npos) {
-        return "";
-    }
-
-    size_t doubleSpace = text.rfind("  ", pct);
-
-    if (doubleSpace != std::string::npos) {
-        return text.substr(0, doubleSpace + 2);
-    }
-
-    size_t singleSpace = text.rfind(' ', pct);
-
-    if (singleSpace != std::string::npos) {
-        return text.substr(0, singleSpace + 1);
-    }
-
-    return "";
-}
-
-static std::string FormatResetDateTime(long long unixSeconds);
-
-static std::string TrimRightCopy(std::string text)
-{
-    return Text::get_instance()->TrimRightCopy(text);
-}
-
-static std::string BuildResetDisplayText(const std::string& fallback, long long resetAtUnixSeconds)
-{
-    if (resetAtUnixSeconds > 0) {
-        std::string text = ResetTime::get_instance()->Format(
-            resetAtUnixSeconds,
-            g_resetDisplayMode,
-            g_showResetDateDetails
-        );
-
-        if (!text.empty()) {
-            return text;
-        }
-    }
-
-    return fallback;
-}
-
-static std::string BuildCodexRightText(const Codex::UsageBar& bar) {
-    std::string left;
-
-    if (bar.resetAtUnixSeconds > 0) {
-        left = BuildResetDisplayText("", bar.resetAtUnixSeconds);
-    }
-    else {
-        left = TrimRightCopy(PrefixBeforeTrailingPercent(bar.rightText));
-    }
-
-    if (left.empty()) {
-        return FormatDisplayPercent(bar.usedPercent);
-    }
-
-    return left + "  " + FormatDisplayPercent(bar.usedPercent);
-}
-
-static std::string BuildResetRightText(const std::string& resetText, float usedPercent, long long resetAtUnixSeconds = 0) {
-    std::string left = BuildResetDisplayText(resetText, resetAtUnixSeconds);
-
-    if (left.empty()) {
-        return FormatDisplayPercent(usedPercent);
-    }
-
-    return left + "  " + FormatDisplayPercent(usedPercent);
-}
-
-
-static bool ShouldDrawFlipResetClock(const UiBar& bar)
-{
-    return g_resetDisplayMode == ResetTime::Flip && bar.resetAtUnixSeconds > 0;
-}
-
-static std::string TwoDigit(long long value)
-{
-    value = std::max<long long>(0, value);
-
-    std::ostringstream out;
-    out << std::setw(2) << std::setfill('0') << value;
-    return out.str();
-}
-
-static std::string DisplayPercentFromUiBar(const UiBar& bar)
-{
-    std::string text = FormatPercent(bar.usedPercent);
-
-    if (g_showRemaining) {
-        text += " remaining";
-    }
-    else {
-        text += " used";
-    }
-
-    return text;
-}
-
-struct FlipClockElement
-{
-    enum Kind
-    {
-        Digit,
-        Separator,
-        Text
-    } kind = Text;
-
-    char digit = '0';
-    std::string text;
-    std::string key;
-};
-
-struct FlipDigitVisualState
-{
-    char current = '\0';
-    char previous = '\0';
-    double changedAt = 0.0;
-};
-
-static std::unordered_map<std::string, FlipDigitVisualState> g_flipDigitStates;
-
-static void PushFlipDigit(std::vector<FlipClockElement>& elements, const std::string& keyPrefix, int& digitIndex, char value)
-{
-    FlipClockElement element;
-    element.kind = FlipClockElement::Digit;
-    element.digit = value;
-    element.key = keyPrefix + ":" + std::to_string(digitIndex++);
-    elements.push_back(element);
-}
-
-static void PushFlipDigits(std::vector<FlipClockElement>& elements, const std::string& keyPrefix, int& digitIndex, const std::string& value)
-{
-    for (char ch : value) {
-        PushFlipDigit(elements, keyPrefix, digitIndex, ch);
-    }
-}
-
-static void PushFlipText(std::vector<FlipClockElement>& elements, const std::string& text)
-{
-    FlipClockElement element;
-    element.kind = FlipClockElement::Text;
-    element.text = text;
-    elements.push_back(element);
-}
-
-static void PushFlipSeparator(std::vector<FlipClockElement>& elements, const std::string& text)
-{
-    FlipClockElement element;
-    element.kind = FlipClockElement::Separator;
-    element.text = text;
-    elements.push_back(element);
-}
-
-static std::vector<FlipClockElement> BuildFlipClockElements(const UiBar& bar)
-{
-    long long secondsLeft = bar.resetAtUnixSeconds - static_cast<long long>(std::time(nullptr));
-
-    if (secondsLeft < 0) {
-        secondsLeft = 0;
-    }
-
-    long long days = secondsLeft / 86400;
-    secondsLeft %= 86400;
-    long long hours = secondsLeft / 3600;
-    secondsLeft %= 3600;
-    long long minutes = secondsLeft / 60;
-    long long seconds = secondsLeft % 60;
-
-    std::vector<FlipClockElement> elements;
-    std::string keyPrefix = bar.label + ":" + std::to_string(bar.resetAtUnixSeconds);
-    int digitIndex = 0;
-
-    if (days > 0) {
-        PushFlipDigits(elements, keyPrefix, digitIndex, std::to_string(days));
-        PushFlipText(elements, "d ");
-    }
-
-    PushFlipDigits(elements, keyPrefix, digitIndex, TwoDigit(hours));
-    PushFlipSeparator(elements, ":");
-    PushFlipDigits(elements, keyPrefix, digitIndex, TwoDigit(minutes));
-    PushFlipSeparator(elements, ":");
-    PushFlipDigits(elements, keyPrefix, digitIndex, TwoDigit(seconds));
-    return elements;
-}
-
-static float FlipDigitWidth()
-{
-    return 18.0f;
-}
-
-static float FlipDigitHeight()
-{
-    return 24.0f;
-}
-
-static float FlipElementWidth(const FlipClockElement& element)
-{
-    if (element.kind == FlipClockElement::Digit) {
-        return FlipDigitWidth();
-    }
-
-    float textWidth = ImGui::CalcTextSize(element.text.c_str()).x;
-
-    if (element.kind == FlipClockElement::Separator) {
-        return textWidth + 6.0f;
-    }
-
-    return textWidth + 3.0f;
-}
-
-static float FlipClockWidth(const std::vector<FlipClockElement>& elements, const std::string& percentText)
-{
-    float width = ImGui::CalcTextSize("Resets in").x + 8.0f;
-
-    for (const FlipClockElement& element : elements) {
-        width += FlipElementWidth(element);
-    }
-
-    if (!percentText.empty()) {
-        width += 8.0f + ImGui::CalcTextSize(percentText.c_str()).x;
-    }
-
-    return width;
-}
-
-static bool UpdateFlipDigitState(const std::string& key, char value, char& current, char& previous, float& phase)
-{
-    static constexpr double kFlipDurationSeconds = 0.58;
-
-    double now = ImGui::GetTime();
-    FlipDigitVisualState& state = g_flipDigitStates[key];
-
-    if (state.current == '\0') {
-        state.current = value;
-        state.previous = value;
-        state.changedAt = now - kFlipDurationSeconds;
-    }
-    else if (state.current != value) {
-        state.previous = state.current;
-        state.current = value;
-        state.changedAt = now;
-    }
-
-    current = state.current;
-    previous = state.previous;
-    phase = static_cast<float>((now - state.changedAt) / kFlipDurationSeconds);
-
-    if (phase < 0.0f) {
-        phase = 0.0f;
-    }
-    else if (phase > 1.0f) {
-        phase = 1.0f;
-    }
-
-    return phase < 1.0f && current != previous;
-}
-
-static void DrawDigitTextClipped(ImDrawList* draw, ImVec2 pos, float width, float height, char digit, ImVec2 clipMin, ImVec2 clipMax, ImU32 color)
-{
-    char text[2] = { digit, '\0' };
-    ImVec2 textSize = ImGui::CalcTextSize(text);
-    ImVec2 textPos(pos.x + (width - textSize.x) * 0.5f, pos.y + (height - textSize.y) * 0.5f);
-
-    draw->PushClipRect(clipMin, clipMax, true);
-    draw->AddText(textPos, color, text);
-    draw->PopClipRect();
-}
-
-static void DrawFlipDigitBox(ImDrawList* draw, ImVec2 pos, float width, float height, const std::string& key, char value)
-{
-    const float rounding = 4.0f;
-    const float halfHeight = height * 0.5f;
-    ImVec2 max(pos.x + width, pos.y + height);
-    ImVec2 topMax(pos.x + width, pos.y + halfHeight);
-    ImVec2 bottomMin(pos.x, pos.y + halfHeight);
-    ImVec2 midLeft(pos.x, pos.y + halfHeight);
-    ImVec2 midRight(pos.x + width, pos.y + halfHeight);
-
-    char current = value;
-    char previous = value;
-    float phase = 1.0f;
-    bool flipping = UpdateFlipDigitState(key, value, current, previous, phase);
-
-    char topDigit = current;
-    char bottomDigit = current;
-
-    if (flipping) {
-        if (phase < 0.5f) {
-            topDigit = previous;
-            bottomDigit = current;
-        }
-        else {
-            topDigit = current;
-            bottomDigit = current;
-        }
-    }
-
-    draw->AddRectFilled(pos, topMax, Color(43, 43, 43), rounding, ImDrawFlags_RoundCornersTop);
-    draw->AddRectFilled(bottomMin, max, Color(25, 25, 25), rounding, ImDrawFlags_RoundCornersBottom);
-    draw->AddRect(pos, max, Color(86, 86, 86), rounding);
-
-    DrawDigitTextClipped(draw, pos, width, height, topDigit, pos, topMax, Color(238, 238, 238));
-    DrawDigitTextClipped(draw, pos, width, height, bottomDigit, bottomMin, max, Color(238, 238, 238));
-
-    if (flipping) {
-        if (phase < 0.5f) {
-            float local = phase * 2.0f;
-            int alpha = static_cast<int>(70.0f + local * 85.0f);
-            draw->AddRectFilled(pos, topMax, IM_COL32(0, 0, 0, alpha), rounding, ImDrawFlags_RoundCornersTop);
-
-            float flapHeight = std::max(2.0f, halfHeight * (1.0f - local));
-            draw->AddRectFilled(
-                ImVec2(pos.x + 1.0f, pos.y + halfHeight - flapHeight),
-                ImVec2(max.x - 1.0f, pos.y + halfHeight),
-                IM_COL32(18, 18, 18, 185),
-                2.0f
-            );
-            DrawDigitTextClipped(
-                draw,
-                pos,
-                width,
-                height,
-                previous,
-                ImVec2(pos.x, pos.y + halfHeight - flapHeight),
-                ImVec2(max.x, pos.y + halfHeight),
-                IM_COL32(238, 238, 238, 220)
-            );
-        }
-        else {
-            float local = (phase - 0.5f) * 2.0f;
-            int alpha = static_cast<int>((1.0f - local) * 110.0f);
-            draw->AddRectFilled(bottomMin, max, IM_COL32(255, 255, 255, alpha), rounding, ImDrawFlags_RoundCornersBottom);
-
-            float flapHeight = std::max(2.0f, halfHeight * local);
-            draw->AddRectFilled(
-                bottomMin,
-                ImVec2(max.x, bottomMin.y + flapHeight),
-                IM_COL32(38, 38, 38, 185),
-                2.0f
-            );
-            DrawDigitTextClipped(
-                draw,
-                pos,
-                width,
-                height,
-                current,
-                bottomMin,
-                ImVec2(max.x, bottomMin.y + flapHeight),
-                IM_COL32(238, 238, 238, 230)
-            );
-        }
-    }
-
-    draw->AddLine(midLeft, midRight, Color(9, 9, 9));
-    draw->AddLine(ImVec2(pos.x + 1.0f, pos.y + halfHeight + 1.0f), ImVec2(pos.x + width - 1.0f, pos.y + halfHeight + 1.0f), Color(62, 62, 62));
-}
-
-static void DrawFlipElement(ImDrawList* draw, ImVec2 pos, const FlipClockElement& element)
-{
-    if (element.kind == FlipClockElement::Digit) {
-        DrawFlipDigitBox(draw, pos, FlipDigitWidth(), FlipDigitHeight(), element.key, element.digit);
-        return;
-    }
-
-    ImVec2 textSize = ImGui::CalcTextSize(element.text.c_str());
-    float y = pos.y + (FlipDigitHeight() - textSize.y) * 0.5f;
-    draw->AddText(ImVec2(pos.x, y), Color(190, 190, 190), element.text.c_str());
-}
-
-static void DrawFlipResetClock(ImDrawList* draw, const ImVec2& rowStart, float barWidth, const UiBar& bar)
-{
-    std::vector<FlipClockElement> elements = BuildFlipClockElements(bar);
-    std::string percentText = DisplayPercentFromUiBar(bar);
-
-    float totalWidth = FlipClockWidth(elements, percentText);
-    float x = rowStart.x + std::max(0.0f, barWidth - totalWidth);
-    float y = rowStart.y - 3.0f;
-
-    const char* prefix = "Resets in";
-    ImVec2 prefixSize = ImGui::CalcTextSize(prefix);
-    draw->AddText(ImVec2(x, rowStart.y), Color(190, 190, 190), prefix);
-    x += prefixSize.x + 8.0f;
-
-    for (const FlipClockElement& element : elements) {
-        DrawFlipElement(draw, ImVec2(x, y), element);
-        x += FlipElementWidth(element);
-    }
-
-    if (!percentText.empty()) {
-        x += 8.0f;
-        draw->AddText(ImVec2(x, rowStart.y), Color(190, 190, 190), percentText.c_str());
-    }
-}
-
-static void DrawUsageModeCheckbox() {
-    ImGui::SameLine();
-    ImGui::Checkbox("Show remaining", &g_showRemaining);
-}
-
-static std::string FormatExpiryTime(std::chrono::system_clock::time_point tp) {
-    return Format::get_instance()->ExpiryTime(tp);
-}
-
-static std::string FormatTimeRemaining(std::chrono::system_clock::time_point tp) {
-    return Format::get_instance()->TimeRemaining(tp);
-}
-
-static std::string FormatResetDateTime(long long unixSeconds)
-{
-    return Format::get_instance()->ResetDateTime(unixSeconds);
-}
-
-
-// Widget-only sans fonts (Segoe UI), loaded in ApplyStyle before the DX11 atlas
-// is built. Null when unavailable, in which case the widget uses the default.
+// Widget-only sans fonts (Segoe UI), loaded by ReloadFonts before the DX11
+// atlas is built. Null when unavailable, in which case the widget uses the
+// default.
 static ImFont* g_widgetFont = nullptr;
 static ImFont* g_widgetBigFont = nullptr;
 
@@ -1033,18 +432,8 @@ bool ConsumeFontReloadRequest()
     return requested;
 }
 
-static void ApplyStyleColorsInternal();
-
+// Style only: the app calls ReloadFonts straight after, which builds the atlas.
 void ApplyStyle() {
-    LoadInterfaceFonts(14);
-    ApplyStyleColorsInternal();
-}
-
-void ApplyStyleColorsOnly() {
-    ApplyStyleColorsInternal();
-}
-
-static void ApplyStyleColorsInternal() {
     ImGuiStyle& style = ImGui::GetStyle();
 
     style.WindowRounding = 10.0f;
@@ -1131,666 +520,6 @@ static void DrawThinBar(float displayPercent, float width, ImU32 fillColor, floa
     ImGui::Dummy(ImVec2(width, height));
 }
 
-static void DrawCustomTitleBar() {
-    ImGui::BeginChild("##title_bar", ImVec2(0.0f, 38.0f), false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-
-    ImVec2 titleMin = ImGui::GetWindowPos();
-    ImVec2 titleSize = ImGui::GetWindowSize();
-
-    ImDrawList* draw = ImGui::GetWindowDrawList();
-
-    draw->AddRectFilled(titleMin, ImVec2(titleMin.x + titleSize.x, titleMin.y + titleSize.y), Color(22, 22, 22), 10.0f, ImDrawFlags_RoundCornersTop);
-
-    ImGui::SetCursorPos(ImVec2(12.0f, 9.0f));
-
-    ImVec2 iconPos = ImGui::GetCursorScreenPos();
-
-    DrawGenericQuotaIcon(ImVec2(iconPos.x + 10.0f, iconPos.y + 10.0f), 18.0f);
-
-    ImGui::SetCursorPosX(38.0f);
-    if (g_widgetFont) {
-        ImGui::PushFont(g_widgetFont);
-        ImGui::TextUnformatted("AI Quota Checker");
-        ImGui::PopFont();
-    }
-    else {
-        ImGui::TextUnformatted("AI Quota Checker");
-    }
-
-    ImGui::SameLine();
-
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.50f, 0.50f, 0.50f, 1.0f));
-    // ImGui::TextUnformatted("Made with Love");
-    ImGui::PopStyleColor();
-
-    // Keep this strip in sync with kTitleBarButtonStrip in AIQuotaChecker.cpp.
-    // WM_NCHITTEST reports HTCAPTION for the rest of the bar, and Windows eats
-    // those clicks for window dragging before ImGui ever sees them.
-    ImGui::SetCursorPos(ImVec2(titleSize.x - 114.0f, 6.0f));
-
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.16f, 0.16f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.28f, 0.28f, 0.28f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.38f, 0.38f, 0.38f, 1.0f));
-
-    if (ImGui::Button("-", ImVec2(30.0f, 24.0f))) {
-        g_minimizeRequest = true;
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Minimize");
-    }
-
-    ImGui::SameLine(0.0f, 6.0f);
-
-    if (ImGui::Button(g_widgetMode ? "[]" : "[.]", ImVec2(30.0f, 24.0f))) {
-        g_widgetMode = !g_widgetMode;
-        if (R().saveAppSettings) R().saveAppSettings();
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip(g_widgetMode ? "Leave widget mode" : "Dock as desktop widget");
-    }
-
-    ImGui::PopStyleColor(3);
-
-    ImGui::SameLine(0.0f, 6.0f);
-
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.16f, 0.16f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.62f, 0.12f, 0.12f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.82f, 0.16f, 0.16f, 1.0f));
-
-    if (ImGui::Button("X", ImVec2(30.0f, 24.0f))) {
-        g_shouldClose = true;
-    }
-
-    ImGui::PopStyleColor(3);
-    ImGui::EndChild();
-}
-
-static void DrawUsageDetailCell(const std::string& value, const std::string& label)
-{
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f, 0.92f, 0.92f, 1.0f));
-    ImGui::TextUnformatted(value.empty() ? "--" : value.c_str());
-    ImGui::PopStyleColor();
-
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.58f, 0.58f, 0.58f, 1.0f));
-    ImGui::TextUnformatted(label.c_str());
-    ImGui::PopStyleColor();
-}
-
-static void DrawUnifiedUsageCard(const char* title, const std::vector<UiBar>& bars, float cardWidth) {
-    float cardHeight = 50.0f;
-
-    for (const UiBar& bar : bars) {
-        if (!bar.valid) {
-            continue;
-        }
-
-        if (bar.green) {
-            cardHeight += bar.sublabel.empty() ? 66.0f : 88.0f;
-        }
-        else {
-            cardHeight += bar.sublabel.empty() ? 54.0f : 70.0f;
-        }
-
-        if (ShouldDrawFlipResetClock(bar)) {
-            cardHeight += 8.0f;
-        }
-
-        if (!bar.detailValue1.empty() || !bar.detailLabel1.empty() || !bar.detailValue2.empty() || !bar.detailLabel2.empty()) {
-            cardHeight += 72.0f;
-        }
-    }
-
-    // The card is owner-drawn while the row content still advances ImGui's
-    // layout cursor. Use a conservative footer/row pad so Claude's credit
-    // details and Grok's extra-credit row cannot clip at the card bottom.
-    cardHeight += 36.0f + static_cast<float>(bars.size()) * 18.0f;
-
-    ImGui::BeginChild(title, ImVec2(cardWidth, cardHeight), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-
-    ImDrawList* draw = ImGui::GetWindowDrawList();
-    ImVec2 min = ImGui::GetWindowPos();
-    ImVec2 max{ min.x + cardWidth, min.y + cardHeight };
-
-    draw->AddRectFilled(min, max, Color(35, 35, 35), 8.0f);
-    draw->AddRect(min, max, Color(58, 58, 58), 8.0f);
-
-    ImGui::SetCursorPos(ImVec2(14.0f, 12.0f));
-
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.82f, 0.82f, 0.82f, 1.0f));
-    ImGui::TextUnformatted(title);
-    ImGui::PopStyleColor();
-
-    const bool hasValidBar = std::any_of(
-        bars.begin(),
-        bars.end(),
-        [](const UiBar& bar) { return bar.valid; }
-    );
-
-    if (!hasValidBar) {
-        // Do not move the cursor to the first row unless a row will actually
-        // submit an item. On startup an empty usage vector used to leave a raw
-        // SetCursorPos() as the final layout operation, which triggers ImGui's
-        // cursor-extent assertion in EndChild().
-        ImGui::EndChild();
-        return;
-    }
-
-    ImGui::SetCursorPos(ImVec2(14.0f, 42.0f));
-    float barWidth = cardWidth - 28.0f;
-
-    for (const UiBar& bar : bars) {
-        if (!bar.valid) {
-            continue;
-        }
-
-        ImGui::PushID(bar.label.c_str());
-
-        ImDrawList* rowDraw = ImGui::GetWindowDrawList();
-        ImVec2 rowStart = ImGui::GetCursorScreenPos();
-
-        rowDraw->AddText(ImVec2(rowStart.x, rowStart.y), Color(235, 235, 235), bar.label.c_str());
-
-        bool drawFlipClock = ShouldDrawFlipResetClock(bar);
-
-        if (drawFlipClock) {
-            DrawFlipResetClock(rowDraw, rowStart, barWidth, bar);
-        }
-        else {
-            ImVec2 rightSize = ImGui::CalcTextSize(bar.rightText.c_str());
-            rowDraw->AddText(ImVec2(rowStart.x + barWidth - rightSize.x, rowStart.y), Color(190, 190, 190), bar.rightText.c_str());
-        }
-
-        ImGui::Dummy(ImVec2(barWidth, drawFlipClock ? 28.0f : 20.0f));
-
-        if (drawFlipClock && ImGui::IsItemHovered() && !bar.rightText.empty()) {
-            ImGui::SetTooltip("%s", bar.rightText.c_str());
-        }
-
-        if (!bar.sublabel.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
-            ImGui::TextUnformatted(bar.sublabel.c_str());
-            ImGui::PopStyleColor();
-            ImGui::Dummy(ImVec2(barWidth, 2.0f));
-        }
-
-        ImU32 fill = Color(38, 132, 255);
-
-        if (bar.red) {
-            fill = Color(238, 65, 65);
-        }
-        else if (bar.green) {
-            fill = Color(68, 215, 128);
-        }
-        else if (bar.white) {
-            fill = Color(235, 235, 235);
-        }
-
-        float barHeight = bar.green ? 6.0f : (bar.thin ? 3.0f : 7.0f);
-        DrawThinBar(bar.usedPercent, barWidth, fill, barHeight);
-
-        if (!bar.detailValue1.empty() || !bar.detailLabel1.empty() || !bar.detailValue2.empty() || !bar.detailLabel2.empty()) {
-            ImGui::Dummy(ImVec2(barWidth, 13.0f));
-
-            if (ImGui::BeginTable("##usage_details", 2, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoSavedSettings)) {
-                ImGui::TableNextRow();
-
-                ImGui::TableSetColumnIndex(0);
-                DrawUsageDetailCell(bar.detailValue1, bar.detailLabel1);
-
-                ImGui::TableSetColumnIndex(1);
-                DrawUsageDetailCell(bar.detailValue2, bar.detailLabel2);
-
-                ImGui::EndTable();
-            }
-        }
-
-        ImGui::Dummy(ImVec2(barWidth, 16.0f));
-        ImGui::PopID();
-    }
-
-    ImGui::EndChild();
-}
-
-static bool IsUsableResetCreditStatus(const std::string& status)
-{
-    std::string lower = status;
-
-    std::transform(lower.begin(), lower.end(), lower.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-
-    // Codex 26.1027 statuses are available, redeeming and redeemed; only
-    // available can still be spent.
-    return lower.empty() || lower == "available";
-}
-
-static void DrawCodexResetCreditsCard(const Codex::Snapshot& snapshot, float cardWidth) {
-    int bankedCount = snapshot.resetCreditsAvailableCount >= 0
-        ? snapshot.resetCreditsAvailableCount
-        : static_cast<int>(snapshot.resetCredits.size());
-
-    int ledgerUsableCount = 0;
-
-    for (const Codex::ResetCredit& credit : snapshot.resetCreditLedger) {
-        if (IsUsableResetCreditStatus(credit.status)) {
-            ++ledgerUsableCount;
-        }
-    }
-
-    int notReflectedYet = std::max(ledgerUsableCount - bankedCount, 0);
-    size_t ledgerCount = snapshot.resetCreditLedger.size();
-    bool showPendingLine = notReflectedYet > 0;
-
-    float rowHeight = 28.0f;
-    float rows = static_cast<float>(std::max<size_t>(1, ledgerCount));
-    float cardHeight = (showPendingLine ? 98.0f : 78.0f) + rows * rowHeight;
-
-    ImGui::BeginChild("##codex_resets_card", ImVec2(cardWidth, cardHeight), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-
-    ImGui::Text("Reset credits: %d banked", bankedCount);
-
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
-    ImGui::Text("Reset-credit ledger: %d usable %s", ledgerUsableCount, ledgerUsableCount == 1 ? "entry" : "entries");
-    ImGui::PopStyleColor();
-
-    if (showPendingLine) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.00f, 0.78f, 0.25f, 1.0f));
-        ImGui::Text("Pending/not reflected yet: %d", notReflectedYet);
-        ImGui::PopStyleColor();
-    }
-
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    if (snapshot.resetCreditLedger.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
-        ImGui::TextUnformatted("No reset-credit ledger entries returned");
-        ImGui::PopStyleColor();
-        ImGui::EndChild();
-        return;
-    }
-
-    if (ImGui::BeginTable("##codex_reset_table", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
-        ImGui::TableSetupColumn("Credit", ImGuiTableColumnFlags_WidthStretch, 0.58f);
-        ImGui::TableSetupColumn("Expires", ImGuiTableColumnFlags_WidthStretch, 0.42f);
-
-        for (size_t i = 0; i < snapshot.resetCreditLedger.size(); ++i) {
-            const Codex::ResetCredit& credit = snapshot.resetCreditLedger[i];
-
-            std::string left = "Ledger #" + std::to_string(i + 1);
-
-            if (!credit.status.empty()) {
-                left += " · ";
-                left += credit.status;
-            }
-
-            if (!credit.title.empty()) {
-                left += " · ";
-                left += credit.title;
-            }
-
-            if (!credit.resetType.empty()) {
-                left += " · ";
-                left += credit.resetType;
-            }
-
-            std::string expires = credit.expiresAt.time_since_epoch().count() != 0
-                ? FormatExpiryTime(credit.expiresAt)
-                : "--";
-
-            std::string remaining = credit.expiresAt.time_since_epoch().count() != 0
-                ? FormatTimeRemaining(credit.expiresAt)
-                : "unknown";
-
-            ImGui::TableNextRow();
-
-            ImGui::TableSetColumnIndex(0);
-            ImGui::TextUnformatted(left.c_str());
-
-            ImGui::TableSetColumnIndex(1);
-            std::string right = expires + " · " + remaining;
-            float rightWidth = ImGui::GetContentRegionAvail().x;
-            float rightTextWidth = ImGui::CalcTextSize(right.c_str()).x;
-
-            if (rightTextWidth < rightWidth) {
-                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + rightWidth - rightTextWidth);
-            }
-
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
-            ImGui::TextUnformatted(right.c_str());
-            ImGui::PopStyleColor();
-        }
-
-        ImGui::EndTable();
-    }
-
-    ImGui::EndChild();
-}
-
-static void DrawCodexExtraUsageCard(const Codex::Snapshot& snapshot, float cardWidth) {
-    const bool showCredits = snapshot.creditBalance.valid;
-    const bool showSpendDetails = snapshot.extraUsage.valid && !snapshot.extraUsage.hasUsedPercent;
-
-    if (!showCredits && !showSpendDetails) {
-        return;
-    }
-
-    const int rows = (showCredits ? 1 : 0) + (showSpendDetails ? 1 : 0);
-    const float cardHeight = 24.0f + static_cast<float>(rows) * 50.0f;
-
-    ImGui::BeginChild("##codex_extra_usage_card", ImVec2(cardWidth, cardHeight), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-
-    if (ImGui::BeginTable("##codex_extra_table", 2, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoSavedSettings)) {
-        if (showCredits) {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            DrawUsageDetailCell(snapshot.creditBalance.balanceText, "Credit balance");
-            ImGui::TableSetColumnIndex(1);
-            DrawUsageDetailCell(
-                snapshot.creditBalance.unlimited ? "Unlimited" : (snapshot.creditBalance.hasCredits ? "Available" : "Unavailable"),
-                "Extra usage credits"
-            );
-        }
-
-        if (showSpendDetails) {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            DrawUsageDetailCell(
-                snapshot.extraUsage.spentText.empty() ? snapshot.extraUsage.limitText : snapshot.extraUsage.spentText,
-                snapshot.extraUsage.label
-            );
-            ImGui::TableSetColumnIndex(1);
-            DrawUsageDetailCell(
-                snapshot.extraUsage.remainingText.empty() ? snapshot.extraUsage.limitText : snapshot.extraUsage.remainingText,
-                "Remaining"
-            );
-        }
-
-        ImGui::EndTable();
-    }
-
-    ImGui::EndChild();
-}
-
-static void DrawClaudeExtraUsageCard(const Claude::Snapshot& snapshot, float cardWidth) {
-    // The Usage credits section remains visible even when Claude omits spend
-    // data. This keeps the section independent from Session/Weekly exhaustion
-    // without inventing a balance or utilization value.
-    if (snapshot.credits.valid && snapshot.credits.enabled && snapshot.credits.hasUsedPercent) {
-        return;
-    }
-
-    const float cardHeight = 74.0f;
-
-    ImGui::BeginChild(
-        "##claude_extra_usage_card",
-        ImVec2(cardWidth, cardHeight),
-        true,
-        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse
-    );
-
-    if (ImGui::BeginTable(
-        "##claude_extra_usage_table",
-        2,
-        ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoSavedSettings
-    )) {
-        ImGui::TableNextRow();
-
-        ImGui::TableSetColumnIndex(0);
-        DrawUsageDetailCell(
-            snapshot.credits.spentText.empty() ? "Unavailable" : snapshot.credits.spentText,
-            snapshot.credits.label.empty() ? "Usage credits" : snapshot.credits.label.c_str()
-        );
-
-        ImGui::TableSetColumnIndex(1);
-        const std::string creditLimit = !snapshot.credits.monthlyLimitText.empty()
-            ? snapshot.credits.monthlyLimitText
-            : (!snapshot.credits.limitText.empty() ? snapshot.credits.limitText : "Unavailable");
-        DrawUsageDetailCell(
-            creditLimit,
-            snapshot.credits.resetText.empty()
-                ? (snapshot.credits.reported ? "Monthly spend limit" : "Not returned by provider")
-                : snapshot.credits.resetText
-        );
-
-        ImGui::EndTable();
-    }
-
-    ImGui::EndChild();
-}
-
-static std::vector<UiBar> BuildCodexBars(const Codex::Snapshot& snapshot) {
-    std::vector<UiBar> bars;
-
-    for (const Codex::UsageBar& b : snapshot.bars) {
-        if (!b.valid) {
-            continue;
-        }
-
-        UiBar row;
-        row.label = b.label;
-        row.sublabel = b.sublabel;
-        row.rightText = BuildCodexRightText(b);
-        row.resetAtUnixSeconds = b.resetAtUnixSeconds;
-        row.usedPercent = DisplayPercentValue(b.usedPercent);
-        row.valid = b.valid;
-        row.red = false;
-        row.white = true;
-        row.thin = false;
-        bars.push_back(row);
-    }
-
-    if (snapshot.extraUsage.valid && snapshot.extraUsage.hasUsedPercent) {
-        UiBar row;
-        row.label = snapshot.extraUsage.label;
-        row.sublabel = snapshot.extraUsage.spentText;
-        row.rightText = BuildResetRightText(
-            snapshot.extraUsage.resetText,
-            snapshot.extraUsage.usedPercent,
-            snapshot.extraUsage.resetAtUnixSeconds
-        );
-        row.resetAtUnixSeconds = snapshot.extraUsage.resetAtUnixSeconds;
-        row.usedPercent = DisplayPercentValue(snapshot.extraUsage.usedPercent);
-        row.valid = true;
-        row.red = false;
-        row.white = true;
-        row.thin = false;
-        row.detailValue1 = snapshot.extraUsage.limitText;
-        row.detailLabel1 = snapshot.extraUsage.limitText.empty() ? "" : "Monthly limit";
-        row.detailValue2 = snapshot.extraUsage.remainingText;
-        row.detailLabel2 = snapshot.extraUsage.remainingText.empty() ? "" : "Remaining";
-        bars.push_back(row);
-    }
-
-    return bars;
-}
-
-static std::vector<UiBar> BuildClaudeBars(const Claude::Snapshot& snapshot) {
-    std::vector<UiBar> bars;
-
-    if (snapshot.currentSession.valid) {
-        UiBar row;
-        row.label = snapshot.currentSession.title;
-        row.sublabel = snapshot.currentSession.subtitle;
-        row.rightText = BuildResetRightText(snapshot.currentSession.resetText, snapshot.currentSession.usedPercent, snapshot.currentSession.resetAtUnixSeconds);
-        row.resetAtUnixSeconds = snapshot.currentSession.resetAtUnixSeconds;
-        row.usedPercent = DisplayPercentValue(snapshot.currentSession.usedPercent);
-        row.valid = true;
-        row.red = false;
-        row.white = false;
-        row.thin = true;
-        bars.push_back(row);
-    }
-
-    if (snapshot.weeklyAllModels.valid) {
-        UiBar row;
-        row.label = snapshot.weeklyAllModels.title;
-        row.sublabel = snapshot.weeklyAllModels.subtitle;
-        row.rightText = BuildResetRightText(snapshot.weeklyAllModels.resetText, snapshot.weeklyAllModels.usedPercent, snapshot.weeklyAllModels.resetAtUnixSeconds);
-        row.resetAtUnixSeconds = snapshot.weeklyAllModels.resetAtUnixSeconds;
-        row.usedPercent = DisplayPercentValue(snapshot.weeklyAllModels.usedPercent);
-        row.valid = true;
-        row.red = false;
-        row.white = false;
-        row.thin = true;
-        bars.push_back(row);
-    }
-
-    if (snapshot.weeklySonnet.valid) {
-        UiBar row;
-        row.label = snapshot.weeklySonnet.title;
-        row.sublabel = snapshot.weeklySonnet.subtitle;
-        row.rightText = BuildResetRightText(snapshot.weeklySonnet.resetText, snapshot.weeklySonnet.usedPercent, snapshot.weeklySonnet.resetAtUnixSeconds);
-        row.resetAtUnixSeconds = snapshot.weeklySonnet.resetAtUnixSeconds;
-        row.usedPercent = DisplayPercentValue(snapshot.weeklySonnet.usedPercent);
-        row.valid = true;
-        row.red = false;
-        row.white = false;
-        row.thin = true;
-        bars.push_back(row);
-    }
-
-    if (snapshot.weeklyFable.valid) {
-        UiBar row;
-        row.label = snapshot.weeklyFable.title;
-        row.sublabel = snapshot.weeklyFable.subtitle;
-        row.rightText = BuildResetRightText(snapshot.weeklyFable.resetText, snapshot.weeklyFable.usedPercent, snapshot.weeklyFable.resetAtUnixSeconds);
-        row.resetAtUnixSeconds = snapshot.weeklyFable.resetAtUnixSeconds;
-        row.usedPercent = DisplayPercentValue(snapshot.weeklyFable.usedPercent);
-        row.valid = true;
-        row.red = false;
-        row.white = false;
-        row.thin = true;
-        bars.push_back(row);
-    }
-
-    for (const Claude::UsageWindow& limit : snapshot.additionalLimits) {
-        if (!limit.valid) {
-            continue;
-        }
-
-        UiBar row;
-        row.label = limit.title;
-        row.sublabel = limit.subtitle;
-        row.rightText = BuildResetRightText(limit.resetText, limit.usedPercent, limit.resetAtUnixSeconds);
-        row.resetAtUnixSeconds = limit.resetAtUnixSeconds;
-        row.usedPercent = DisplayPercentValue(limit.usedPercent);
-        row.valid = true;
-        row.red = false;
-        row.white = false;
-        row.thin = true;
-        bars.push_back(row);
-    }
-
-    if (snapshot.credits.valid && snapshot.credits.enabled && snapshot.credits.hasUsedPercent) {
-        UiBar row;
-        row.label = snapshot.credits.label.empty() ? "Usage credits" : snapshot.credits.label;
-        row.sublabel = snapshot.credits.spentText;
-        row.rightText = BuildResetRightText(snapshot.credits.resetText, snapshot.credits.usedPercent, snapshot.credits.resetAtUnixSeconds);
-        row.resetAtUnixSeconds = snapshot.credits.resetAtUnixSeconds;
-        row.usedPercent = DisplayPercentValue(snapshot.credits.usedPercent);
-        row.valid = true;
-        row.red = true;
-        row.white = false;
-        row.thin = true;
-        row.detailValue1 = snapshot.credits.monthlyLimitText;
-        row.detailLabel1 = "Monthly spend limit";
-        row.detailValue2 = snapshot.credits.currentBalanceText;
-        row.detailLabel2 = "Current balance";
-        bars.push_back(row);
-    }
-
-    return bars;
-}
-
-static std::vector<UiBar> BuildZAiBars(const ZAi::Snapshot& snapshot) {
-    std::vector<UiBar> bars;
-
-    for (const ZAi::UsageBar& b : snapshot.bars) {
-        if (!b.valid) {
-            continue;
-        }
-
-        UiBar row;
-        row.label = b.label;
-        row.sublabel = b.sublabel;
-        row.rightText = BuildResetRightText(b.resetText, b.usedPercent, b.resetAtUnixSeconds);
-        row.resetAtUnixSeconds = b.resetAtUnixSeconds;
-        row.usedPercent = DisplayPercentValue(b.usedPercent);
-        row.valid = true;
-        row.red = b.red;
-        row.white = b.white;
-        row.green = b.green;
-        row.thin = b.thin;
-        bars.push_back(row);
-    }
-
-    return bars;
-}
-
-static std::vector<UiBar> BuildGrokBars(const Grok::Snapshot& snapshot) {
-    std::vector<UiBar> bars;
-
-    if (snapshot.weeklyLimit.valid) {
-        UiBar row;
-        row.label = snapshot.weeklyLimit.title;
-        row.sublabel = snapshot.weeklyLimit.subtitle;
-        row.rightText = BuildResetRightText(snapshot.weeklyLimit.resetText, snapshot.weeklyLimit.usedPercent, snapshot.weeklyLimit.resetAtUnixSeconds);
-        row.resetAtUnixSeconds = snapshot.weeklyLimit.resetAtUnixSeconds;
-        row.usedPercent = snapshot.weeklyLimit.usedPercent;
-        row.valid = true;
-        row.red = false;
-        row.white = true;
-        row.thin = false;
-        bars.push_back(row);
-    }
-
-    if (snapshot.extraCredits.valid) {
-        UiBar row;
-        row.label = snapshot.extraCredits.balanceText;
-        row.sublabel = "Extra Usage Credits";
-        row.rightText = "";
-        row.usedPercent = snapshot.extraCredits.usedPercent;
-        row.valid = true;
-        row.red = false;
-        row.white = true;
-        row.thin = true;
-        row.detailValue1 = snapshot.extraCredits.usedText;
-        row.detailLabel1 = "On-demand used";
-        row.detailValue2 = snapshot.extraCredits.balanceText;
-        row.detailLabel2 = "Credit balance";
-        bars.push_back(row);
-    }
-
-    return bars;
-}
-
-static void DrawZAiDetailsCard(const ZAi::Snapshot& snapshot, float cardWidth) {
-    if (snapshot.details.empty()) {
-        return;
-    }
-
-    float rowHeight = 34.0f;
-    float cardHeight = 32.0f + static_cast<float>(snapshot.details.size()) * rowHeight;
-
-    ImGui::BeginChild("##zai_details_card", ImVec2(cardWidth, cardHeight), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-
-    if (ImGui::BeginTable("##zai_details_table", 2, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoSavedSettings)) {
-        for (const ZAi::DetailRow& row : snapshot.details) {
-            ImGui::TableNextRow();
-
-            ImGui::TableSetColumnIndex(0);
-            DrawUsageDetailCell(row.leftValue, row.leftLabel);
-
-            ImGui::TableSetColumnIndex(1);
-            DrawUsageDetailCell(row.rightValue, row.rightLabel);
-        }
-
-        ImGui::EndTable();
-    }
-
-    ImGui::EndChild();
-}
-
 static std::string FormatCompactTokenCount(long long value)
 {
     value = std::max<long long>(0, value);
@@ -1798,7 +527,11 @@ static std::string FormatCompactTokenCount(long long value)
     std::ostringstream out;
     out << std::fixed << std::setprecision(1);
 
-    if (value >= 1000000) {
+    // Lifetime and yearly totals run into the billions.
+    if (value >= 1000000000) {
+        out << (static_cast<double>(value) / 1000000000.0) << "B";
+    }
+    else if (value >= 1000000) {
         out << (static_cast<double>(value) / 1000000.0) << "M";
     }
     else if (value >= 1000) {
@@ -1810,7 +543,6 @@ static std::string FormatCompactTokenCount(long long value)
 
     return out.str();
 }
-
 
 static std::string FormatRunDuration(long long seconds)
 {
@@ -1878,620 +610,13 @@ static void DrawClaudeThinkingShimmer(const char* text)
     ImGui::Dummy(size);
 }
 
-static void DrawClaudeStatusValue(
-    const char* label,
-    bool thinking,
-    bool thoughtComplete,
-    bool compacting,
-    UsageTelemetry::AccessState accessState
-)
-{
-    if (thinking) {
-        DrawClaudeThinkingShimmer(label);
-        return;
-    }
-
-    const ImVec4 color = thoughtComplete
-        ? ImVec4(0.64f, 0.64f, 0.64f, 1.0f)
-        : (compacting
-            ? ImVec4(1.00f, 0.58f, 0.24f, 1.0f)
-            : AccessStateColor(accessState));
-
-    ImGui::PushStyleColor(ImGuiCol_Text, color);
-    ImGui::TextUnformatted(label);
-    ImGui::PopStyleColor();
-}
-
-static void DrawClaudeAccessStatus(
-    const UsageTelemetry::AccessStatus& access,
-    const UsageTelemetry::ContextUsage& context,
-    const UsageTelemetry::RunUsage& run
-)
-{
-    // Capture the full row bounds before any right-aligned telemetry shrinks
-    // GetContentRegionAvail(). See DrawStatusDetailText.
-    const float contentStartX = ImGui::GetCursorPosX();
-    const float contentRightX = contentStartX + ImGui::GetContentRegionAvail().x;
-
-    const bool canOverride =
-        access.state == UsageTelemetry::AccessState::Available ||
-        access.state == UsageTelemetry::AccessState::Unknown;
-    const bool compacting = canOverride && context.compacting;
-    const bool activeRun = canOverride && !compacting && run.valid && run.running;
-    const long long nowUnix = static_cast<long long>(std::time(nullptr));
-    constexpr long long kThoughtNoticeSeconds = 5;
-    const bool thoughtComplete = activeRun &&
-        run.lastThoughtDurationSeconds > 0 &&
-        run.lastThoughtCompletedAtUnixSeconds > 0 &&
-        nowUnix >= run.lastThoughtCompletedAtUnixSeconds &&
-        nowUnix - run.lastThoughtCompletedAtUnixSeconds <= kThoughtNoticeSeconds;
-    const bool thinking = activeRun && run.thinking && !thoughtComplete;
-
-    std::string stateLabel;
-    if (compacting) {
-        stateLabel = "COMPACTING";
-    }
-    else if (thoughtComplete) {
-        // Keep this visible briefly even if a tool_result has already started
-        // the next reasoning cycle. After five seconds it flips back to the
-        // live THINKING state automatically.
-        stateLabel = "THOUGHT FOR " + FormatRunDuration(run.lastThoughtDurationSeconds);
-    }
-    else if (thinking || activeRun) {
-        stateLabel = "THINKING";
-    }
-    else {
-        const char* accessLabel = AccessStateLabel(access.state);
-        stateLabel = accessLabel ? accessLabel : "";
-    }
-
-    if (stateLabel.empty()) {
-        return;
-    }
-
-    // Keep "Status:" white. Only the current state value carries state color.
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f, 0.92f, 0.92f, 1.0f));
-    ImGui::TextUnformatted("Status:");
-    ImGui::PopStyleColor();
-
-    ImGui::SameLine(0.0f, 5.0f);
-    DrawClaudeStatusValue(
-        stateLabel.c_str(),
-        thinking,
-        thoughtComplete,
-        compacting,
-        access.state
-    );
-
-    const bool transientState = compacting || activeRun;
-    if (transientState && run.valid && run.running) {
-        const long long timerStart = compacting && context.compactionStartedAtUnixSeconds > 0
-            ? context.compactionStartedAtUnixSeconds
-            : run.startedAtUnixSeconds;
-        const long long elapsed = timerStart > 0 && nowUnix >= timerStart
-            ? nowUnix - timerStart
-            : 0;
-
-        std::string telemetry = FormatRunDuration(elapsed);
-        if (run.tokenStatsValid) {
-            telemetry += " · Current Tokens: " + FormatCompactTokenCount(run.currentTokens);
-        }
-        if (run.tokens > 0) {
-            telemetry += " · Total Tokens: " + FormatCompactTokenCount(run.tokens);
-        }
-
-        // Match the right-aligned reset/usage text used by the quota rows.
-        ImGui::SameLine();
-        const float telemetryWidth = ImGui::CalcTextSize(telemetry.c_str()).x;
-        const float currentX = ImGui::GetCursorPosX();
-        const float targetX = currentX + ImGui::GetContentRegionAvail().x - telemetryWidth;
-        if (targetX > currentX) {
-            ImGui::SetCursorPosX(targetX);
-        }
-
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.70f, 0.70f, 1.0f));
-        ImGui::TextUnformatted(telemetry.c_str());
-        ImGui::PopStyleColor();
-
-        // Current Tokens above is already Claude's output_tokens, so do not
-        // duplicate it as "Out". "In" is the effective prompt input including
-        // cache reads/creation. Only render this row when real token telemetry
-        // is available so placeholder characters never appear in the UI.
-        if (run.tokenStatsValid) {
-            const std::string tokenStats =
-                "In: " + FormatCompactTokenCount(run.inputTokens) +
-                " · Cache Read: " + FormatCompactTokenCount(run.cacheReadInputTokens) +
-                " · Cache Create: " + FormatCompactTokenCount(run.cacheCreationInputTokens);
-
-            // Right-align the token breakdown to match the other detail text.
-            const float tokenStatsWidth = ImGui::CalcTextSize(tokenStats.c_str()).x;
-            const float availableWidth = ImGui::GetContentRegionAvail().x;
-            if (tokenStatsWidth < availableWidth) {
-                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + availableWidth - tokenStatsWidth);
-            }
-
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
-            ImGui::TextUnformatted(tokenStats.c_str());
-            ImGui::PopStyleColor();
-        }
-    }
-
-    if (!transientState && !access.detail.empty()) {
-        DrawStatusDetailText(access.detail.c_str(), contentStartX, contentRightX);
-    }
-}
-
-static void DrawCodexAccessStatus(
-    const UsageTelemetry::AccessStatus& access,
-    const UsageTelemetry::ContextUsage& context,
-    const UsageTelemetry::RunUsage& run
-)
-{
-    // Capture the full row bounds before drawing any right-aligned telemetry.
-    // GetContentRegionAvail() becomes very small after the first right-aligned
-    // item, which previously caused the second token row to begin at the far
-    // right edge and wrap one character per line.
-    const float contentStartX = ImGui::GetCursorPosX();
-    const float contentRightX = contentStartX + ImGui::GetContentRegionAvail().x;
-
-    const bool canOverride =
-        access.state == UsageTelemetry::AccessState::Available ||
-        access.state == UsageTelemetry::AccessState::Unknown;
-    const bool compacting = canOverride && context.compacting;
-    const bool activeRun = canOverride && !compacting && run.valid && run.running;
-
-    std::string stateLabel;
-    if (compacting) {
-        stateLabel = "COMPACTING";
-    }
-    else if (activeRun) {
-        stateLabel = "THINKING";
-    }
-    else {
-        const char* accessLabel = AccessStateLabel(access.state);
-        stateLabel = accessLabel ? accessLabel : "";
-    }
-
-    if (stateLabel.empty()) {
-        return;
-    }
-
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f, 0.92f, 0.92f, 1.0f));
-    ImGui::TextUnformatted("Status:");
-    ImGui::PopStyleColor();
-
-    ImGui::SameLine(0.0f, 5.0f);
-    DrawClaudeStatusValue(
-        stateLabel.c_str(),
-        activeRun,
-        false,
-        compacting,
-        access.state
-    );
-
-    const long long nowUnix = static_cast<long long>(std::time(nullptr));
-    const bool runStats = run.valid && run.tokenStatsValid && (activeRun || compacting);
-    // Do not label the previous request's context counters as live spend
-    // while a new Codex turn is still waiting for its first token update.
-    const bool contextStats = !activeRun && !compacting && context.valid &&
-        (context.inputTokens > 0 || context.outputTokens > 0 ||
-            context.cachedInputTokens > 0);
-    const bool haveStats = runStats || contextStats;
-
-    long long rawInput = 0;
-    long long netInput = 0;
-    long long cachedInput = 0;
-    long long output = 0;
-    long long reasoning = 0;
-    long long spent = 0;
-
-    if (runStats) {
-        rawInput = run.rawInputTokens;
-        netInput = run.inputTokens;
-        cachedInput = run.cacheReadInputTokens;
-        output = run.currentTokens;
-        reasoning = run.reasoningOutputTokens;
-        spent = run.tokens > 0
-            ? run.tokens
-            : std::max(0LL, rawInput + output);
-    }
-    else if (contextStats) {
-        rawInput = context.inputTokens;
-        cachedInput = context.cachedInputTokens;
-        netInput = std::max(0LL, rawInput - cachedInput);
-        output = context.outputTokens;
-        reasoning = context.reasoningOutputTokens;
-        spent = std::max(0LL, rawInput + output);
-    }
-
-    if (haveStats || compacting || activeRun) {
-        std::string telemetry;
-
-        if (compacting || activeRun) {
-            const long long timerStart = compacting && context.compactionStartedAtUnixSeconds > 0
-                ? context.compactionStartedAtUnixSeconds
-                : run.startedAtUnixSeconds;
-            const long long elapsed = timerStart > 0 && nowUnix >= timerStart
-                ? nowUnix - timerStart
-                : 0;
-            telemetry = FormatRunDuration(elapsed);
-        }
-
-        if (haveStats) {
-            if (!telemetry.empty()) {
-                telemetry += " · ";
-            }
-            telemetry += (activeRun ? "Spent: " : "Last request: ") +
-                FormatCompactTokenCount(spent) + " tokens";
-        }
-
-        if (!telemetry.empty()) {
-            ImGui::SameLine();
-            const float telemetryWidth = ImGui::CalcTextSize(telemetry.c_str()).x;
-            const float currentX = ImGui::GetCursorPosX();
-            const float targetX = contentRightX - telemetryWidth;
-            if (targetX > currentX) {
-                ImGui::SetCursorPosX(targetX);
-            }
-
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.70f, 0.70f, 1.0f));
-            ImGui::TextUnformatted(telemetry.c_str());
-            ImGui::PopStyleColor();
-        }
-
-        if (haveStats) {
-            std::string tokenStats =
-                "In: " + FormatCompactTokenCount(netInput) +
-                " · Out: " + FormatCompactTokenCount(output) +
-                " · Cache: " + FormatCompactTokenCount(cachedInput);
-
-            if (reasoning > 0) {
-                tokenStats += " · Reasoning: " + FormatCompactTokenCount(reasoning);
-            }
-
-            // Always align against the original full row, not the remaining
-            // width after the telemetry line above. This keeps the token row
-            // on one line instead of wrapping vertically at the right edge.
-            const float tokenStatsWidth = ImGui::CalcTextSize(tokenStats.c_str()).x;
-            const float targetX = std::max(contentStartX, contentRightX - tokenStatsWidth);
-            ImGui::SetCursorPosX(targetX);
-
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
-            ImGui::TextUnformatted(tokenStats.c_str());
-            ImGui::PopStyleColor();
-        }
-    }
-
-    const bool transientState = compacting || activeRun;
-    // OUT OF USAGE is already the complete user-facing Codex state. Keep the
-    // underlying quota detail for detection/debugging, but do not clutter the
-    // status row with redundant text such as "Usage exhausted: Weekly".
-    if (!transientState && access.state != UsageTelemetry::AccessState::OutOfUsage && !access.detail.empty()) {
-        DrawStatusDetailText(access.detail.c_str(), contentStartX, contentRightX);
-    }
-}
-
-static void DrawZAiAccessStatus(
-    const UsageTelemetry::AccessStatus& access,
-    const UsageTelemetry::ContextUsage& context,
-    const UsageTelemetry::RunUsage& run
-)
-{
-    const float contentStartX = ImGui::GetCursorPosX();
-    const float contentRightX = contentStartX + ImGui::GetContentRegionAvail().x;
-
-    // ZCode runtime telemetry is local and independent of the billing API. If
-    // the quota endpoint is temporarily unavailable, an explicit live local
-    // turn/compact marker is still authoritative for the transient status.
-    const bool compacting = context.compacting;
-    const bool activeRun = !compacting && run.valid && run.running;
-
-    std::string stateLabel;
-    if (compacting) stateLabel = "COMPACTING";
-    else if (activeRun) stateLabel = "THINKING";
-    else {
-        const char* label = AccessStateLabel(access.state);
-        stateLabel = label ? label : "";
-    }
-    if (stateLabel.empty()) return;
-
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f, 0.92f, 0.92f, 1.0f));
-    ImGui::TextUnformatted("Status:");
-    ImGui::PopStyleColor();
-    ImGui::SameLine(0.0f, 5.0f);
-    DrawClaudeStatusValue(stateLabel.c_str(), activeRun, false, compacting, access.state);
-
-    const long long nowUnix = static_cast<long long>(std::time(nullptr));
-    const bool runStats = run.valid && run.tokenStatsValid && (activeRun || compacting);
-    const bool contextStats = !activeRun && !compacting && context.valid &&
-        (context.inputTokens > 0 || context.outputTokens > 0 ||
-            context.cachedInputTokens > 0 || context.cacheReadTokens > 0);
-    const bool haveStats = runStats || contextStats;
-
-    long long input = 0;
-    long long output = 0;
-    long long cacheRead = 0;
-    long long cacheCreate = 0;
-    long long reasoning = 0;
-    long long total = 0;
-
-    if (runStats) {
-        input = run.inputTokens;
-        output = run.currentTokens;
-        cacheRead = run.cacheReadInputTokens;
-        cacheCreate = run.cacheCreationInputTokens;
-        reasoning = run.reasoningOutputTokens;
-        total = run.tokens > 0 ? run.tokens : std::max(0LL, input + output);
-    }
-    else if (contextStats) {
-        input = context.inputTokens;
-        output = context.outputTokens;
-        cacheRead = context.cacheReadTokens > 0
-            ? context.cacheReadTokens : context.cachedInputTokens;
-        cacheCreate = context.cacheWriteTokens;
-        reasoning = context.reasoningOutputTokens;
-        total = std::max(0LL, input + output);
-    }
-
-    if (activeRun || compacting || haveStats) {
-        std::string telemetry;
-        if (activeRun || compacting) {
-            const long long timerStart = compacting && context.compactionStartedAtUnixSeconds > 0
-                ? context.compactionStartedAtUnixSeconds : run.startedAtUnixSeconds;
-            const long long elapsed = timerStart > 0 && nowUnix >= timerStart
-                ? nowUnix - timerStart : 0;
-            telemetry = FormatRunDuration(elapsed);
-        }
-        if (haveStats) {
-            if (!telemetry.empty()) telemetry += " · ";
-            telemetry += ((activeRun || compacting) ? "Total Tokens: " : "Last request: ") +
-                FormatCompactTokenCount(total);
-        }
-
-        if (!telemetry.empty()) {
-            ImGui::SameLine();
-            const float width = ImGui::CalcTextSize(telemetry.c_str()).x;
-            const float targetX = contentRightX - width;
-            if (targetX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(targetX);
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.70f, 0.70f, 1.0f));
-            ImGui::TextUnformatted(telemetry.c_str());
-            ImGui::PopStyleColor();
-        }
-
-        if (haveStats) {
-            std::string tokenStats =
-                "In: " + FormatCompactTokenCount(input) +
-                " · Out: " + FormatCompactTokenCount(output) +
-                " · Cache Read: " + FormatCompactTokenCount(cacheRead) +
-                " · Cache Create: " + FormatCompactTokenCount(cacheCreate);
-            if (reasoning > 0) {
-                tokenStats += " · Reasoning: " + FormatCompactTokenCount(reasoning);
-            }
-            const float width = ImGui::CalcTextSize(tokenStats.c_str()).x;
-            ImGui::SetCursorPosX(std::max(contentStartX, contentRightX - width));
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
-            ImGui::TextUnformatted(tokenStats.c_str());
-            ImGui::PopStyleColor();
-        }
-    }
-
-    if (!activeRun && !compacting && !access.detail.empty() &&
-        access.state != UsageTelemetry::AccessState::OutOfUsage) {
-        DrawStatusDetailText(access.detail.c_str(), contentStartX, contentRightX);
-    }
-}
-
-enum class ContextMeterStyle
-{
-    ClaudeBlueThin,
-    CodexWhiteStandard
-};
-
-static ImU32 ClaudeContextFillColor(
-    const UsageTelemetry::ContextUsage& context,
-    float usedPercent
-) {
-    // Claude's normal context meter is blue. Enter the warning color in the
-    // same 20k pre-auto-compact band used by Claude Code, then use red only
-    // once the calculated auto-compact threshold has actually been reached.
-    // Severity always follows USED context, so the Remaining checkbox never
-    // reverses the warning color.
-    if (context.autoCompactPercentValid && context.autoCompactThresholdTokens > 0) {
-        if (context.usedTokens >= context.autoCompactThresholdTokens) {
-            return Color(235, 87, 87);
-        }
-
-        if (context.compacting ||
-            context.usedTokens >= context.autoCompactThresholdTokens - 20000) {
-            return Color(245, 190, 55);
-        }
-
-        return Color(38, 132, 255);
-    }
-
-    // Fallback for a valid context where an auto-compact threshold could not
-    // be calculated. This is visual only and never changes token values.
-    if (usedPercent >= 90.0f) {
-        return Color(235, 87, 87);
-    }
-    if (usedPercent >= 80.0f) {
-        return Color(245, 190, 55);
-    }
-    return Color(38, 132, 255);
-}
-
-static void DrawContextUsageCard(
-    const UsageTelemetry::ContextUsage& context,
-    float cardWidth,
-    bool showWhenUnavailable = false,
-    ContextMeterStyle style = ContextMeterStyle::ClaudeBlueThin
-) {
-    const bool available = context.valid &&
-        context.usedTokens >= 0 &&
-        context.contextWindowTokens > 0;
-    const bool codexStyle = style == ContextMeterStyle::CodexWhiteStandard;
-
-    if (!available && !showWhenUnavailable) {
-        return;
-    }
-
-    const bool showCache = available && (context.cacheStatsValid ||
-        context.latestCacheHitPercentValid || context.averageCacheHitPercentValid);
-    const size_t breakdownCount = available ? std::min<size_t>(context.breakdown.size(), 10) : 0;
-    float cardHeight = available ? 70.0f : 48.0f;
-    if (showCache) cardHeight += 22.0f;
-    if (breakdownCount > 0) cardHeight += 8.0f + static_cast<float>(breakdownCount) * 18.0f;
-    ImGui::BeginChild(
-        "##context_usage_card",
-        ImVec2(cardWidth, cardHeight),
-        true,
-        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse
-    );
-
-    ImGui::TextUnformatted("Context window");
-
-    std::string usageText = context.compacting
-        ? "Compacting Conversation..."
-        : "Unavailable";
-    float displayPercent = 0.0f;
-    float usedPercent = 0.0f;
-
-    if (available) {
-        const long long clampedUsed = std::clamp<long long>(
-            context.usedTokens,
-            0,
-            context.contextWindowTokens
-        );
-        const long long remainingTokens = context.contextWindowTokens - clampedUsed;
-        usedPercent = Math::get_instance()->ClampPercentFloat(
-            static_cast<float>(
-                (static_cast<double>(clampedUsed) /
-                    static_cast<double>(context.contextWindowTokens)) * 100.0
-            )
-        );
-
-        displayPercent = g_showRemaining ? 100.0f - usedPercent : usedPercent;
-        const long long displayTokens = g_showRemaining ? remainingTokens : clampedUsed;
-
-        if (context.compacting) {
-            usageText = "Compacting Conversation...";
-        }
-        else {
-            const long long nowUnix = static_cast<long long>(std::time(nullptr));
-            const bool showCompactionNotice =
-                context.compactionSavedTokens > 0 &&
-                context.compactionCompletedAtUnixSeconds > 0 &&
-                nowUnix >= context.compactionCompletedAtUnixSeconds &&
-                nowUnix - context.compactionCompletedAtUnixSeconds <= 15;
-
-            if (showCompactionNotice) {
-                usageText = "Compacted Conversation · You saved " +
-                    FormatCompactTokenCount(context.compactionSavedTokens) + " tokens!";
-            }
-            else {
-                usageText = FormatCompactTokenCount(displayTokens) + " / " +
-                    FormatCompactTokenCount(context.contextWindowTokens) + " (" +
-                    Format::get_instance()->Percent(displayPercent) +
-                    (g_showRemaining ? " remaining)" : " used)");
-
-                if (!codexStyle && context.autoCompactPercentValid) {
-                    usageText += " · Auto Compact after: " +
-                        std::to_string(context.autoCompactPercentLeft) + "%";
-                }
-            }
-        }
-    }
-
-    if (!usageText.empty()) {
-        ImGui::SameLine();
-        const float availableWidth = ImGui::GetContentRegionAvail().x;
-        const float textWidth = ImGui::CalcTextSize(usageText.c_str()).x;
-
-        if (textWidth < availableWidth) {
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + availableWidth - textWidth);
-        }
-
-        if (!available && !context.compacting) {
-            ImGui::TextDisabled("%s", usageText.c_str());
-            ImGui::EndChild();
-            return;
-        }
-
-        if (context.compacting) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.96f, 0.75f, 0.22f, 1.0f));
-            ImGui::TextUnformatted(usageText.c_str());
-            ImGui::PopStyleColor();
-        }
-        else {
-            ImGui::TextUnformatted(usageText.c_str());
-        }
-    }
-    else if (!available) {
-        ImGui::EndChild();
-        return;
-    }
-
-    if (available) {
-        const ImU32 fillColor = codexStyle
-            ? Color(235, 235, 235)
-            : ClaudeContextFillColor(context, usedPercent);
-        const float barHeight = codexStyle ? 7.0f : 3.0f;
-        DrawThinBar(displayPercent, ImGui::GetContentRegionAvail().x, fillColor, barHeight);
-
-        if (showCache) {
-            ImGui::Spacing();
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
-            ImGui::TextUnformatted("Cache hit rate");
-            std::string cacheText;
-            if (context.averageCacheHitPercentValid) {
-                cacheText = "Average " + FormatDetailedPercent(
-                    context.averageCacheHitPercent);
-            }
-            if (context.latestCacheHitPercentValid) {
-                if (!cacheText.empty()) cacheText += " · ";
-                cacheText += "Latest " + FormatDetailedPercent(
-                    context.latestCacheHitPercent);
-            }
-            if (cacheText.empty()) {
-                cacheText = "Read " + FormatCompactTokenCount(context.cacheReadTokens) +
-                    " · Create " + FormatCompactTokenCount(context.cacheWriteTokens);
-            }
-            ImGui::SameLine();
-            const float width = ImGui::CalcTextSize(cacheText.c_str()).x;
-            const float avail = ImGui::GetContentRegionAvail().x;
-            if (width < avail) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - width);
-            ImGui::TextUnformatted(cacheText.c_str());
-            ImGui::PopStyleColor();
-        }
-
-        if (breakdownCount > 0) {
-            ImGui::Separator();
-            for (size_t i = 0; i < breakdownCount; ++i) {
-                const auto& entry = context.breakdown[i];
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.68f, 0.68f, 0.68f, 1.0f));
-                ImGui::TextUnformatted(entry.label.c_str());
-                const std::string percentText = FormatDetailedPercent(entry.percent);
-                ImGui::SameLine();
-                const float width = ImGui::CalcTextSize(percentText.c_str()).x;
-                const float avail = ImGui::GetContentRegionAvail().x;
-                if (width < avail) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - width);
-                ImGui::TextUnformatted(percentText.c_str());
-                ImGui::PopStyleColor();
-            }
-        }
-    }
-
-    ImGui::EndChild();
-}
-
 static bool ProviderAutoRefreshActive(bool providerEnabled)
 {
     return g_autoRefreshEnabled && providerEnabled;
 }
 
-
 // ---------------------------------------------------------------------------
-// Provider panels (CodexBar-style, shared by the main window and the widget)
+// Provider panels (CodexBar-style, the widget's body)
 //
 // A flat, sectioned layout: a section title, a thin severity-coloured bar, then
 // "X% used / left" on the left and the reset on the right, with an optional
@@ -2499,12 +624,19 @@ static bool ProviderAutoRefreshActive(bool providerEnabled)
 // is drawn from primitives - no stock cards.
 // ---------------------------------------------------------------------------
 
+// Info card text, secondary text, and the two alert tones the status line
+// and the pace forecast use.
+static constexpr ImU32 kPanelInfoText = IM_COL32(178, 185, 199, 255);
+static constexpr ImU32 kPanelMuted = IM_COL32(138, 146, 166, 255);
+static constexpr ImU32 kPanelWarning = IM_COL32(228, 168, 72, 255);
+static constexpr ImU32 kPanelDanger = IM_COL32(214, 96, 96, 255);
+
 static ImU32 PanelSeverity(float usedPercent)
 {
     // Green -> yellow -> orange -> red. Deliberately desaturated: a wall of neon
     // bars reads as noise, so these sit closer to the reference popovers' muted
     // accents while still being four clearly distinct steps.
-    if (usedPercent >= 90.0f) return Color(214, 96, 96);    // red
+    if (usedPercent >= 90.0f) return kPanelDanger;          // red
     if (usedPercent >= 75.0f) return Color(216, 138, 68);   // orange
     if (usedPercent >= 55.0f) return Color(214, 186, 84);   // yellow
     return Color(94, 168, 132);                             // green
@@ -2702,7 +834,7 @@ static bool WindowTakesLiveState(const std::string& title, const std::string& ac
 {
     const std::string lower = Text::get_instance()->ToLowerCopy(title);
 
-    // Titles arrive as either "Session" or "<model> Â· Session".
+    // Titles arrive as either "Session" or "<model> · Session".
     std::string modelPart;
     std::string periodPart = lower;
 
@@ -2717,7 +849,7 @@ static bool WindowTakesLiveState(const std::string& title, const std::string& ac
         return false;
     }
 
-    if (modelPart.find_first_not_of(" 	") == std::string::npos) {
+    if (modelPart.find_first_not_of(" \t") == std::string::npos) {
         return true;
     }
 
@@ -2727,56 +859,47 @@ static bool WindowTakesLiveState(const std::string& title, const std::string& ac
 
     // Compare on letters and digits only: "GPT-5.3 Codex Spark" against
     // "gpt-5.3-codex-spark" differs only in punctuation.
-    const auto compact = [](const std::string& value) {
-        std::string out;
-        for (unsigned char c : value) {
-            if (std::isalnum(c)) out.push_back(static_cast<char>(std::tolower(c)));
-        }
-        return out;
-    };
-
-    const std::string wanted = compact(modelPart);
-    return !wanted.empty() && compact(activeModel).find(wanted) != std::string::npos;
+    const std::string wanted = Text::get_instance()->CompactLower(modelPart, false);
+    return !wanted.empty() &&
+        Text::get_instance()->CompactLower(activeModel, false).find(wanted) != std::string::npos;
 }
 
-static void PanelBarSection(
-    const char* title,
-    bool valid,
-    float usedPercent,
-    const std::string& rightText,
-    const std::string& subline,
-    // Whether this bar tracks a window that resets on a clock. The context
-    // meter does not - it moves with the conversation - so it must not be
-    // annotated with a reset that will never come.
-    bool resets = true,
-    // "<provider>:<window>". When set, the card can be dragged into the
-    // rolled-up bar to pin it there.
-    const std::string& dragKey = std::string{}
-)
+// A pin key, "<host>:<title>". The stored list is comma-separated, so a comma
+// in a provider-supplied title would split the pin apart on the next load.
+static std::string PinKey(const std::string& host, const std::string& title)
 {
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    const float w = ImGui::GetContentRegionAvail().x;
-    const float lineH = ImGui::GetTextLineHeight();
-    const float pad = PanelPad();
-    const float titleH = PanelTitleSize() + 3.0f;
-    const float barH = 5.0f;
+    std::string key = host + ":" + title;
+    key.erase(std::remove(key.begin(), key.end(), ','), key.end());
+    return key;
+}
 
-    const float height = pad + titleH + 7.0f + barH + 8.0f + lineH
-        + (subline.empty() ? 0.0f : lineH + 3.0f) + pad;
+// Drag a card into the rolled-up bar to pin it there ("<provider>:<window>"
+// payload). The hit area goes down first so the card's own painting covers
+// it; the card background is drawn here too, outlined while dragging.
+static void PanelCardDragSource(const std::string& dragKey, const char* title, ImVec2 c0, ImVec2 c1)
+{
+    // A key gets one drag source per frame. A second "##card_drag" under the
+    // same ID is an ImGui ID conflict, and only the first card could be pinned
+    // anyway: the candidate list keeps the first row with a given key.
+    static int frame = -1;
+    static std::vector<std::string> submitted;
 
-    const ImVec2 c0 = ImGui::GetCursorScreenPos();
-    const ImVec2 c1(c0.x + w, c0.y + height);
+    if (frame != ImGui::GetFrameCount()) {
+        frame = ImGui::GetFrameCount();
+        submitted.clear();
+    }
 
-    // Drag the card into the bar to pin it there. The hit area goes down first
-    // so the card's own painting covers it.
+    const bool source = !dragKey.empty() &&
+        std::find(submitted.begin(), submitted.end(), dragKey) == submitted.end();
     bool dragging = false;
-    if (!dragKey.empty()) {
+
+    if (source) {
+        submitted.push_back(dragKey);
         ImGui::PushID(dragKey.c_str());
-        ImGui::InvisibleButton("##card_drag", ImVec2(w, height));
+        ImGui::InvisibleButton("##card_drag", ImVec2(c1.x - c0.x, c1.y - c0.y));
 
         if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
-            ImGui::SetDragDropPayload("AQC_BAR_KEY", dragKey.c_str(),
-                dragKey.size() + 1);
+            ImGui::SetDragDropPayload("AQC_BAR_KEY", dragKey.c_str(), dragKey.size() + 1);
             ImGui::Text("Pin %s to the bar", title);
             ImGui::EndDragDropSource();
             dragging = true;
@@ -2792,8 +915,50 @@ static void PanelBarSection(
     PanelCardBackground(c0, c1);
 
     if (dragging) {
-        dl->AddRect(c0, c1, Color(96, 156, 240, 220), 10.0f, 0, 1.5f);
+        ImGui::GetWindowDrawList()->AddRect(c0, c1, Color(96, 156, 240, 220), 10.0f, 0, 1.5f);
     }
+}
+
+// "45% used", or "55% left" with Show remaining on.
+static std::string UsageText(float usedPercent)
+{
+    return Format::get_instance()->Percent(g_showRemaining ? 100.0f - usedPercent : usedPercent) +
+        (g_showRemaining ? " left" : " used");
+}
+
+static void PanelBarSection(
+    const char* title,
+    bool valid,
+    float usedPercent,
+    const std::string& rightText,
+    const std::string& subline,
+    // Whether this bar tracks a window that resets on a clock. The context
+    // meter does not - it moves with the conversation - so it must not be
+    // annotated with a reset that will never come.
+    bool resets = true,
+    // "<provider>:<window>". When set, the card can be dragged into the
+    // rolled-up bar to pin it there.
+    const std::string& dragKey = std::string{},
+    // Replaces "X% used" under the bar, for a row that is named rather than
+    // read as a percentage (a credit grant's "Included credit").
+    const std::string& leftText = std::string{}
+)
+{
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float w = ImGui::GetContentRegionAvail().x;
+    const float lineH = ImGui::GetTextLineHeight();
+    const float pad = PanelPad();
+    const float titleH = PanelTitleSize() + 3.0f;
+    const float barH = 5.0f;
+
+    // The sub-line may run to several lines ('\n'-separated).
+    const float height = pad + titleH + 7.0f + barH + 8.0f + lineH
+        + (subline.empty() ? 0.0f : ImGui::CalcTextSize(subline.c_str()).y + 3.0f) + pad;
+
+    const ImVec2 c0 = ImGui::GetCursorScreenPos();
+    const ImVec2 c1(c0.x + w, c0.y + height);
+
+    PanelCardDragSource(dragKey, title, c0, c1);
 
     const float x = c0.x + pad;
     const float innerW = w - pad * 2.0f;
@@ -2809,9 +974,7 @@ static void PanelBarSection(
         Color(48, 52, 63));
     y += barH + 8.0f;
 
-    const std::string left = valid
-        ? Format::get_instance()->Percent(shown) + (g_showRemaining ? " left" : " used")
-        : "No data";
+    const std::string left = !valid ? "No data" : !leftText.empty() ? leftText : UsageText(usedPercent);
     dl->AddText(ImVec2(x, y), Color(206, 213, 227), left.c_str());
 
     // A percentage on its own is half the answer - when it resets matters as
@@ -2830,7 +993,7 @@ static void PanelBarSection(
 
         if (!right.empty()) {
             const float rw = ImGui::CalcTextSize(right.c_str()).x;
-            dl->AddText(ImVec2(x + innerW - rw, y), Color(138, 146, 166), right.c_str());
+            dl->AddText(ImVec2(x + innerW - rw, y), kPanelMuted, right.c_str());
         }
     }
     y += lineH + 3.0f;
@@ -2850,11 +1013,7 @@ static void PanelBarSection(
 // the provider's identity as the drag/drop key.
 static std::string ZAiWidgetDisplayLabel(const ZAi::UsageBar& bar)
 {
-    std::string compact;
-    compact.reserve(bar.label.size());
-    for (unsigned char c : bar.label) {
-        if (std::isalnum(c)) compact.push_back(static_cast<char>(std::tolower(c)));
-    }
+    const std::string compact = Text::get_instance()->CompactLower(bar.label, false);
 
     if (compact.find("codingcredits") != std::string::npos) {
         if (compact.find("week") != std::string::npos) return "ZAi - Weekly";
@@ -2865,35 +1024,52 @@ static std::string ZAiWidgetDisplayLabel(const ZAi::UsageBar& bar)
     return bar.label.empty() ? bar.sublabel : bar.label;
 }
 
+// Letters and digits only, lowercased: the part of a name that survives a
+// cosmetic rename. A name with none of them (a localized label) hashes its
+// bytes instead, so such names cannot all collapse into one key.
+static std::string CompactName(const std::string& name)
+{
+    std::string compact = Text::get_instance()->CompactLower(name, false);
+    if (!compact.empty() || name.empty()) return compact;
+
+    // FNV-1a: the same value on every build, unlike std::hash.
+    std::uint32_t hash = 2166136261u;
+    for (unsigned char c : name) hash = (hash ^ c) * 16777619u;
+
+    std::ostringstream out;
+    out << 'u' << std::hex << hash;
+    return out.str();
+}
+
 static std::string ZAiWidgetKey(const ZAi::UsageBar& bar, const std::string& fallbackLabel)
 {
     // WidgetBarRows is comma-delimited. The former identity was a JSON array
     // containing commas, so one Z.Ai pin was split into several "No data"
     // rows. Use a stable display-derived key that is safe for that setting.
     const std::string& label = bar.label.empty() ? fallbackLabel : bar.label;
-    std::string compact;
-    compact.reserve(label.size());
-    for (unsigned char c : label) {
-        if (std::isalnum(c)) compact.push_back(static_cast<char>(std::tolower(c)));
-    }
-
-    return "Z.Ai:bar-" + (compact.empty() ? std::string("usage") : compact);
+    return "Z.Ai:bar-" + (label.empty() ? std::string("usage") : CompactName(label));
 }
 
-static void PanelInfoSection(const char* title, const std::vector<std::string>& lines)
+// Lines wrap to the card, so a sentence such as the weekly pace stays whole.
+// Lines from `mutedFrom` on are secondary and drawn muted.
+static void PanelInfoSection(const char* title, const std::vector<std::string>& lines,
+    const std::string& dragKey = std::string{}, ImU32 color = kPanelInfoText,
+    size_t mutedFrom = SIZE_MAX)
 {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float w = ImGui::GetContentRegionAvail().x;
-    const float lineH = ImGui::GetTextLineHeight();
     const float pad = PanelPad();
     const float titleH = PanelTitleSize() + 3.0f;
+    const float wrapW = w - pad * 2.0f;
 
-    const float height = pad + titleH + 5.0f
-        + static_cast<float>(lines.size()) * (lineH + 4.0f) + pad - 4.0f;
+    float height = pad + titleH + 5.0f + pad - 4.0f;
+    for (const std::string& line : lines) {
+        height += ImGui::CalcTextSize(line.c_str(), nullptr, false, wrapW).y + 4.0f;
+    }
 
     const ImVec2 c0 = ImGui::GetCursorScreenPos();
     const ImVec2 c1(c0.x + w, c0.y + height);
-    PanelCardBackground(c0, c1);
+    PanelCardDragSource(dragKey, title, c0, c1);
 
     const float x = c0.x + pad;
     float y = c0.y + pad;
@@ -2902,9 +1078,10 @@ static void PanelInfoSection(const char* title, const std::vector<std::string>& 
     dl->AddText(tf, PanelTitleSize(), ImVec2(x, y), Color(234, 238, 246), title);
     y += titleH + 5.0f;
 
-    for (const std::string& line : lines) {
-        dl->AddText(ImVec2(x, y), Color(178, 185, 199), line.c_str());
-        y += lineH + 4.0f;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(x, y),
+            i < mutedFrom ? color : kPanelMuted, lines[i].c_str(), nullptr, wrapW);
+        y += ImGui::CalcTextSize(lines[i].c_str(), nullptr, false, wrapW).y + 4.0f;
     }
 
     ImGui::SetCursorScreenPos(ImVec2(c0.x, c1.y));
@@ -2926,11 +1103,10 @@ static void PanelStatusLine(const UsageTelemetry::AccessStatus& access, const st
     }
     if (text.empty()) return;
 
-    ImDrawList* dl = ImGui::GetWindowDrawList();
     const float w = ImGui::GetContentRegionAvail().x;
     const ImU32 color = access.state == UsageTelemetry::AccessState::Available
         ? Color(120, 128, 148)
-        : Color(228, 168, 72);
+        : kPanelWarning;
 
     ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + w);
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(color));
@@ -2946,21 +1122,28 @@ static bool PanelShows(int bit)
     return R().widgetSections ? ((*R().widgetSections) & bit) != 0 : true;
 }
 
+// An info card pinnable as "<host>:<title>"; nothing is drawn without lines.
+// The same line builders feed the bar's candidates, so a pinned row always
+// reads exactly like its card.
+static void PanelInfoCard(const std::string& title, const std::vector<std::string>& lines,
+    const std::string& host, ImU32 color = kPanelInfoText, size_t mutedFrom = SIZE_MAX)
+{
+    if (lines.empty() || lines.front().empty()) return;
+    PanelInfoSection(title.c_str(), lines, PinKey(host, title), color, mutedFrom);
+    PanelRule();
+}
+
 // Live token telemetry for the current turn - the numbers Claude Code and the
 // Codex app-server publish per request but which we were throwing away.
-static void PanelActivitySection(const UsageTelemetry::RunUsage& run,
+static std::vector<std::string> ActivityCardLines(const UsageTelemetry::RunUsage& run,
     const UsageTelemetry::ContextUsage& context)
 {
-    if (!PanelShows(AppSettings::WidgetSectionActivity)) return;
+    std::vector<std::string> lines;
 
     // Compaction is worth announcing on its own: it happens precisely when the
     // token stats are least meaningful, so gating the whole card on them would
     // hide the one moment the user most wants to see.
-    const bool compacting = context.compacting;
-
-    if (!compacting && (!run.valid || !run.tokenStatsValid)) return;
-
-    std::vector<std::string> lines;
+    if (!context.compacting && (!run.valid || !run.tokenStatsValid)) return lines;
 
     if (run.running && run.startedAtUnixSeconds > 0) {
         const long long now = static_cast<long long>(std::time(nullptr));
@@ -2985,40 +1168,42 @@ static void PanelActivitySection(const UsageTelemetry::RunUsage& run,
         lines.push_back("Thought for " + FormatRunDuration(run.lastThoughtDurationSeconds));
     }
 
-    if (lines.empty()) return;
-    PanelInfoSection("Activity", lines);
-    PanelRule();
+    return lines;
+}
+
+static void PanelActivitySection(const UsageTelemetry::RunUsage& run,
+    const UsageTelemetry::ContextUsage& context, const std::string& host)
+{
+    if (!PanelShows(AppSettings::WidgetSectionActivity)) return;
+    PanelInfoCard("Activity", ActivityCardLines(run, context), host);
 }
 
 // Session facts Claude Code only publishes through its statusLine payload.
-static void PanelSessionSection(const UsageTelemetry::RunUsage& run)
+static void PanelSessionSection(const UsageTelemetry::RunUsage& run, const std::string& host)
 {
     if (!PanelShows(AppSettings::WidgetSectionSession)) return;
-    if (run.sessionDetails.empty()) return;
-
-    PanelInfoSection("Session info", run.sessionDetails);
-    PanelRule();
+    PanelInfoCard("Session info", run.sessionDetails, host);
 }
 
 // The model actually in use and the context limit resolved for it.
-static void PanelModelSection(const UsageTelemetry::ContextUsage& context)
+static std::vector<std::string> ModelCardLines(const UsageTelemetry::ContextUsage& context)
 {
-    if (!PanelShows(AppSettings::WidgetSectionModel)) return;
-    if (context.model.empty() && context.contextWindowTokens <= 0) return;
-
     std::vector<std::string> lines;
     if (!context.model.empty()) lines.push_back(context.model);
     if (context.contextWindowTokens > 0) {
         lines.push_back("Context limit: " + FormatCompactTokenCount(context.contextWindowTokens));
     }
-    if (!context.sourceLabel.empty()) lines.push_back(context.sourceLabel);
-
-    PanelInfoSection("Model", lines);
-    PanelRule();
+    if (!lines.empty() && !context.sourceLabel.empty()) lines.push_back(context.sourceLabel);
+    return lines;
 }
 
-static void PanelContextSection(const UsageTelemetry::ContextUsage& context,
-    const char* provider = nullptr)
+static void PanelModelSection(const UsageTelemetry::ContextUsage& context, const std::string& host)
+{
+    if (!PanelShows(AppSettings::WidgetSectionModel)) return;
+    PanelInfoCard("Model", ModelCardLines(context), host);
+}
+
+static void PanelContextSection(const UsageTelemetry::ContextUsage& context, const char* host)
 {
     if (!PanelShows(AppSettings::WidgetSectionContext)) return;
     if (!context.valid || context.contextWindowTokens <= 0) return;
@@ -3035,23 +1220,25 @@ static void PanelContextSection(const UsageTelemetry::ContextUsage& context,
     const std::string tokens = FormatCompactTokenCount(context.usedTokens) + " / " +
         FormatCompactTokenCount(context.contextWindowTokens) + " tokens";
 
-    PanelBarSection("Context", true, used, right, tokens, /*resets=*/false,
-        provider ? std::string(provider) + ":Context" : std::string{});
+    PanelBarSection("Context", true, used, right, tokens, /*resets=*/false, PinKey(host, "Context"));
     PanelRule();
 }
 
 // The subscription actually in force. Providers default this string to their
 // own name, so a bare "Codex"/"Claude" means the plan has not been resolved -
 // say so rather than presenting the fallback as if it were the answer.
-static void PanelPlanSection(const char* provider, const std::string& plan,
-    const std::string& statusText)
+static std::vector<std::string> PlanCardLines(const char* provider, const std::string& plan,
+    const std::string& statusText, const std::string& renewal = std::string{})
 {
-    if (!PanelShows(AppSettings::WidgetSectionPlan)) return;
-
     std::vector<std::string> lines;
 
     const bool resolved = !plan.empty() && plan != provider;
     lines.push_back(resolved ? plan : "Not reported");
+
+    // Second, so a pinned Plan row reads "Renews Nov 3" beside the plan.
+    if (!renewal.empty()) {
+        lines.push_back(renewal);
+    }
 
     // Providers put "Plan: <x> | Source: <y>" in statusText; the source half is
     // worth keeping here because it says which credential the plan came from.
@@ -3061,19 +1248,23 @@ static void PanelPlanSection(const char* provider, const std::string& plan,
         lines.push_back(statusText.substr(at + marker.size()));
     }
 
-    PanelInfoSection("Plan", lines);
-    PanelRule();
+    return lines;
+}
+
+static void PanelPlanSection(const char* provider, const std::vector<std::string>& lines,
+    size_t mutedFrom = SIZE_MAX)
+{
+    if (!PanelShows(AppSettings::WidgetSectionPlan)) return;
+    PanelInfoCard("Plan", lines, provider, kPanelInfoText, mutedFrom);
 }
 
 // Provider-native cache telemetry. ZCode publishes both the latest request's
 // hit ratio and a cumulative average; every other provider leaves this unset,
 // so the card simply does not appear for them.
-static void PanelCacheSection(const UsageTelemetry::ContextUsage& context)
+static std::vector<std::string> CacheCardLines(const UsageTelemetry::ContextUsage& context)
 {
-    if (!PanelShows(AppSettings::WidgetSectionCache)) return;
-    if (!context.cacheStatsValid) return;
-
     std::vector<std::string> lines;
+    if (!context.cacheStatsValid) return lines;
 
     if (context.latestCacheHitPercentValid) {
         lines.push_back("Latest hit: " +
@@ -3092,19 +1283,20 @@ static void PanelCacheSection(const UsageTelemetry::ContextUsage& context)
             "  ·  write " + FormatCompactTokenCount(context.totalCacheWriteTokens));
     }
 
-    if (lines.empty()) return;
-    PanelInfoSection("Cache", lines);
-    PanelRule();
+    return lines;
+}
+
+static void PanelCacheSection(const UsageTelemetry::ContextUsage& context, const std::string& host)
+{
+    if (!PanelShows(AppSettings::WidgetSectionCache)) return;
+    PanelInfoCard("Cache", CacheCardLines(context), host);
 }
 
 // What is actually filling the context window - messages, system prompt, tool
 // definitions. ZCode reports this natively; the provider normalises it into
 // label/value/percent so nothing provider-specific lands here.
-static void PanelBreakdownSection(const UsageTelemetry::ContextUsage& context)
+static std::vector<std::string> BreakdownCardLines(const UsageTelemetry::ContextUsage& context)
 {
-    if (!PanelShows(AppSettings::WidgetSectionBreakdown)) return;
-    if (context.breakdown.empty()) return;
-
     std::vector<std::string> lines;
     for (const UsageTelemetry::ContextBreakdownEntry& entry : context.breakdown) {
         if (entry.label.empty()) continue;
@@ -3114,20 +1306,22 @@ static void PanelBreakdownSection(const UsageTelemetry::ContextUsage& context)
         }
         lines.push_back(std::move(line));
     }
+    return lines;
+}
 
-    if (lines.empty()) return;
-    PanelInfoSection("Context breakdown", lines);
-    PanelRule();
+static void PanelBreakdownSection(const UsageTelemetry::ContextUsage& context, const std::string& host)
+{
+    if (!PanelShows(AppSettings::WidgetSectionBreakdown)) return;
+    PanelInfoCard("Context breakdown", BreakdownCardLines(context), host);
 }
 
 // The last completed compaction. Claude writes an explicit boundary record and
 // Codex reports a retained count; both land in compactionSavedTokens.
-static void PanelCompactionSection(const UsageTelemetry::ContextUsage& context)
+static std::vector<std::string> CompactionCardLines(const UsageTelemetry::ContextUsage& context)
 {
-    if (!PanelShows(AppSettings::WidgetSectionCompaction)) return;
-    if (context.compactionSavedTokens <= 0) return;
-
     std::vector<std::string> lines;
+    if (context.compactionSavedTokens <= 0) return lines;
+
     lines.push_back("Freed " + FormatCompactTokenCount(context.compactionSavedTokens));
 
     if (context.compactionPreTokens > 0) {
@@ -3143,16 +1337,18 @@ static void PanelCompactionSection(const UsageTelemetry::ContextUsage& context)
         }
     }
 
-    PanelInfoSection("Last compaction", lines);
-    PanelRule();
+    return lines;
+}
+
+static void PanelCompactionSection(const UsageTelemetry::ContextUsage& context, const std::string& host)
+{
+    if (!PanelShows(AppSettings::WidgetSectionCompaction)) return;
+    PanelInfoCard("Last compaction", CompactionCardLines(context), host);
 }
 
 // Wall time vs time actually spent in the API, from the statusLine payload.
-static void PanelTimingSection(const UsageTelemetry::RunUsage& run)
+static std::vector<std::string> TimingCardLines(const UsageTelemetry::RunUsage& run)
 {
-    if (!PanelShows(AppSettings::WidgetSectionTiming)) return;
-    if (run.sessionDurationMs <= 0 && run.sessionApiDurationMs <= 0) return;
-
     std::vector<std::string> lines;
     if (run.sessionDurationMs > 0) {
         lines.push_back("Session: " + FormatRunDuration(run.sessionDurationMs / 1000));
@@ -3160,17 +1356,14 @@ static void PanelTimingSection(const UsageTelemetry::RunUsage& run)
     if (run.sessionApiDurationMs > 0) {
         lines.push_back("API time: " + FormatRunDuration(run.sessionApiDurationMs / 1000));
     }
-
-    PanelInfoSection("Timing", lines);
-    PanelRule();
+    return lines;
 }
 
-struct PanelScope
+static void PanelTimingSection(const UsageTelemetry::RunUsage& run, const std::string& host)
 {
-    bool pushed = false;
-    PanelScope() { if (g_widgetFont) { ImGui::PushFont(g_widgetFont); pushed = true; } }
-    ~PanelScope() { if (pushed) ImGui::PopFont(); }
-};
+    if (!PanelShows(AppSettings::WidgetSectionTiming)) return;
+    PanelInfoCard("Timing", TimingCardLines(run), host);
+}
 
 // A custom refresh icon button (circular arrow), drawn from primitives.
 static bool PanelRefreshButton(const char* id, ImVec2 pos, float size, bool loading)
@@ -3243,79 +1436,408 @@ static void DrawProviderHeader(
 }
 
 // ---- per-provider section bodies (no header) ----
+//
+// Every card carries a "<host>:<title>" pin key, and the *CardLines builders
+// below also feed WidgetPeekCandidates, so anything the panel shows can be
+// dragged into - or ticked for - the rolled-up bar.
+
+// "1 day", "1,204 turns".
+static std::string Plural(long long count, const char* noun)
+{
+    return Format::get_instance()->IntegerWithCommas(static_cast<double>(count)) + " " + noun +
+        (count == 1 ? "" : "s");
+}
+
+static std::string Capitalized(std::string text)
+{
+    if (!text.empty()) text[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(text[0])));
+    return text;
+}
+
+// A server code in words: "plus-1-month-free" -> "Plus 1 month free".
+static std::string Humanized(std::string code)
+{
+    std::replace(code.begin(), code.end(), '_', ' ');
+    std::replace(code.begin(), code.end(), '-', ' ');
+    return Capitalized(std::move(code));
+}
+
+// "2026-10-03" -> "Oct 3"; anything else is returned as it came. The date is
+// a calendar day, so it is read at local noon, which no zone shift moves off it.
+static std::string ShortDate(const std::string& isoDate)
+{
+    std::tm day{};
+    std::istringstream in(isoDate);
+    in >> std::get_time(&day, "%Y-%m-%d");
+    if (in.fail()) return isoDate;
+
+    day.tm_hour = 12;
+    day.tm_isdst = -1;
+    const std::time_t at = std::mktime(&day);
+    return at == -1 ? isoDate : Format::get_instance()->MonthDay(at);
+}
+
+// "267.66 credits", "1,200 credits", as the provider writes its own amounts.
+static std::string CreditCount(double credits)
+{
+    return Format::get_instance()->CreditAmount(credits) + " credits";
+}
+
+// "GLM-5.3 1.2M · GLM-5.3-Flash 300.0k": the three biggest, biggest first.
+static std::string TopEntries(std::vector<std::pair<std::string, long long>> entries)
+{
+    std::stable_sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
+        return a.second > b.second;
+    });
+
+    std::string text;
+    for (size_t i = 0; i < entries.size() && i < 3; ++i) {
+        if (!text.empty()) text += " · ";
+        text += entries[i].first + " " + FormatCompactTokenCount(entries[i].second);
+    }
+    return text;
+}
+
+// "Streak: 4 days · best 12 days". -1 is "not reported".
+static std::string StreakLine(int current, int longest)
+{
+    std::string line = "Streak: " + (current >= 0 ? Plural(current, "day") : std::string("--"));
+    if (longest >= 0) line += " · best " + Plural(longest, "day");
+    return line;
+}
+
+// "Nov 30, 10:59 PM CST", how Desktop dates a grant's expiry.
+static std::string ExpiryDate(long long unixSeconds)
+{
+    return Format::get_instance()->LocalTime(unixSeconds, "%b %d, %I:%M %p %Z");
+}
+
+// A window's name. Pin keys keep the raw name, so a nameless window still
+// resolves the pin it always had while the card reads "Usage".
+static std::string CodexBarName(const Codex::UsageBar& bar)
+{
+    return !bar.label.empty() ? bar.label : bar.sublabel;
+}
+
+static std::string CodexExtraUsageTitle(const Codex::Snapshot& s)
+{
+    return s.extraUsage.label.empty() ? "Extra usage" : s.extraUsage.label;
+}
+
+static std::string CodexExtraUsageLine(const Codex::Snapshot& s)
+{
+    if (!s.extraUsage.valid || s.extraUsage.spentText.empty()) return {};
+    return "This month: " + s.extraUsage.spentText +
+        (s.extraUsage.limitText.empty() ? "" : " / " + s.extraUsage.limitText);
+}
+
+// Desktop only blocks on a HARD_CAP; any other cap just warns.
+static std::string CodexCapNote(const Codex::Snapshot& s)
+{
+    return s.extraUsage.enforced ? std::string{} : "(warning only)";
+}
+
+// The month's spend against the cap, then the note, which the panel mutes.
+static std::vector<std::string> CodexExtraUsageCardLines(const Codex::Snapshot& s)
+{
+    std::vector<std::string> lines{ CodexExtraUsageLine(s) };
+    if (const std::string note = CodexCapNote(s); !note.empty()) lines.push_back(note);
+    return lines;
+}
+
+// The balance, then what it buys ("~9,531–49,563 local · ~1,525–9,531
+// cloud messages").
+static std::vector<std::string> CodexCreditCardLines(const Codex::Snapshot& s)
+{
+    if (!s.creditBalance.valid || s.creditBalance.balanceText.empty()) return {};
+
+    std::vector<std::string> lines{ s.creditBalance.unlimited ? "Unlimited" : s.creditBalance.balanceText };
+    if (!s.creditBalance.approxMessagesText.empty()) lines.push_back(s.creditBalance.approxMessagesText);
+    return lines;
+}
+
+// Credit auto-reload: "On · below 125 credits, refill to 500 credits ·
+// monthly limit 2,000 credits". No monthly limit means no cap.
+static std::vector<std::string> CodexAutoTopUpCardLines(const Codex::AutoTopUp& topUp)
+{
+    if (!topUp.valid) return {};
+    if (!topUp.enabled) return { "Off" };
+
+    std::string line = "On";
+    if (!topUp.thresholdText.empty()) line += " · below " + topUp.thresholdText;
+    if (!topUp.targetText.empty()) {
+        line += (topUp.thresholdText.empty() ? " · " : ", ") + std::string("refill to ") + topUp.targetText;
+    }
+    line += topUp.monthlyLimitText.empty() ? " · no monthly limit" : " · monthly limit " + topUp.monthlyLimitText;
+    return { line };
+}
+
+// Credit spend by day and surface, newest first: "Oct 3 · Desktop App · 267.7 credits".
+static std::vector<std::string> CodexCreditUsageCardLines(const Codex::Snapshot& s)
+{
+    std::vector<std::string> lines;
+    for (const Codex::CreditEvent& event : s.creditEvents) {
+        std::string line = ShortDate(event.date);
+        if (!event.surface.empty()) line += " · " + event.surface;
+        lines.push_back(line + " · " + CreditCount(event.credits));
+    }
+    return lines;
+}
+
+static std::vector<std::string> CodexResetCreditCardLines(const Codex::Snapshot& s)
+{
+    if (s.resetCreditsAvailableCount < 0 && s.resetCreditsEarnedCount < 0) return {};
+
+    std::vector<std::string> lines;
+    if (s.resetCreditsAvailableCount >= 0) {
+        lines.push_back(std::to_string(s.resetCreditsAvailableCount) + " banked");
+    }
+    if (s.resetCreditsEarnedCount >= 0) {
+        lines.push_back(std::to_string(s.resetCreditsEarnedCount) + " earned in total");
+    }
+
+    // Each banked credit carries its own expiry, already sorted soonest first
+    // by the provider. A bare count hides the only actionable part.
+    for (const Codex::ResetCredit& credit : s.resetCredits) {
+        const std::string when = PanelExpiry(UnixSecondsFrom(credit.expiresAt));
+        if (when.empty() && credit.title.empty()) continue;
+
+        std::string line = credit.title.empty() ? std::string("Credit") : credit.title;
+        if (!credit.resetType.empty()) line += " (" + credit.resetType + ")";
+        if (!when.empty()) line += "  ·  " + when;
+        lines.push_back(std::move(line));
+    }
+
+    return lines;
+}
+
+// Banked-reset activity over the last 30 days, newest first.
+static std::vector<std::string> CodexResetHistoryCardLines(const Codex::Snapshot& s)
+{
+    constexpr size_t kShown = 5;
+
+    std::vector<Codex::ResetCredit> events = s.resetHistory;
+    std::stable_sort(events.begin(), events.end(), [](const Codex::ResetCredit& a, const Codex::ResetCredit& b) {
+        return a.grantedAt > b.grantedAt;
+    });
+
+    std::vector<std::string> lines;
+    for (size_t i = 0; i < events.size() && i < kShown; ++i) {
+        std::string line = events[i].title.empty() ? std::string("Reset") : events[i].title;
+        if (!events[i].resetType.empty()) line += " (" + events[i].resetType + ")";
+        if (const long long at = UnixSecondsFrom(events[i].grantedAt); at > 0) {
+            line += " · " + Format::get_instance()->LocalTime(at, "%b %d, %I:%M %p");
+        }
+        lines.push_back(std::move(line));
+    }
+    if (events.size() > kShown) {
+        lines.push_back("+" + std::to_string(events.size() - kShown) + " earlier");
+    }
+
+    return lines;
+}
+
+// Past plan windows, newest first: "5-hour · Nov 1 · 63%",
+// "Weekly · Oct 29–Nov 5 · 58%".
+static std::vector<std::string> CodexPlanLimitHistoryCardLines(const Codex::Snapshot& s)
+{
+    constexpr size_t kShown = 7;
+    constexpr int kWeekMinutes = 7 * 24 * 60;
+
+    std::vector<std::string> lines;
+    for (auto period = s.planLimitHistory.rbegin();
+        period != s.planLimitHistory.rend() && lines.size() < kShown; ++period) {
+        if (period->startsAtUnixSeconds <= 0) continue;
+
+        const bool weekly = period->windowMinutes >= kWeekMinutes;
+        std::string line = weekly ? std::string("Weekly")
+            : std::to_string(std::max(1, period->windowMinutes / 60)) + "-hour";
+        line += " · " + Format::get_instance()->MonthDay(period->startsAtUnixSeconds);
+        if (weekly && period->endsAtUnixSeconds > 0) {
+            line += "\xe2\x80\x93" + Format::get_instance()->MonthDay(period->endsAtUnixSeconds);
+        }
+        // -1: the window has not been accounted for yet.
+        line += " · " + (period->usedPercent < 0.0f ? std::string("pending")
+            : Format::get_instance()->Percent(period->usedPercent));
+        lines.push_back(std::move(line));
+    }
+
+    return lines;
+}
+
+// Each surface's share of the last 7 days, like Claude's weekly split.
+static std::vector<std::string> CodexSurfaceShareCardLines(const Codex::Snapshot& s)
+{
+    std::vector<std::string> lines;
+    for (const Codex::SurfaceShare& share : s.surfaceShare) {
+        lines.push_back(share.surface + "  " + Format::get_instance()->Percent(share.percent));
+    }
+    return lines;
+}
+
+// The 30-day total, then the last 7 days, newest first:
+// "Nov 1 · 1.2M tokens · 18 turns · 350 credits".
+static std::vector<std::string> CodexDailyUsageCardLines(const Codex::Snapshot& s)
+{
+    constexpr size_t kDays = 7;
+    if (s.dailyUsage.empty()) return {};
+
+    const auto line = [](const std::string& when, const Codex::DailyUsage& usage) {
+        return when + " · " + FormatCompactTokenCount(usage.tokens) + " tokens · " +
+            Plural(usage.turns, "turn") + " · " + CreditCount(usage.credits);
+    };
+
+    Codex::DailyUsage total;
+    for (const Codex::DailyUsage& day : s.dailyUsage) {
+        total.tokens += day.tokens;
+        total.turns += day.turns;
+        total.credits += day.credits;
+    }
+
+    std::vector<std::string> lines{ line("30 days", total) };
+    for (auto day = s.dailyUsage.rbegin(); day != s.dailyUsage.rend() && lines.size() <= kDays; ++day) {
+        lines.push_back(line(ShortDate(day->date), *day));
+    }
+    return lines;
+}
+
+// Codex Desktop's profile page (GET /wham/profiles/me). -1 is "not
+// reported", so each figure stands or falls on its own. A stats failure is
+// the last line, so the panel can mute it.
+static std::vector<std::string> CodexProfileCardLines(const Codex::ProfileStats& p)
+{
+    std::vector<std::string> lines;
+    if (!p.valid && !p.statsError) return lines;
+
+    if (p.lifetimeTokens >= 0) lines.push_back("Lifetime: " + FormatCompactTokenCount(p.lifetimeTokens) + " tokens");
+    if (p.todayTokens >= 0) lines.push_back("Today: " + FormatCompactTokenCount(p.todayTokens) + " tokens");
+    if (p.peakDailyTokens >= 0) lines.push_back("Peak day: " + FormatCompactTokenCount(p.peakDailyTokens) + " tokens");
+    if (p.longestTaskSeconds >= 0) lines.push_back("Longest task: " + FormatRunDuration(p.longestTaskSeconds));
+    if (p.currentStreakDays >= 0 || p.longestStreakDays >= 0) {
+        lines.push_back(StreakLine(p.currentStreakDays, p.longestStreakDays));
+    }
+    if (p.totalThreads >= 0) lines.push_back("Threads: " + Format::get_instance()->IntegerWithCommas(static_cast<double>(p.totalThreads)));
+    if (!p.reasoningEffort.empty()) {
+        lines.push_back("Reasoning: " + Capitalized(p.reasoningEffort) + (p.reasoningEffortPercent >= 0.0
+            ? " (" + Format::get_instance()->Percent(p.reasoningEffortPercent) + ")" : std::string{}));
+    }
+    if (p.fastModePercent >= 0.0) lines.push_back("Fast mode: " + Format::get_instance()->Percent(p.fastModePercent));
+    if (!p.topInvocations.empty()) lines.push_back("Most used: " + TopEntries(p.topInvocations));
+    // -1 is a personal account, which has no workspace to rank in.
+    if (p.workspaceRank >= 0 && p.workspaceUsers > 0) {
+        lines.push_back("Rank " + std::to_string(p.workspaceRank) + " of " +
+            std::to_string(p.workspaceUsers) + " in the workspace");
+    }
+    if (!p.statsAsOf.empty()) lines.push_back("As of " + ShortDate(p.statsAsOf));
+    if (p.statsError) lines.push_back("Stats could not be computed");
+
+    return lines;
+}
+
+static std::vector<std::string> CodexAccountsCardLines(const Codex::Snapshot& s)
+{
+    if (s.signedInAccounts <= 0) return {};
+    return { Plural(s.signedInAccounts, "account") + " signed in to Codex" };
+}
+
+// What Codex is serving requests from, and the notices behind it ("Main
+// limit reached - running on Luna Reserve").
+static std::vector<std::string> CodexUsageSourceCardLines(const Codex::Snapshot& s)
+{
+    std::vector<std::string> lines;
+    if (!s.usageSource.empty()) {
+        lines.push_back(s.usageSource == "included" ? std::string("Included usage")
+            : s.usageSource == "reserve" ? std::string("Luna Reserve")
+            : Capitalized(s.usageSource));
+    }
+    if (!s.usageNotice.empty()) lines.push_back(s.usageNotice);
+    return lines;
+}
+
+// The plan, its renewal ("Renews Oct 5 · Monthly"), the credential, then the
+// promotion it runs on, if any ("Plus 1 month free"), which the panel mutes.
+static std::vector<std::string> CodexPlanCardLines(const Codex::Snapshot& s)
+{
+    const Codex::Subscription& subscription = s.subscription;
+    std::string renewal = subscription.valid ? subscription.text : std::string{};
+    if (!renewal.empty() && !subscription.billingPeriod.empty()) {
+        renewal += " · " + Capitalized(subscription.billingPeriod);
+    }
+
+    std::vector<std::string> lines = PlanCardLines("Codex", s.plan, s.statusText, renewal);
+    if (!s.promoCampaign.empty()) lines.push_back(Humanized(s.promoCampaign));
+    return lines;
+}
 
 static void RenderCodexSections(const Codex::Snapshot& snapshot)
 {
     g_panelLiveState = LiveRunState(snapshot.run, snapshot.context);
     g_panelLiveModel = snapshot.context.model;
-    g_panelLiveModel = snapshot.context.model;
-    g_panelLiveModel = snapshot.context.model;
     PanelStatusLine(snapshot.access, snapshot.statusText);
 
-    PanelPlanSection("Codex", snapshot.plan, snapshot.statusText);
+    const std::vector<std::string> plan = CodexPlanCardLines(snapshot);
+    PanelPlanSection("Codex", plan, snapshot.promoCampaign.empty() ? SIZE_MAX : plan.size() - 1);
+    if (PanelShows(AppSettings::WidgetSectionPlan)) {
+        PanelInfoCard("Accounts", CodexAccountsCardLines(snapshot), "Codex");
+    }
 
     for (const Codex::UsageBar& bar : snapshot.bars) {
         if (!bar.valid || !PanelShows(AppSettings::WidgetSectionQuota)) continue;
-        const char* title = !bar.label.empty() ? bar.label.c_str()
-            : (!bar.sublabel.empty() ? bar.sublabel.c_str() : "Usage");
-        PanelBarSection(title, true, bar.usedPercent,
-            PanelReset(bar.resetAtUnixSeconds, bar.rightText), std::string{},
-            true, std::string("Codex:") + title);
+        const std::string name = CodexBarName(bar);
+        PanelBarSection(name.empty() ? "Usage" : name.c_str(), true, bar.usedPercent,
+            PanelReset(bar.resetAtUnixSeconds, std::string{}), std::string{},
+            true, PinKey("Codex", name));
         PanelRule();
     }
 
-    if (PanelShows(AppSettings::WidgetSectionExtra) &&
-        snapshot.extraUsage.valid && snapshot.extraUsage.hasUsedPercent) {
-        PanelBarSection(snapshot.extraUsage.label.empty() ? "Extra usage" : snapshot.extraUsage.label.c_str(),
-            true, snapshot.extraUsage.usedPercent,
-            PanelReset(snapshot.extraUsage.resetAtUnixSeconds, snapshot.extraUsage.resetText),
-            snapshot.extraUsage.spentText.empty() ? std::string{}
-                : "This month: " + snapshot.extraUsage.spentText +
-                  (snapshot.extraUsage.limitText.empty() ? "" : " / " + snapshot.extraUsage.limitText));
-        PanelRule();
+    if (PanelShows(AppSettings::WidgetSectionExtra) && snapshot.extraUsage.valid) {
+        const std::string title = CodexExtraUsageTitle(snapshot);
+
+        // Either way "(warning only)" sits muted beside the cap: the bar card's
+        // sub-line is muted throughout.
+        if (snapshot.extraUsage.hasUsedPercent) {
+            const std::string line = CodexExtraUsageLine(snapshot);
+            const std::string note = CodexCapNote(snapshot);
+            PanelBarSection(title.c_str(), true, snapshot.extraUsage.usedPercent,
+                PanelReset(snapshot.extraUsage.resetAtUnixSeconds, snapshot.extraUsage.resetText),
+                line.empty() || note.empty() ? line + note : line + " " + note,
+                true, PinKey("Codex", title));
+            PanelRule();
+        }
+        else {
+            PanelInfoCard(title, CodexExtraUsageCardLines(snapshot), "Codex", kPanelInfoText, 1);
+        }
     }
-    else if (PanelShows(AppSettings::WidgetSectionExtra) &&
-        snapshot.extraUsage.valid && !snapshot.extraUsage.spentText.empty()) {
-        PanelInfoSection(snapshot.extraUsage.label.empty() ? "Extra usage" : snapshot.extraUsage.label.c_str(),
-            { "This month: " + snapshot.extraUsage.spentText +
-              (snapshot.extraUsage.limitText.empty() ? "" : " / " + snapshot.extraUsage.limitText) });
-        PanelRule();
+
+    if (PanelShows(AppSettings::WidgetSectionExtra)) {
+        PanelInfoCard("Usage source", CodexUsageSourceCardLines(snapshot), "Codex");
     }
 
     PanelContextSection(snapshot.context, "Codex");
 
-    if (PanelShows(AppSettings::WidgetSectionExtra) &&
-        snapshot.creditBalance.valid && !snapshot.creditBalance.balanceText.empty()) {
-        PanelInfoSection("Credits",
-            { snapshot.creditBalance.unlimited ? "Unlimited" : snapshot.creditBalance.balanceText });
-        PanelRule();
+    if (PanelShows(AppSettings::WidgetSectionExtra)) {
+        PanelInfoCard("Credits", CodexCreditCardLines(snapshot), "Codex");
+        PanelInfoCard("Workspace credits", { snapshot.workspaceCredits }, "Codex");
+        PanelInfoCard("Auto top-up", CodexAutoTopUpCardLines(snapshot.autoTopUp), "Codex");
+        PanelInfoCard("Credit usage", CodexCreditUsageCardLines(snapshot), "Codex");
     }
-    if (PanelShows(AppSettings::WidgetSectionDetails) && snapshot.resetCreditsAvailableCount >= 0) {
-        std::vector<std::string> lines;
-        lines.push_back(std::to_string(snapshot.resetCreditsAvailableCount) + " banked");
+    if (PanelShows(AppSettings::WidgetSectionDetails)) {
+        PanelInfoCard("Reset credits", CodexResetCreditCardLines(snapshot), "Codex");
+        PanelInfoCard("Reset history", CodexResetHistoryCardLines(snapshot), "Codex");
+        PanelInfoCard("Plan limit history", CodexPlanLimitHistoryCardLines(snapshot), "Codex");
+        PanelInfoCard("Usage by surface", CodexSurfaceShareCardLines(snapshot), "Codex");
+        PanelInfoCard("Daily usage", CodexDailyUsageCardLines(snapshot), "Codex");
 
-        // Each banked credit carries its own expiry, already sorted soonest
-        // first by the provider. A bare count hides the only thing that is
-        // actually actionable about them.
-        for (const Codex::ResetCredit& credit : snapshot.resetCredits) {
-            const std::string when = PanelExpiry(UnixSecondsFrom(credit.expiresAt));
-            if (when.empty() && credit.title.empty()) continue;
-
-            std::string line = credit.title.empty() ? std::string("Credit") : credit.title;
-            if (!credit.resetType.empty()) line += " (" + credit.resetType + ")";
-            if (!when.empty()) line += "  ·  " + when;
-            lines.push_back(std::move(line));
-        }
-
-        PanelInfoSection("Reset credits", lines);
-        PanelRule();
+        const std::vector<std::string> profile = CodexProfileCardLines(snapshot.profile);
+        PanelInfoCard("Profile", profile, "Codex", kPanelInfoText,
+            snapshot.profile.statsError ? profile.size() - 1 : SIZE_MAX);
     }
 
-    PanelActivitySection(snapshot.run, snapshot.context);
-    PanelBreakdownSection(snapshot.context);
-    PanelCacheSection(snapshot.context);
-    PanelCompactionSection(snapshot.context);
-    PanelModelSection(snapshot.context);
+    PanelActivitySection(snapshot.run, snapshot.context, "Codex");
+    PanelBreakdownSection(snapshot.context, "Codex");
+    PanelCacheSection(snapshot.context, "Codex");
+    PanelCompactionSection(snapshot.context, "Codex");
+    PanelModelSection(snapshot.context, "Codex");
 }
 
 // Provider plans are brand-prefixed by their formatters ("Claude Max 5x",
@@ -3329,13 +1851,199 @@ static std::string PlanBeside(const char* provider, const std::string& plan)
     return plan.rfind(prefix, 0) == 0 ? plan.substr(prefix.size()) : plan;
 }
 
+static std::string ClaudeCreditsTitle(const Claude::Snapshot& s)
+{
+    return s.credits.label.empty() ? "Usage credits" : s.credits.label;
+}
+
+// "$0.00 spent / $50.00", or "$0.00 spent / Off" with credits off - compact,
+// as Desktop's "Usage credits $0" beside a switched-off toggle. A block that
+// reports nothing but "Off" says it once.
+static std::string ClaudeCreditsLine(const Claude::Snapshot& s)
+{
+    if (!s.credits.valid || s.credits.spentText.empty()) return {};
+
+    const std::string& limit = s.credits.monthlyLimitText;
+    return s.credits.spentText + (limit.empty() || limit == s.credits.spentText ? "" : " / " + limit);
+}
+
+// The server's code for why usage credits are off, in words; empty when it
+// gives none.
+static std::string ClaudeCreditsDisabledText(const Claude::UsageCredits& credits)
+{
+    const std::string& code = credits.disabledReason;
+    if (code == "out_of_credits") return "Out of credits";
+    if (code == "org_level_disabled") return "Turned off for the organization";
+    return Humanized(code);
+}
+
+// The credits line, then why they are off; the panel mutes the reason.
+static std::vector<std::string> ClaudeCreditsCardLines(const Claude::Snapshot& s)
+{
+    std::vector<std::string> lines{ ClaudeCreditsLine(s) };
+    if (const std::string reason = ClaudeCreditsDisabledText(s.credits); !reason.empty()) {
+        lines.push_back(reason);
+    }
+    return lines;
+}
+
+// The plan, then "Renews Nov 3" ("Ends Nov 3" for a plan that will not renew).
+static std::vector<std::string> ClaudePlanCardLines(const Claude::Snapshot& s)
+{
+    std::string renewal;
+    if (s.planRenewsAtUnixSeconds > 0) {
+        renewal = (s.planEnds ? "Ends " : "Renews ") +
+            Format::get_instance()->MonthDay(s.planRenewsAtUnixSeconds);
+    }
+    return PlanCardLines("Claude", s.plan, s.statusText, renewal);
+}
+
+static std::vector<std::string> ClaudeCostCardLines(const UsageTelemetry::RunUsage& run)
+{
+    if (!run.costValid) return {};
+
+    std::vector<std::string> lines{ "Session: " + Format::get_instance()->Dollars(run.sessionCostUsd) };
+    if (run.sessionLinesAdded > 0 || run.sessionLinesRemoved > 0) {
+        lines.push_back("+" + std::to_string(run.sessionLinesAdded) +
+            " / -" + std::to_string(run.sessionLinesRemoved) + " lines");
+    }
+    if (run.sessionDurationMs > 0) {
+        lines.push_back("Over " + FormatRunDuration(run.sessionDurationMs / 1000));
+    }
+    return lines;
+}
+
+// Desktop's weekly pace forecast. Recomputed every frame rather than cached:
+// the wording ("run out Wednesday night") moves with the clock.
+static Claude::Pace ClaudeWeeklyPace(const Claude::Snapshot& s, long long now)
+{
+    if (!s.weeklyAllModels.valid) return {};
+    return Claude::ComputePace(s.weeklyAllModels.usedPercent, s.weeklyAllModels.resetAtUnixSeconds, now);
+}
+
+static ImU32 PaceColor(Claude::Pace::State state)
+{
+    if (state == Claude::Pace::State::HeadsUp) return kPanelWarning;
+    if (state == Claude::Pace::State::LimitHit) return kPanelDanger;
+    return kPanelMuted;
+}
+
+// Free limit resets, read-only. Claiming one is a POST this app never sends,
+// so the card carries what Desktop's does minus its "Reset for free" button.
+static std::vector<std::string> ClaudeLimitResetCardLines(const Claude::LimitResets& resets, long long now)
+{
+    std::vector<std::string> lines;
+
+    for (const Claude::LimitReset& grant : resets.grants) {
+        std::string line = grant.title + " · " + std::to_string(grant.left) + " left";
+        if (grant.endsAtUnixSeconds > 0) line += " · Expires " + ExpiryDate(grant.endsAtUnixSeconds);
+        if (grant.paused) line += " · Paused";
+        if (grant.usableNow) line += " · Usable now";
+        lines.push_back(std::move(line));
+    }
+
+    if (!lines.empty() && resets.cooldownUntilUnixSeconds > now) {
+        lines.push_back("Cooling down until " + ExpiryDate(resets.cooldownUntilUnixSeconds));
+    }
+
+    return lines;
+}
+
+// One-time credit grants. Their titles repeat ("Promotional credit"), so pins
+// use the usage field name the provider keeps for exactly that.
+static std::string PromoCreditKey(const Claude::PromoCredit& credit)
+{
+    return PinKey("Claude", credit.key.empty() ? credit.title : credit.key);
+}
+
+// "$250 of $250 left"; empty without dollar figures.
+static std::string PromoCreditLeft(const Claude::PromoCredit& credit)
+{
+    if (!credit.hasDollars) return {};
+    return Format::get_instance()->Dollars(credit.remainingDollars, 0) + " of " +
+        Format::get_instance()->Dollars(credit.limitDollars, 0) + " left";
+}
+
+// "Expires 1:59 AM CST, November 5", then the lock, if any.
+static std::string PromoCreditSubline(const Claude::PromoCredit& credit)
+{
+    std::string text;
+    if (credit.expiresAtUnixSeconds > 0) {
+        text = "Expires " + Format::get_instance()->LocalTime(credit.expiresAtUnixSeconds, "%I:%M %p %Z, %B %d");
+    }
+    if (!credit.lockedReason.empty()) {
+        text += (text.empty() ? "" : "\n") + credit.lockedReason;
+    }
+    return text;
+}
+
+// This week's usage by surface, shown with the weekly window it splits.
+static std::vector<std::string> ClaudeBreakdownCardLines(const Claude::Snapshot& s)
+{
+    std::vector<std::string> lines;
+    if (!s.weeklyAllModels.valid) return lines;
+
+    for (const Claude::BreakdownRow& row : s.weeklyBreakdown) {
+        lines.push_back(row.name + "  " + Format::get_instance()->Percent(row.percent));
+    }
+    return lines;
+}
+
+// Desktop sessions parked until the five-hour limit resets.
+static std::vector<std::string> ClaudeAutoResumeCardLines(const Claude::AutoResume& resume)
+{
+    if (!resume.valid) return {};
+
+    std::string line = Plural(resume.waitingSessions, "session") + " waiting";
+    if (resume.resetAtUnixSeconds > 0) {
+        line += " · resumes " + Format::get_instance()->UnixResetTime(resume.resetAtUnixSeconds);
+    }
+
+    std::vector<std::string> lines{ line };
+    if (resume.optedIn) lines.push_back("Auto-resume on");
+    return lines;
+}
+
+static std::string ClaudeLedgerTitle(const Claude::UsageLedger& ledger)
+{
+    return "Usage (" + std::to_string(ledger.windowDays) + " days)";
+}
+
+// The local usage ledger Desktop's 3P builds keep, summed over its window.
+static std::vector<std::string> ClaudeLedgerCardLines(const Claude::UsageLedger& ledger)
+{
+    if (!ledger.valid) return {};
+
+    std::vector<std::string> lines{
+        Plural(ledger.turns, "turn") + " · " + Plural(ledger.errorTurns, "error"),
+        "In " + FormatCompactTokenCount(ledger.inputTokens) +
+            " · Out " + FormatCompactTokenCount(ledger.outputTokens),
+        "Cache read " + FormatCompactTokenCount(ledger.cacheReadTokens) +
+            " · write " + FormatCompactTokenCount(ledger.cacheWriteTokens)
+    };
+    if (ledger.costValid) lines.push_back("Cost " + Format::get_instance()->Dollars(ledger.costUsd));
+    for (const auto& [surface, tokens] : ledger.surfaceTokens) {
+        lines.push_back(Capitalized(surface) + ": " + FormatCompactTokenCount(tokens) + " tokens");
+    }
+    return lines;
+}
+
 static void RenderClaudeSections(const Claude::Snapshot& snapshot)
 {
     g_panelLiveState = LiveRunState(snapshot.run, snapshot.context);
+    // Without this the previous host's model decided which row shows the live state.
+    g_panelLiveModel = snapshot.context.model;
     PanelStatusLine(snapshot.access, snapshot.statusText);
 
-    PanelPlanSection("Claude", snapshot.plan, snapshot.statusText);
+    PanelPlanSection("Claude", ClaudePlanCardLines(snapshot));
 
+    const long long now = static_cast<long long>(std::time(nullptr));
+
+    // An invalid window draws nothing at all: Ultra has no five-hour limit, so
+    // its session window arrives as null rather than as a placeholder. The
+    // sub-line is the window's subtitle ("Up to 50% of weekly limit"), except
+    // the session's "Starts when a message is sent", which the right-hand slot
+    // already says as "Not started yet".
     const Claude::UsageWindow* windows[] = {
         &snapshot.currentSession, &snapshot.weeklyAllModels,
         &snapshot.weeklySonnet, &snapshot.weeklyFable
@@ -3343,68 +2051,168 @@ static void RenderClaudeSections(const Claude::Snapshot& snapshot)
     for (const Claude::UsageWindow* w : windows) {
         if (!w->valid || !PanelShows(AppSettings::WidgetSectionQuota)) continue;
         PanelBarSection(w->title.empty() ? "Usage" : w->title.c_str(), true, w->usedPercent,
-            PanelReset(w->resetAtUnixSeconds, w->resetText), std::string{},
-            true, "Claude:" + w->title);
+            PanelReset(w->resetAtUnixSeconds, w->resetText),
+            w == &snapshot.currentSession ? std::string{} : w->subtitle,
+            true, PinKey("Claude", w->title));
         PanelRule();
+
+        // The forecast and the split by surface read as part of the week.
+        if (w == &snapshot.weeklyAllModels) {
+            const Claude::Pace pace = ClaudeWeeklyPace(snapshot, now);
+            PanelInfoCard("Pace", { Claude::PaceText(pace, now) }, "Claude", PaceColor(pace.state));
+            PanelInfoCard("This week by surface", ClaudeBreakdownCardLines(snapshot), "Claude");
+        }
     }
     for (const Claude::UsageWindow& w : snapshot.additionalLimits) {
         if (!w.valid || !PanelShows(AppSettings::WidgetSectionQuota)) continue;
         PanelBarSection(w.title.empty() ? "Usage" : w.title.c_str(), true, w.usedPercent,
-            PanelReset(w.resetAtUnixSeconds, w.resetText), std::string{},
-            true, "Claude:" + w.title);
+            PanelReset(w.resetAtUnixSeconds, w.resetText), w.subtitle,
+            true, PinKey("Claude", w.title));
         PanelRule();
+    }
+
+    if (PanelShows(AppSettings::WidgetSectionDetails)) {
+        PanelInfoCard("Limit resets", ClaudeLimitResetCardLines(snapshot.limitResets, now), "Claude");
+    }
+
+    if (PanelShows(AppSettings::WidgetSectionExtra)) {
+        for (const Claude::PromoCredit& credit : snapshot.promoCredits) {
+            const std::string left = PromoCreditLeft(credit);
+            PanelBarSection(credit.title.c_str(), true, credit.usedPercent,
+                left.empty() ? UsageText(credit.usedPercent) : left, PromoCreditSubline(credit),
+                /*resets=*/false, PromoCreditKey(credit), credit.label);
+            PanelRule();
+        }
     }
 
     PanelContextSection(snapshot.context, "Claude");
 
-    if (PanelShows(AppSettings::WidgetSectionExtra) &&
-        snapshot.credits.valid && snapshot.credits.hasUsedPercent) {
-        PanelBarSection(snapshot.credits.label.empty() ? "Extra usage" : snapshot.credits.label.c_str(),
-            true, snapshot.credits.usedPercent,
-            PanelReset(snapshot.credits.resetAtUnixSeconds, snapshot.credits.resetText),
-            snapshot.credits.spentText.empty() ? std::string{}
-                : snapshot.credits.spentText +
-                  (snapshot.credits.monthlyLimitText.empty() ? "" : " / " + snapshot.credits.monthlyLimitText));
-        PanelRule();
-    }
-    else if (PanelShows(AppSettings::WidgetSectionExtra) &&
-        snapshot.credits.valid && !snapshot.credits.spentText.empty()) {
-        PanelInfoSection(snapshot.credits.label.empty() ? "Usage credits" : snapshot.credits.label.c_str(),
-            { snapshot.credits.spentText +
-              (snapshot.credits.monthlyLimitText.empty() ? "" : " / " + snapshot.credits.monthlyLimitText) });
-        PanelRule();
+    if (PanelShows(AppSettings::WidgetSectionExtra) && snapshot.credits.valid) {
+        const std::string title = ClaudeCreditsTitle(snapshot);
+
+        // Either way the disabled reason sits muted beside the credits line:
+        // the bar card's sub-line is muted throughout.
+        if (snapshot.credits.hasUsedPercent) {
+            const std::string reason = ClaudeCreditsDisabledText(snapshot.credits);
+            PanelBarSection(title.c_str(), true, snapshot.credits.usedPercent,
+                PanelReset(snapshot.credits.resetAtUnixSeconds, snapshot.credits.resetText),
+                ClaudeCreditsLine(snapshot) + (reason.empty() ? "" : " · " + reason),
+                true, PinKey("Claude", title));
+            PanelRule();
+        }
+        else {
+            PanelInfoCard(title, ClaudeCreditsCardLines(snapshot), "Claude", kPanelInfoText, 1);
+        }
     }
 
-    if (PanelShows(AppSettings::WidgetSectionCost) && snapshot.run.costValid) {
-        char spend[48];
-        std::snprintf(spend, sizeof(spend), "Session: $%.2f", snapshot.run.sessionCostUsd);
-        std::vector<std::string> lines{ spend };
-        if (snapshot.run.sessionLinesAdded > 0 || snapshot.run.sessionLinesRemoved > 0) {
-            lines.push_back("+" + std::to_string(snapshot.run.sessionLinesAdded) +
-                " / -" + std::to_string(snapshot.run.sessionLinesRemoved) + " lines");
-        }
-        if (snapshot.run.sessionDurationMs > 0) {
-            lines.push_back("Over " + FormatRunDuration(snapshot.run.sessionDurationMs / 1000));
-        }
-        PanelInfoSection("Cost", lines);
-        PanelRule();
+    if (PanelShows(AppSettings::WidgetSectionCost)) {
+        PanelInfoCard("Cost", ClaudeCostCardLines(snapshot.run), "Claude");
+    }
+    if (PanelShows(AppSettings::WidgetSectionDetails)) {
+        PanelInfoCard("Auto-resume", ClaudeAutoResumeCardLines(snapshot.autoResume), "Claude");
+        PanelInfoCard(ClaudeLedgerTitle(snapshot.ledger), ClaudeLedgerCardLines(snapshot.ledger), "Claude");
     }
 
-    PanelActivitySection(snapshot.run, snapshot.context);
-    PanelSessionSection(snapshot.run);
-    PanelTimingSection(snapshot.run);
-    PanelBreakdownSection(snapshot.context);
-    PanelCacheSection(snapshot.context);
-    PanelCompactionSection(snapshot.context);
-    PanelModelSection(snapshot.context);
+    PanelActivitySection(snapshot.run, snapshot.context, "Claude");
+    PanelSessionSection(snapshot.run, "Claude");
+    PanelTimingSection(snapshot.run, "Claude");
+    PanelBreakdownSection(snapshot.context, "Claude");
+    PanelCacheSection(snapshot.context, "Claude");
+    PanelCompactionSection(snapshot.context, "Claude");
+    PanelModelSection(snapshot.context, "Claude");
+}
+
+// A provider detail row as its own card, titled by what it is ("Subscription",
+// "5-hour quota resets") so each can be pinned separately.
+static std::vector<std::string> ZAiDetailCardLines(const ZAi::DetailRow& detail)
+{
+    std::vector<std::string> lines;
+    if (!detail.leftValue.empty()) lines.push_back(detail.leftValue);
+    if (!detail.rightLabel.empty() && !detail.rightValue.empty()) {
+        lines.push_back(detail.rightLabel + ": " + detail.rightValue);
+    }
+    return lines;
+}
+
+// Banked 5-hour / weekly resets, soonest expiry first, and when each kind was
+// last spent - the reading ZCode's own reset panel gives.
+static std::vector<std::string> ZAiResetCardLines(const ZAi::Snapshot& s)
+{
+    if (!s.resetsReported) return {};
+
+    std::vector<std::string> lines;
+    lines.push_back(std::to_string(s.resets.size()) + " available");
+
+    for (const ZAi::QuotaReset& reset : s.resets) {
+        const std::string when = PanelExpiry(reset.expiresAtUnixSeconds);
+        lines.push_back(reset.type + " reset" + (when.empty() ? "" : "  ·  " + when));
+    }
+
+    const long long now = static_cast<long long>(std::time(nullptr));
+    for (const auto& [type, usedAt] : { std::pair<const char*, long long>{ "5-hour", s.lastFiveHourResetUnixSeconds },
+                                        std::pair<const char*, long long>{ "weekly", s.lastWeeklyResetUnixSeconds } }) {
+        if (usedAt > 0 && usedAt <= now) {
+            lines.push_back("Last " + std::string(type) + " reset used " + FormatRunDuration(now - usedAt) + " ago");
+        }
+    }
+
+    return lines;
+}
+
+// Coding Plan usage history. -1 is "not reported", so each figure stands or
+// falls on its own.
+static std::vector<std::string> ZAiHistoryCardLines(const ZAi::UsageHistory& h)
+{
+    std::vector<std::string> lines;
+    if (!h.valid) return lines;
+
+    std::string today;
+    const auto add = [&today](const std::string& part) {
+        today += (today.empty() ? "" : " · ") + part;
+    };
+    if (h.todayTokens >= 0) add(FormatCompactTokenCount(h.todayTokens) + " tokens");
+    if (h.todayModelCalls >= 0) add(Plural(h.todayModelCalls, "model call"));
+    if (h.todayToolCalls >= 0) add(Plural(h.todayToolCalls, "tool call"));
+    if (!today.empty()) lines.push_back("Today: " + today);
+
+    if (h.totalTokens >= 0) lines.push_back("Past year: " + FormatCompactTokenCount(h.totalTokens) + " tokens");
+
+    // "Usage time 123 h · Decode Pro 42 tok/s, Lite 88 tok/s": the year's
+    // time, then the latest daily decode speed per tier.
+    std::string decode;
+    if (h.proDecodeTps >= 0.0) {
+        decode = "Pro " + Format::get_instance()->IntegerWithCommas(h.proDecodeTps) + " tok/s";
+    }
+    if (h.liteDecodeTps >= 0.0) {
+        decode += (decode.empty() ? "" : ", ") + std::string("Lite ") +
+            Format::get_instance()->IntegerWithCommas(h.liteDecodeTps) + " tok/s";
+    }
+    std::string speed = h.totalUsageSeconds >= 0
+        ? "Usage time " + Format::get_instance()->IntegerWithCommas(static_cast<double>(h.totalUsageSeconds / 3600)) + " h"
+        : std::string{};
+    if (!decode.empty()) speed += (speed.empty() ? "Decode " : " · Decode ") + decode;
+    if (!speed.empty()) lines.push_back(speed);
+
+    if (h.peakDailyTokens >= 0) {
+        lines.push_back("Peak day: " + FormatCompactTokenCount(h.peakDailyTokens) + " tokens" +
+            (h.peakDate.empty() ? "" : " · " + ShortDate(h.peakDate)));
+    }
+    if (h.currentStreakDays >= 0 || h.longestStreakDays >= 0) {
+        lines.push_back(StreakLine(h.currentStreakDays, h.longestStreakDays));
+    }
+    if (!h.models.empty()) lines.push_back("Models, 7 days: " + TopEntries(h.models));
+    if (!h.tools.empty()) lines.push_back("Tools, 7 days: " + TopEntries(h.tools));
+
+    return lines;
 }
 
 static void RenderZAiSections(const ZAi::Snapshot& snapshot)
 {
     g_panelLiveState = LiveRunState(snapshot.run, snapshot.context);
+    g_panelLiveModel = snapshot.context.model;
     PanelStatusLine(snapshot.access, snapshot.statusText);
 
-    PanelPlanSection("Z.Ai", snapshot.plan, snapshot.statusText);
+    PanelPlanSection("Z.Ai", PlanCardLines("Z.Ai", snapshot.plan, snapshot.statusText));
 
     for (const ZAi::UsageBar& bar : snapshot.bars) {
         if (!bar.valid || !PanelShows(AppSettings::WidgetSectionQuota)) continue;
@@ -3417,12 +2225,13 @@ static void RenderZAiSections(const ZAi::Snapshot& snapshot)
 
     PanelContextSection(snapshot.context, "Z.Ai");
 
-    for (const ZAi::DetailRow& detail : snapshot.details) {
-        if (!PanelShows(AppSettings::WidgetSectionDetails)) break;
-        std::vector<std::string> lines;
-        if (!detail.leftLabel.empty()) lines.push_back(detail.leftLabel + ": " + detail.leftValue);
-        if (!detail.rightLabel.empty()) lines.push_back(detail.rightLabel + ": " + detail.rightValue);
-        if (!lines.empty()) { PanelInfoSection("Details", lines); PanelRule(); }
+    if (PanelShows(AppSettings::WidgetSectionDetails)) {
+        for (const ZAi::DetailRow& detail : snapshot.details) {
+            PanelInfoCard(detail.leftLabel.empty() ? "Details" : detail.leftLabel,
+                ZAiDetailCardLines(detail), "Z.Ai");
+        }
+        PanelInfoCard("Quota resets", ZAiResetCardLines(snapshot), "Z.Ai");
+        PanelInfoCard("Usage history", ZAiHistoryCardLines(snapshot.history), "Z.Ai");
     }
 
     if (PanelShows(AppSettings::WidgetSectionMcp) && snapshot.mcp.valid) {
@@ -3447,15 +2256,21 @@ static void RenderZAiSections(const ZAi::Snapshot& snapshot)
         }
 
         PanelBarSection("MCP Usage", snapshot.mcp.limit > 0, used, right, sub,
-            true, "Z.Ai:MCP");
+            true, PinKey("Z.Ai", "MCP"));
         PanelRule();
     }
 
-    PanelActivitySection(snapshot.run, snapshot.context);
-    PanelBreakdownSection(snapshot.context);
-    PanelCacheSection(snapshot.context);
-    PanelCompactionSection(snapshot.context);
-    PanelModelSection(snapshot.context);
+    PanelActivitySection(snapshot.run, snapshot.context, "Z.Ai");
+    PanelBreakdownSection(snapshot.context, "Z.Ai");
+    PanelCacheSection(snapshot.context, "Z.Ai");
+    PanelCompactionSection(snapshot.context, "Z.Ai");
+    PanelModelSection(snapshot.context, "Z.Ai");
+}
+
+static std::vector<std::string> GrokCreditCardLines(const Grok::Snapshot& s)
+{
+    if (!s.extraCredits.valid) return {};
+    return { "Balance: " + s.extraCredits.balanceText, "Used: " + s.extraCredits.usedText };
 }
 
 static void RenderGrokSections(const Grok::Snapshot& snapshot)
@@ -3465,80 +2280,30 @@ static void RenderGrokSections(const Grok::Snapshot& snapshot)
     g_panelLiveModel = snapshot.context.model;
     PanelStatusLine(snapshot.access, snapshot.statusText);
 
-    PanelPlanSection("Grok", snapshot.plan, snapshot.statusText);
+    PanelPlanSection("Grok", PlanCardLines("Grok", snapshot.plan, snapshot.statusText));
 
     if (PanelShows(AppSettings::WidgetSectionQuota) && snapshot.weeklyLimit.valid) {
         PanelBarSection(snapshot.weeklyLimit.title.empty() ? "Weekly" : snapshot.weeklyLimit.title.c_str(),
             true, snapshot.weeklyLimit.usedPercent,
             PanelReset(snapshot.weeklyLimit.resetAtUnixSeconds, snapshot.weeklyLimit.resetText),
-            std::string{}, true, "Grok:" + snapshot.weeklyLimit.title);
+            std::string{}, true, PinKey("Grok", snapshot.weeklyLimit.title));
         PanelRule();
     }
     for (const Grok::ProductUsage& product : snapshot.products) {
         if (!PanelShows(AppSettings::WidgetSectionQuota)) break;
         PanelBarSection(product.product.empty() ? "Product" : product.product.c_str(),
             true, product.usagePercent, std::string{}, std::string{},
-            true, "Grok:" + product.product);
+            true, PinKey("Grok", product.product));
         PanelRule();
     }
-    if (PanelShows(AppSettings::WidgetSectionExtra) && snapshot.extraCredits.valid) {
-        PanelInfoSection("Credits",
-            { "Balance: " + snapshot.extraCredits.balanceText, "Used: " + snapshot.extraCredits.usedText });
-        PanelRule();
+    if (PanelShows(AppSettings::WidgetSectionExtra)) {
+        PanelInfoCard("Credits", GrokCreditCardLines(snapshot), "Grok");
     }
 
     PanelContextSection(snapshot.context, "Grok");
-    PanelBreakdownSection(snapshot.context);
-    PanelCacheSection(snapshot.context);
-    PanelModelSection(snapshot.context);
-}
-
-// ---- main-window provider tabs ----
-
-static void DrawCodexTab() {
-    Codex::Snapshot snapshot;
-    { std::lock_guard<std::mutex> lock(g_codexMutex); snapshot = g_codexState; }
-    PanelScope scope;
-    DrawProviderHeader("Codex", snapshot.lastUpdated, snapshot.plan,
-        g_codexAutoRefreshEnabled, g_codexLoading.load(), RefreshCodexAsync, "codex_refresh");
-    RenderCodexSections(snapshot);
-}
-
-static void DrawClaudeTab() {
-    Claude::Snapshot snapshot;
-    { std::lock_guard<std::mutex> lock(g_claudeMutex); snapshot = g_claudeState; }
-    PanelScope scope;
-    DrawProviderHeader("Claude", snapshot.lastUpdated, PlanBeside("Claude", snapshot.plan),
-        g_claudeAutoRefreshEnabled, g_claudeLoading.load(), RefreshClaudeAsync, "claude_refresh");
-    RenderClaudeSections(snapshot);
-}
-
-static void DrawZAiTab() {
-    ZAi::Snapshot snapshot;
-    { std::lock_guard<std::mutex> lock(g_zaiMutex); snapshot = g_zaiState; }
-    PanelScope scope;
-    DrawProviderHeader("Z.Ai", snapshot.lastUpdated, snapshot.plan,
-        g_zaiAutoRefreshEnabled, g_zaiLoading.load(), RefreshZAiAsync, "zai_refresh");
-    RenderZAiSections(snapshot);
-}
-
-static void DrawGrokTab() {
-    Grok::Snapshot snapshot;
-    { std::lock_guard<std::mutex> lock(g_grokMutex); snapshot = g_grokState; }
-    PanelScope scope;
-    DrawProviderHeader("Grok", snapshot.lastUpdated, snapshot.plan,
-        g_grokAutoRefreshEnabled, g_grokLoading.load(), RefreshGrokAsync, "grok_refresh");
-    RenderGrokSections(snapshot);
-}
-
-static void DrawSettingsHeader(const char* title)
-{
-    ImGui::Spacing();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.86f, 0.86f, 0.86f, 1.0f));
-    ImGui::TextUnformatted(title);
-    ImGui::PopStyleColor();
-    ImGui::Separator();
-    ImGui::Spacing();
+    PanelBreakdownSection(snapshot.context, "Grok");
+    PanelCacheSection(snapshot.context, "Grok");
+    PanelModelSection(snapshot.context, "Grok");
 }
 
 static void DrawQuotaRuleSettings(const char* label, AppSettings::QuotaWarningRule& rule)
@@ -3582,384 +2347,6 @@ static void DrawQuotaRuleSettings(const char* label, AppSettings::QuotaWarningRu
     }
 
     ImGui::PopID();
-}
-
-static void DrawPrepareMinutesControl(AppSettings::ProviderNotifications& settings)
-{
-    ImGui::BeginDisabled(!settings.prepareReset);
-
-    ImGui::TableNextRow();
-    ImGui::TableSetColumnIndex(0);
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextDisabled("Prepare warning time");
-
-    ImGui::TableSetColumnIndex(1);
-    ImGui::SetNextItemWidth(-1.0f);
-    ImGui::SliderInt("##prepare_minutes", &settings.prepareMinutes, 1, 120, "%d min before reset");
-
-    ImGui::EndDisabled();
-}
-
-static void DrawProviderNotificationSettings(const char* label, AppSettings::ProviderNotifications& settings, bool showResetCredits)
-{
-    ImGui::PushID(label);
-    DrawSettingsHeader(label);
-
-    if (ImGui::BeginTable("##provider_notifications", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
-        ImGui::TableSetupColumn("Option", ImGuiTableColumnFlags_WidthStretch, 0.52f);
-        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.48f);
-
-        ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0);
-        ImGui::Checkbox("Enabled", &settings.enabled);
-        ImGui::TableSetColumnIndex(1);
-        ImGui::TextDisabled(settings.enabled ? "Notifications on" : "Notifications off");
-
-        if (showResetCredits) {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            ImGui::Checkbox("Reset credit reminders", &settings.resetCredits);
-            ImGui::TableSetColumnIndex(1);
-            ImGui::TextDisabled("Codex reset credits");
-        }
-
-        ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0);
-        ImGui::Checkbox("Prepare reset warning", &settings.prepareReset);
-        ImGui::TableSetColumnIndex(1);
-        ImGui::TextDisabled("Before quota resets");
-
-        DrawPrepareMinutesControl(settings);
-
-        ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0);
-        ImGui::Checkbox("Exact reset notification", &settings.exactReset);
-        ImGui::TableSetColumnIndex(1);
-        ImGui::TextDisabled("When quota resets");
-
-        ImGui::EndTable();
-    }
-
-    ImGui::PopID();
-}
-
-static void DrawCodexNotificationCard()
-{
-    DrawProviderNotificationSettings("Codex notifications", g_codexNotifySettings, true);
-}
-
-static void DrawClaudeNotificationCard()
-{
-    DrawProviderNotificationSettings("Claude notifications", g_claudeNotifySettings, false);
-}
-
-static Codex::Snapshot CopyCodexSnapshotForSettings()
-{
-    std::lock_guard<std::mutex> lock(g_codexMutex);
-    return g_codexState;
-}
-
-static Claude::Snapshot CopyClaudeSnapshotForSettings()
-{
-    std::lock_guard<std::mutex> lock(g_claudeMutex);
-    return g_claudeState;
-}
-
-static ZAi::Snapshot CopyZAiSnapshotForSettings()
-{
-    std::lock_guard<std::mutex> lock(g_zaiMutex);
-    return g_zaiState;
-}
-
-static Grok::Snapshot CopyGrokSnapshotForSettings()
-{
-    std::lock_guard<std::mutex> lock(g_grokMutex);
-    return g_grokState;
-}
-
-static bool HasCodexWindow(const Codex::Snapshot& snapshot, const char* label)
-{
-    for (const Codex::UsageBar& bar : snapshot.bars) {
-        if (bar.valid && bar.label == label) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-
-static void DrawCodexQuotaCard()
-{
-    DrawSettingsHeader("Codex quota warnings");
-    Codex::Snapshot snapshot = CopyCodexSnapshotForSettings();
-    bool hasSession = HasCodexWindow(snapshot, "Session");
-    bool hasWeekly = HasCodexWindow(snapshot, "Weekly");
-
-    if (!hasSession && !hasWeekly) {
-        ImGui::TextDisabled("No quota windows are currently available.");
-        return;
-    }
-
-    if (ImGui::BeginTable("##codex_quota_table", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
-        ImGui::TableSetupColumn("Quota", ImGuiTableColumnFlags_WidthStretch, 0.47f);
-        ImGui::TableSetupColumn("Threshold", ImGuiTableColumnFlags_WidthStretch, 0.53f);
-
-        if (hasSession) {
-            DrawQuotaRuleSettings("5-hour limit", g_codexQuotaWarnings.fiveHour);
-        }
-
-        if (hasWeekly) {
-            DrawQuotaRuleSettings("Weekly - all models", g_codexQuotaWarnings.weekly);
-        }
-
-        ImGui::EndTable();
-    }
-}
-
-static void DrawClaudeQuotaCard()
-{
-    DrawSettingsHeader("Claude quota warnings");
-    Claude::Snapshot snapshot = CopyClaudeSnapshotForSettings();
-    bool any = snapshot.currentSession.valid || snapshot.weeklyAllModels.valid || snapshot.weeklySonnet.valid ||
-        snapshot.weeklyFable.valid || (snapshot.credits.valid && snapshot.credits.enabled && snapshot.credits.hasUsedPercent);
-
-    if (!any) {
-        ImGui::TextDisabled("No quota windows are currently available.");
-        return;
-    }
-
-    if (ImGui::BeginTable("##claude_quota_table", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
-        ImGui::TableSetupColumn("Quota", ImGuiTableColumnFlags_WidthStretch, 0.47f);
-        ImGui::TableSetupColumn("Threshold", ImGuiTableColumnFlags_WidthStretch, 0.53f);
-
-        if (snapshot.currentSession.valid) DrawQuotaRuleSettings("Current session", g_claudeQuotaWarnings.currentSession);
-        if (snapshot.weeklyAllModels.valid) DrawQuotaRuleSettings("All models", g_claudeQuotaWarnings.allModels);
-        if (snapshot.weeklySonnet.valid) DrawQuotaRuleSettings("Sonnet", g_claudeQuotaWarnings.sonnet);
-        if (snapshot.weeklyFable.valid) DrawQuotaRuleSettings("Fable", g_claudeQuotaWarnings.fable);
-        if (snapshot.credits.valid && snapshot.credits.enabled && snapshot.credits.hasUsedPercent) DrawQuotaRuleSettings("Usage credits", g_claudeQuotaWarnings.credits);
-
-        ImGui::EndTable();
-    }
-}
-
-static void DrawSettingsGeneralCard(float contentWidth)
-{
-    DrawSettingsHeader("General");
-
-    bool twoColumns = contentWidth >= 650.0f;
-
-    if (twoColumns && ImGui::BeginTable("##general_table", 2, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoSavedSettings)) {
-        ImGui::TableNextRow();
-
-        ImGui::TableSetColumnIndex(0);
-        ImGui::Checkbox("Show remaining", &g_showRemaining);
-        ImGui::Checkbox("Show reset date details", &g_showResetDateDetails);
-        ImGui::SetNextItemWidth(-1.0f);
-        ImGui::Combo("Reset time mode", &g_resetDisplayMode, ResetTime::get_instance()->ModeNames(), ResetTime::get_instance()->ModeCount());
-        g_resetDisplayMode = ResetTime::get_instance()->ClampMode(g_resetDisplayMode);
-
-        if (ImGui::Checkbox("Show notifications inside window", &g_showNotificationsInsideWindow)) {
-            NotifyGUI::SetInsideWindow(g_showNotificationsInsideWindow);
-        }
-
-        ImGui::TableSetColumnIndex(1);
-        ImGui::TextUnformatted("Notification position");
-        ImGui::SetNextItemWidth(-1.0f);
-
-        if (ImGui::Combo("##notification_position", &g_notifyPositionIndex, g_notifyPositionNames, R().notifyPositionCount)) {
-            g_notifyPositionIndex = AppSettings::ClampNotificationPositionIndex(g_notifyPositionIndex);
-            g_notifyPosition = g_notifyPositions[g_notifyPositionIndex];
-            CodexNotifier::SetPosition(g_notifyPosition);
-            ClaudeNotifier::SetPosition(g_notifyPosition);
-            ZAiNotifier::SetPosition(g_notifyPosition);
-            GrokNotifier::SetPosition(g_notifyPosition);
-        }
-
-        ImGui::TextDisabled(g_showNotificationsInsideWindow ? "inside window" : "outside screen");
-
-        ImGui::EndTable();
-    }
-    else {
-        ImGui::Checkbox("Show remaining", &g_showRemaining);
-        ImGui::Checkbox("Show reset date details", &g_showResetDateDetails);
-        ImGui::SetNextItemWidth(-1.0f);
-        ImGui::Combo("Reset time mode", &g_resetDisplayMode, ResetTime::get_instance()->ModeNames(), ResetTime::get_instance()->ModeCount());
-        g_resetDisplayMode = ResetTime::get_instance()->ClampMode(g_resetDisplayMode);
-
-        if (ImGui::Checkbox("Show notifications inside window", &g_showNotificationsInsideWindow)) {
-            NotifyGUI::SetInsideWindow(g_showNotificationsInsideWindow);
-        }
-
-        ImGui::Spacing();
-        ImGui::TextUnformatted("Notification position");
-        ImGui::SetNextItemWidth(-1.0f);
-
-        if (ImGui::Combo("##notification_position", &g_notifyPositionIndex, g_notifyPositionNames, R().notifyPositionCount)) {
-            g_notifyPositionIndex = AppSettings::ClampNotificationPositionIndex(g_notifyPositionIndex);
-            g_notifyPosition = g_notifyPositions[g_notifyPositionIndex];
-            CodexNotifier::SetPosition(g_notifyPosition);
-            ClaudeNotifier::SetPosition(g_notifyPosition);
-            ZAiNotifier::SetPosition(g_notifyPosition);
-            GrokNotifier::SetPosition(g_notifyPosition);
-        }
-
-        ImGui::TextDisabled(g_showNotificationsInsideWindow ? "inside window" : "outside screen");
-    }
-}
-
-static void DrawSettingsSaveFooter()
-{
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    if (ImGui::Button("Save Settings", ImVec2(132.0f, 28.0f))) {
-        if (SaveAppSettings()) {
-            NotifyGUI::Add("Settings saved to settings.ini", g_notifyPosition, 5.0f, NOTIFY_COL32(70, 230, 90, 255));
-        }
-        else {
-            NotifyGUI::Add("Failed to save settings.ini", g_notifyPosition, 5.0f, NOTIFY_COL32(255, 90, 90, 255));
-        }
-    }
-
-    ImGui::SameLine();
-    ImGui::TextDisabled("settings.ini in exe folder");
-}
-
-
-static void DrawModernSettingsSection(const char* title)
-{
-    ImGui::Spacing();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.88f, 0.88f, 0.88f, 1.0f));
-    ImGui::TextUnformatted(title);
-    ImGui::PopStyleColor();
-    ImGui::Separator();
-    ImGui::Spacing();
-}
-
-static void DrawNotificationCell(const char* id, bool* value, const char* enabledText, const char* disabledText)
-{
-    ImGui::PushID(id);
-    ImGui::Checkbox("##check", value);
-    ImGui::SameLine(0.0f, 6.0f);
-    ImGui::TextDisabled(*value ? enabledText : disabledText);
-    ImGui::PopID();
-}
-
-static void DrawPrepareMinutesCell(const char* id, AppSettings::ProviderNotifications& settings)
-{
-    ImGui::PushID(id);
-    ImGui::BeginDisabled(!settings.prepareReset);
-    ImGui::SetNextItemWidth(-1.0f);
-    ImGui::SliderInt("##minutes", &settings.prepareMinutes, 1, 120, "%d min before reset");
-    ImGui::EndDisabled();
-    ImGui::PopID();
-}
-
-static void DrawModernNotificationsSettings()
-{
-    DrawModernSettingsSection("Notifications");
-
-    if (ImGui::BeginTable("##notifications_table", 3,
-        ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_NoSavedSettings)) {
-        ImGui::TableSetupColumn("Setting", ImGuiTableColumnFlags_WidthStretch, 0.30f);
-        ImGui::TableSetupColumn("Codex", ImGuiTableColumnFlags_WidthStretch, 0.35f);
-        ImGui::TableSetupColumn("Claude", ImGuiTableColumnFlags_WidthStretch, 0.35f);
-        ImGui::TableHeadersRow();
-
-        ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted("Enabled");
-        ImGui::TableSetColumnIndex(1); DrawNotificationCell("codex_enabled", &g_codexNotifySettings.enabled, "On", "Off");
-        ImGui::TableSetColumnIndex(2); DrawNotificationCell("claude_enabled", &g_claudeNotifySettings.enabled, "On", "Off");
-
-        ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted("Reset credit reminders");
-        ImGui::TableSetColumnIndex(1); DrawNotificationCell("codex_reset_credits", &g_codexNotifySettings.resetCredits, "On", "Off");
-        ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("Not used by Claude");
-
-        ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted("Prepare reset warning");
-        ImGui::TableSetColumnIndex(1); DrawNotificationCell("codex_prepare", &g_codexNotifySettings.prepareReset, "Before resets", "Off");
-        ImGui::TableSetColumnIndex(2); DrawNotificationCell("claude_prepare", &g_claudeNotifySettings.prepareReset, "Before resets", "Off");
-
-        ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted("Prepare warning time");
-        ImGui::TableSetColumnIndex(1); DrawPrepareMinutesCell("codex_minutes", g_codexNotifySettings);
-        ImGui::TableSetColumnIndex(2); DrawPrepareMinutesCell("claude_minutes", g_claudeNotifySettings);
-
-        ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted("Exact reset notification");
-        ImGui::TableSetColumnIndex(1); DrawNotificationCell("codex_exact", &g_codexNotifySettings.exactReset, "When resets", "Off");
-        ImGui::TableSetColumnIndex(2); DrawNotificationCell("claude_exact", &g_claudeNotifySettings.exactReset, "When resets", "Off");
-
-        ImGui::EndTable();
-    }
-}
-
-static void DrawModernQuotaRow(const char* provider, const char* label, AppSettings::QuotaWarningRule& rule)
-{
-    ImGui::PushID(provider);
-    ImGui::PushID(label);
-
-    ImGui::TableNextRow();
-    ImGui::TableSetColumnIndex(0);
-    ImGui::TextUnformatted(provider);
-
-    ImGui::TableSetColumnIndex(1);
-    ImGui::TextUnformatted(label);
-
-    ImGui::TableSetColumnIndex(2);
-    ImGui::Checkbox("##enabled", &rule.enabled);
-
-    ImGui::TableSetColumnIndex(3);
-
-    int displayPercent = rule.percent;
-
-    if (g_showRemaining) {
-        displayPercent = 100 - rule.percent;
-    }
-
-    displayPercent = Math::get_instance()->ClampPercent(displayPercent);
-
-    ImGui::SetNextItemWidth(-1.0f);
-
-    const char* format = g_showRemaining ? "%d%% remaining" : "%d%% used";
-
-    if (ImGui::SliderInt("##threshold", &displayPercent, 1, 100, format)) {
-        displayPercent = Math::get_instance()->ClampPercent(displayPercent);
-        rule.percent = g_showRemaining ? 100 - displayPercent : displayPercent;
-        rule.percent = Math::get_instance()->ClampPercent(rule.percent);
-    }
-
-    ImGui::PopID();
-    ImGui::PopID();
-}
-
-static void DrawModernQuotaSettings()
-{
-    DrawModernSettingsSection("Quota warnings");
-
-    if (ImGui::BeginTable("##quota_table", 4,
-        ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_NoSavedSettings)) {
-        ImGui::TableSetupColumn("Provider", ImGuiTableColumnFlags_WidthStretch, 0.16f);
-        ImGui::TableSetupColumn("Quota", ImGuiTableColumnFlags_WidthStretch, 0.34f);
-        ImGui::TableSetupColumn("On", ImGuiTableColumnFlags_WidthFixed, 44.0f);
-        ImGui::TableSetupColumn("Threshold", ImGuiTableColumnFlags_WidthStretch, 0.50f);
-        ImGui::TableHeadersRow();
-
-        Codex::Snapshot codexSnapshot = CopyCodexSnapshotForSettings();
-        Claude::Snapshot claudeSnapshot = CopyClaudeSnapshotForSettings();
-
-        if (HasCodexWindow(codexSnapshot, "Session")) DrawModernQuotaRow("Codex", "5-hour limit", g_codexQuotaWarnings.fiveHour);
-        if (HasCodexWindow(codexSnapshot, "Weekly")) DrawModernQuotaRow("Codex", "Weekly - all models", g_codexQuotaWarnings.weekly);
-        if (claudeSnapshot.currentSession.valid) DrawModernQuotaRow("Claude", "Current session", g_claudeQuotaWarnings.currentSession);
-        if (claudeSnapshot.weeklyAllModels.valid) DrawModernQuotaRow("Claude", "All models", g_claudeQuotaWarnings.allModels);
-        if (claudeSnapshot.weeklySonnet.valid) DrawModernQuotaRow("Claude", "Sonnet", g_claudeQuotaWarnings.sonnet);
-        if (claudeSnapshot.weeklyFable.valid) DrawModernQuotaRow("Claude", "Fable", g_claudeQuotaWarnings.fable);
-        if (claudeSnapshot.credits.valid && claudeSnapshot.credits.enabled && claudeSnapshot.credits.hasUsedPercent) DrawModernQuotaRow("Claude", "Usage credits", g_claudeQuotaWarnings.credits);
-
-        ImGui::EndTable();
-    }
 }
 
 static void BeginCleanSettingsCard(const char* id, const char* title, ImVec2 size)
@@ -4052,7 +2439,13 @@ static void DrawCleanProviderNotifications(AppSettings::ProviderNotifications& s
     }
 }
 
-static void DrawCleanQuotaWarnings(bool codex)
+struct QuotaRuleRow
+{
+    const char* label;
+    AppSettings::QuotaWarningRule& rule;
+};
+
+static void DrawCleanQuotaWarnings(std::initializer_list<QuotaRuleRow> rules)
 {
     // Every rule this provider defines is always listed. A warning threshold is
     // a saved preference: gating the row on the window being present in the
@@ -4062,72 +2455,9 @@ static void DrawCleanQuotaWarnings(bool codex)
         ImGui::TableSetupColumn("Quota", ImGuiTableColumnFlags_WidthStretch, 0.48f);
         ImGui::TableSetupColumn("Threshold", ImGuiTableColumnFlags_WidthStretch, 0.52f);
 
-        if (codex) {
-            DrawQuotaRuleSettings("5-hour limit", g_codexQuotaWarnings.fiveHour);
-            DrawQuotaRuleSettings("Weekly - all models", g_codexQuotaWarnings.weekly);
+        for (const QuotaRuleRow& row : rules) {
+            DrawQuotaRuleSettings(row.label, row.rule);
         }
-        else {
-            DrawQuotaRuleSettings("Current session", g_claudeQuotaWarnings.currentSession);
-            DrawQuotaRuleSettings("All models", g_claudeQuotaWarnings.allModels);
-            DrawQuotaRuleSettings("Sonnet", g_claudeQuotaWarnings.sonnet);
-            DrawQuotaRuleSettings("Fable", g_claudeQuotaWarnings.fable);
-            DrawQuotaRuleSettings("Usage credits", g_claudeQuotaWarnings.credits);
-        }
-
-        ImGui::EndTable();
-    }
-}
-
-static void DrawCleanZAiNotifications()
-{
-    if (ImGui::BeginTable("##zai_notify_table", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
-        ImGui::TableSetupColumn("Option", ImGuiTableColumnFlags_WidthStretch, 0.50f);
-        ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthStretch, 0.50f);
-
-        DrawNotificationToggleRow("Enabled", g_zaiNotifySettings.enabled, "Notifications on", "Notifications off");
-        DrawNotificationToggleRow("Prepare reset warning", g_zaiNotifySettings.prepareReset, "Before quota resets", "Off");
-        DrawPrepareMinutesRow(g_zaiNotifySettings);
-        DrawNotificationToggleRow("Exact reset notification", g_zaiNotifySettings.exactReset, "When quota resets", "Off");
-
-        ImGui::EndTable();
-    }
-}
-
-static void DrawCleanZAiQuotaWarnings()
-{
-    if (ImGui::BeginTable("##zai_quota_table", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
-        ImGui::TableSetupColumn("Quota", ImGuiTableColumnFlags_WidthStretch, 0.48f);
-        ImGui::TableSetupColumn("Threshold", ImGuiTableColumnFlags_WidthStretch, 0.52f);
-
-        DrawQuotaRuleSettings("GLM-5.2", g_zaiQuotaWarnings.glm52);
-        DrawQuotaRuleSettings("GLM-5-Turbo", g_zaiQuotaWarnings.turbo);
-
-        ImGui::EndTable();
-    }
-}
-
-static void DrawCleanGrokNotifications()
-{
-    if (ImGui::BeginTable("##grok_notify_table", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
-        ImGui::TableSetupColumn("Option", ImGuiTableColumnFlags_WidthStretch, 0.50f);
-        ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthStretch, 0.50f);
-
-        DrawNotificationToggleRow("Enabled", g_grokNotifySettings.enabled, "Notifications on", "Notifications off");
-        DrawNotificationToggleRow("Prepare reset warning", g_grokNotifySettings.prepareReset, "Before quota resets", "Off");
-        DrawPrepareMinutesRow(g_grokNotifySettings);
-        DrawNotificationToggleRow("Exact reset notification", g_grokNotifySettings.exactReset, "When quota resets", "Off");
-
-        ImGui::EndTable();
-    }
-}
-
-static void DrawCleanGrokQuotaWarnings()
-{
-    if (ImGui::BeginTable("##grok_quota_table", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
-        ImGui::TableSetupColumn("Quota", ImGuiTableColumnFlags_WidthStretch, 0.48f);
-        ImGui::TableSetupColumn("Threshold", ImGuiTableColumnFlags_WidthStretch, 0.52f);
-
-        DrawQuotaRuleSettings("Weekly limit", g_grokQuotaWarnings.weekly);
 
         ImGui::EndTable();
     }
@@ -4203,7 +2533,7 @@ static void DrawResetTimeModeSettings()
             // Rebuilding the atlas has to happen outside the frame, so flag it
             // and let the app loop do it between frames.
             g_fontReloadRequested = true;
-            if (R().saveAppSettings) R().saveAppSettings();
+            SaveAppSettings();
         }
     }
 
@@ -4221,7 +2551,7 @@ struct ViewToggle { const char* label; int bit; const char* hint; };
 
 static const ViewToggle kViewToggles[] = {
     { "Quota limits",      AppSettings::WidgetSectionQuota,
-      "Session, weekly and per-model limit bars" },
+      "Session, weekly and per-model limit bars, with the weekly pace" },
     { "Context window",    AppSettings::WidgetSectionContext,
       "Tokens used against the resolved context limit" },
     { "Context breakdown", AppSettings::WidgetSectionBreakdown,
@@ -4245,7 +2575,7 @@ static const ViewToggle kViewToggles[] = {
     { "MCP calls",         AppSettings::WidgetSectionMcp,
       "Z.Ai MCP call quota and refresh countdown" },
     { "Provider detail",   AppSettings::WidgetSectionDetails,
-      "Reset credits and other provider-specific rows" },
+      "Reset credits, limit resets, usage history and other provider-specific rows" },
     { "Status messages",   AppSettings::WidgetSectionStatus,
       "Errors and access warnings above the cards" },
     { "Plan",              AppSettings::WidgetSectionPlan,
@@ -4307,12 +2637,12 @@ static void DrawViewSectionToggles(float contentWidth)
 
     if (changed) {
         *R().widgetSections = mask;
-        if (R().saveAppSettings) R().saveAppSettings();
+        SaveAppSettings();
     }
 }
 
-// A miniature of the screen: nine cells, the eight edge ones selectable. Far
-// quicker to read than a dropdown of position names.
+// A miniature of the screen: its six parking spots, top and bottom thirds, as
+// a 2x3 grid. Far quicker to read than a dropdown of position names.
 static void DrawWidgetAnchorGrid()
 {
     if (!R().widgetAnchor) return;
@@ -4365,7 +2695,7 @@ static void DrawWidgetAnchorGrid()
 
     if (changed) {
         *R().widgetAnchor = anchor;
-        if (R().saveAppSettings) R().saveAppSettings();
+        SaveAppSettings();
         if (R().repositionWidget) R().repositionWidget();
     }
 }
@@ -4380,7 +2710,7 @@ static void DrawWidgetPlacementSettings(float contentWidth)
         if (ImGui::Combo("##widget_monitor", &monitor,
                 R().widgetMonitorNames, R().widgetMonitorCount)) {
             *R().widgetMonitor = monitor;
-            if (R().saveAppSettings) R().saveAppSettings();
+            SaveAppSettings();
             if (R().repositionWidget) R().repositionWidget();
         }
     }
@@ -4392,7 +2722,7 @@ static void DrawWidgetPlacementSettings(float contentWidth)
 
     if (R().widgetAlwaysOnTop) {
         if (ImGui::Checkbox("Always on top", R().widgetAlwaysOnTop)) {
-            if (R().saveAppSettings) R().saveAppSettings();
+            SaveAppSettings();
         }
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("%s", *R().widgetAlwaysOnTop
@@ -4407,7 +2737,7 @@ static void DrawWidgetPlacementSettings(float contentWidth)
     DrawSettingsMutedText("Snapping and rolling away are relative to this monitor only.");
 }
 
-// One row of the collapsed bar: a quota window from some host.
+// One row of the collapsed bar: a quota window or an info card from some host.
 struct WidgetPeek
 {
     bool valid = false;
@@ -4422,6 +2752,14 @@ struct WidgetPeek
     // meter's token counts, say). Wins over the reset time when set.
     std::string detail;
     bool resets = true;
+    // Info rows (balances, plan, reset credits...) have no percentage: they
+    // show valueText where the percent goes and draw no bar.
+    bool hasPercent = true;
+    std::string valueText;
+    // Whether the row can stand for its host when nothing is pinned, and on
+    // its tab's underline: the quota windows can, the context meter, credit
+    // balances and info rows cannot.
+    bool primary = true;
     // "Thinking..." / "Compacting..." while that host is mid-turn; empty when
     // idle, in which case the reset countdown shows instead.
     LiveState liveState;
@@ -4433,67 +2771,14 @@ struct WidgetPeek
     std::string legacyKey;
 };
 
-static WidgetPeek WidgetPeekSummary();
-static std::vector<WidgetPeek> WidgetPeekCandidates();
-static const std::vector<WidgetPeek>& WidgetPeekRows();
+static const std::vector<WidgetPeek>& WidgetPeekCandidates();
+static const WidgetPeek* ResolveKey(const std::vector<WidgetPeek>& candidates, const std::string& key);
 static std::vector<std::string> WidgetBarKeys();
+static void SetWidgetBarKeys(const std::vector<std::string>& keys);
 
-// Older builds included the moving reset timestamp in Z.Ai coding identities,
-// so a refresh turned an already-pinned row into a permanent "No data"
-// placeholder. Compare the stable portion of those legacy keys as an alias;
-// new keys no longer contain that timestamp.
-static std::string StableZAiKeyPart(const std::string& key)
+static std::string WidgetPeekLabel(const WidgetPeek& peek)
 {
-    const std::string prefix = "Z.Ai:coding:[";
-    if (key.rfind(prefix, 0) != 0 || key.back() != ']') return key;
-
-    size_t commas = 0;
-    for (size_t i = prefix.size(); i + 1 < key.size(); ++i) {
-        if (key[i] == ',') ++commas;
-    }
-
-    // The old shape was [type, unit, number, resetAt]. Keep the first three
-    // fields when resolving a key written by that build.
-    if (commas < 3) return key;
-    const size_t lastComma = key.rfind(',');
-    return lastComma == std::string::npos ? key : key.substr(0, lastComma) + "]";
-}
-
-static bool WidgetPeekKeyMatches(const WidgetPeek& candidate, const std::string& key)
-{
-    if (candidate.key == key || (!candidate.legacyKey.empty() && candidate.legacyKey == key)) {
-        return true;
-    }
-
-    const std::string stableCandidate = StableZAiKeyPart(candidate.key);
-    const std::string stableKey = StableZAiKeyPart(key);
-    // The candidate now has the stable three-field form, while a row saved by
-    // an older build has one additional reset timestamp. The normalized parts
-    // can therefore match even though only the incoming key is legacy.
-    if (stableCandidate == stableKey && candidate.key != key) return true;
-
-    // Some earlier builds serialized the coding identity with a different
-    // JSON number format. Decode the period field as a final compatibility
-    // fallback instead of allowing that formatting detail to strand a pin.
-    const std::string codingPrefix = "Z.Ai:coding:[\"CREDIT_LIMIT\",";
-    if (key.rfind(codingPrefix, 0) == 0 &&
-        (candidate.host == "Z.Ai" || candidate.host == "ZAi - Session" ||
-            candidate.host == "ZAi - Weekly")) {
-        const size_t unitBegin = codingPrefix.size();
-        const size_t unitEnd = key.find(',', unitBegin);
-        if (unitEnd != std::string::npos) {
-            const std::string unit = key.substr(unitBegin, unitEnd - unitBegin);
-            const std::string candidateText = candidate.window;
-            const bool session = unit.find('3') != std::string::npos &&
-                candidateText.find("5-hour") != std::string::npos;
-            const bool weekly = unit.find('6') != std::string::npos &&
-                candidateText.find("Weekly") != std::string::npos;
-            if (session || weekly) return true;
-        }
-    }
-
-    return !candidate.legacyKey.empty() &&
-        StableZAiKeyPart(candidate.legacyKey) == stableKey;
+    return peek.window.empty() ? peek.host : peek.host + "  " + peek.window;
 }
 
 // The collapsed bar's contents: tick the windows you want, drag to reorder.
@@ -4503,7 +2788,7 @@ static void DrawWidgetBarRowPicker(float contentWidth)
 {
     if (!R().widgetBarRows) return;
 
-    const std::vector<WidgetPeek> candidates = WidgetPeekCandidates();
+    const std::vector<WidgetPeek>& candidates = WidgetPeekCandidates();
 
     // The current selection, in order. Keys are kept even when their host is
     // not reporting right now - a host that has not refreshed yet, or is signed
@@ -4515,33 +2800,40 @@ static void DrawWidgetBarRowPicker(float contentWidth)
         return;
     }
 
-    const auto reporting = [&candidates](const std::string& key) {
-        for (const WidgetPeek& c : candidates) {
-            if (WidgetPeekKeyMatches(c, key)) return true;
-        }
-        return false;
-    };
+    // What each pick resolves to, the same way the bar resolves it.
+    std::vector<const WidgetPeek*> picked;
+    for (const std::string& key : chosen) {
+        picked.push_back(ResolveKey(candidates, key));
+    }
 
     bool changed = false;
 
     // Picked rows first, in order, each draggable onto another to reorder.
+    // Edits apply after the loop, so the rows stay paired with `picked`.
+    int removeAt = -1;
+    int moveFrom = -1;
+    int moveTo = -1;
+
     for (size_t i = 0; i < chosen.size(); ++i) {
         ImGui::PushID(static_cast<int>(i));
 
         bool on = true;
         if (ImGui::Checkbox("##pick", &on)) {
-            chosen.erase(chosen.begin() + static_cast<long long>(i));
-            changed = true;
-            ImGui::PopID();
-            break;
+            removeAt = static_cast<int>(i);
         }
 
         ImGui::SameLine();
 
-        std::string label = chosen[i];
-        const size_t colon = label.find(':');
-        if (colon != std::string::npos) label[colon] = ' ';
-        if (!reporting(chosen[i])) label += "   (not reporting)";
+        std::string label;
+        if (picked[i]) {
+            label = WidgetPeekLabel(*picked[i]);
+        }
+        else {
+            label = chosen[i];
+            const size_t colon = label.find(':');
+            if (colon != std::string::npos) label[colon] = ' ';
+            label += "   (not reporting)";
+        }
         ImGui::Selectable(("≡  " + label).c_str(), false, 0, ImVec2(contentWidth * 0.6f, 0.0f));
 
         if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoDisableHover)) {
@@ -4552,19 +2844,24 @@ static void DrawWidgetBarRowPicker(float contentWidth)
         }
         if (ImGui::BeginDragDropTarget()) {
             if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("AQC_BAR_ROW")) {
-                const int from = *static_cast<const int*>(payload->Data);
-                const int to = static_cast<int>(i);
-                if (from >= 0 && from < static_cast<int>(chosen.size()) && from != to) {
-                    const std::string moved = chosen[static_cast<size_t>(from)];
-                    chosen.erase(chosen.begin() + from);
-                    chosen.insert(chosen.begin() + to, moved);
-                    changed = true;
-                }
+                moveFrom = *static_cast<const int*>(payload->Data);
+                moveTo = static_cast<int>(i);
             }
             ImGui::EndDragDropTarget();
         }
 
         ImGui::PopID();
+    }
+
+    if (removeAt >= 0) {
+        chosen.erase(chosen.begin() + removeAt);
+        changed = true;
+    }
+    else if (moveFrom >= 0 && moveFrom < static_cast<int>(chosen.size()) && moveFrom != moveTo) {
+        const std::string moved = chosen[static_cast<size_t>(moveFrom)];
+        chosen.erase(chosen.begin() + moveFrom);
+        chosen.insert(chosen.begin() + moveTo, moved);
+        changed = true;
     }
 
     if (!chosen.empty()) {
@@ -4574,13 +2871,11 @@ static void DrawWidgetBarRowPicker(float contentWidth)
 
     // Everything else, unticked.
     for (const WidgetPeek& candidate : candidates) {
-        if (std::find(chosen.begin(), chosen.end(), candidate.key) != chosen.end()) continue;
+        if (std::find(picked.begin(), picked.end(), &candidate) != picked.end()) continue;
 
         ImGui::PushID(candidate.key.c_str());
         bool on = false;
-        std::string label = candidate.window.empty()
-            ? candidate.host : candidate.host + "  " + candidate.window;
-        if (ImGui::Checkbox(label.c_str(), &on)) {
+        if (ImGui::Checkbox(WidgetPeekLabel(candidate).c_str(), &on)) {
             chosen.push_back(candidate.key);
             changed = true;
         }
@@ -4602,13 +2897,7 @@ static void DrawWidgetBarRowPicker(float contentWidth)
     }
 
     if (changed) {
-        std::string joined;
-        for (const std::string& key : chosen) {
-            if (!joined.empty()) joined.push_back(',');
-            joined += key;
-        }
-        *R().widgetBarRows = joined;
-        if (R().saveAppSettings) R().saveAppSettings();
+        SetWidgetBarKeys(chosen);
     }
 }
 
@@ -4641,6 +2930,28 @@ static void DrawCleanViewSettings(float contentWidth, float contentHeight)
     EndCleanSettingsCard();
 }
 
+// The inside-window flag and the position take effect through
+// ApplySettingsToRuntime, which DrawSettingsTab runs every frame: it clamps
+// the index and hands the position to every notifier.
+static void DrawDisplaySettings()
+{
+    DrawSettingsMutedText("Display");
+    ImGui::Checkbox("Show remaining", &g_showRemaining);
+    ImGui::Checkbox("Show reset date details", &g_showResetDateDetails);
+    ImGui::Spacing();
+    DrawSettingsMutedText("Reset time mode");
+    DrawResetTimeModeSettings();
+    ImGui::Checkbox("Notifications inside window", &g_showNotificationsInsideWindow);
+}
+
+static void DrawNotificationPositionSettings()
+{
+    DrawSettingsMutedText("Notification position");
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::Combo("##notification_position", &g_notifyPositionIndex, g_notifyPositionNames, R().notifyPositionCount);
+    DrawSettingsMutedText(g_showNotificationsInsideWindow ? "Inside the app window" : "Outside the app window");
+}
+
 static void DrawCleanGeneralSettings(float contentWidth, float contentHeight)
 {
     float cardHeight = std::max(340.0f, contentHeight);
@@ -4657,35 +2968,14 @@ static void DrawCleanGeneralSettings(float contentWidth, float contentHeight)
         ImGui::TableNextRow();
 
         ImGui::TableSetColumnIndex(0);
-        DrawSettingsMutedText("Display");
-        ImGui::Checkbox("Show remaining", &g_showRemaining);
-        ImGui::Checkbox("Show reset date details", &g_showResetDateDetails);
-        ImGui::Spacing();
-        DrawSettingsMutedText("Reset time mode");
-        DrawResetTimeModeSettings();
-
-        if (ImGui::Checkbox("Notifications inside window", &g_showNotificationsInsideWindow)) {
-            NotifyGUI::SetInsideWindow(g_showNotificationsInsideWindow);
-        }
+        DrawDisplaySettings();
 
         ImGui::TableSetColumnIndex(1);
         DrawSettingsMutedText("Auto refresh");
         DrawAutoRefreshSettings();
 
         ImGui::TableSetColumnIndex(2);
-        DrawSettingsMutedText("Notification position");
-        ImGui::SetNextItemWidth(-1.0f);
-
-        if (ImGui::Combo("##notification_position", &g_notifyPositionIndex, g_notifyPositionNames, R().notifyPositionCount)) {
-            g_notifyPositionIndex = AppSettings::ClampNotificationPositionIndex(g_notifyPositionIndex);
-            g_notifyPosition = g_notifyPositions[g_notifyPositionIndex];
-            CodexNotifier::SetPosition(g_notifyPosition);
-            ClaudeNotifier::SetPosition(g_notifyPosition);
-            ZAiNotifier::SetPosition(g_notifyPosition);
-            GrokNotifier::SetPosition(g_notifyPosition);
-        }
-
-        DrawSettingsMutedText(g_showNotificationsInsideWindow ? "Inside the app window" : "Outside the app window");
+        DrawNotificationPositionSettings();
 
         ImGui::TableSetColumnIndex(3);
         DrawSettingsMutedText("Settings file");
@@ -4698,35 +2988,14 @@ static void DrawCleanGeneralSettings(float contentWidth, float contentHeight)
         ImGui::TableNextRow();
 
         ImGui::TableSetColumnIndex(0);
-        DrawSettingsMutedText("Display");
-        ImGui::Checkbox("Show remaining", &g_showRemaining);
-        ImGui::Checkbox("Show reset date details", &g_showResetDateDetails);
-        ImGui::Spacing();
-        DrawSettingsMutedText("Reset time mode");
-        DrawResetTimeModeSettings();
-
-        if (ImGui::Checkbox("Notifications inside window", &g_showNotificationsInsideWindow)) {
-            NotifyGUI::SetInsideWindow(g_showNotificationsInsideWindow);
-        }
+        DrawDisplaySettings();
 
         ImGui::Spacing();
         DrawSettingsMutedText("Auto refresh");
         DrawAutoRefreshSettings();
 
         ImGui::TableSetColumnIndex(1);
-        DrawSettingsMutedText("Notification position");
-        ImGui::SetNextItemWidth(-1.0f);
-
-        if (ImGui::Combo("##notification_position", &g_notifyPositionIndex, g_notifyPositionNames, R().notifyPositionCount)) {
-            g_notifyPositionIndex = AppSettings::ClampNotificationPositionIndex(g_notifyPositionIndex);
-            g_notifyPosition = g_notifyPositions[g_notifyPositionIndex];
-            CodexNotifier::SetPosition(g_notifyPosition);
-            ClaudeNotifier::SetPosition(g_notifyPosition);
-            ZAiNotifier::SetPosition(g_notifyPosition);
-            GrokNotifier::SetPosition(g_notifyPosition);
-        }
-
-        DrawSettingsMutedText(g_showNotificationsInsideWindow ? "Inside the app window" : "Outside the app window");
+        DrawNotificationPositionSettings();
 
         ImGui::Spacing();
         DrawSettingsSaveButtonInline();
@@ -4735,22 +3004,6 @@ static void DrawCleanGeneralSettings(float contentWidth, float contentHeight)
     }
 
     EndCleanSettingsCard();
-}
-
-static void DrawProviderSettingsCard(const char* id, const char* title, AppSettings::ProviderNotifications& settings, bool codex, float width, float height)
-{
-    ImGui::PushID(id);
-    BeginCleanSettingsCard(id, title, ImVec2(width, height));
-
-    DrawSettingsSubHeader("Notifications");
-    DrawCleanProviderNotifications(settings, codex);
-
-    ImGui::Spacing();
-    DrawSettingsSubHeader("Quota warnings");
-    DrawCleanQuotaWarnings(codex);
-
-    EndCleanSettingsCard();
-    ImGui::PopID();
 }
 
 static void SyncCodexCustomPathBuffer()
@@ -4831,6 +3084,36 @@ static void DrawProviderAutoRefreshSetting(
     );
 }
 
+// Auto refresh, notifications and quota warnings: the part of every provider
+// page that differs only in which settings it edits.
+static void DrawProviderAlertSettings(const char* name, bool& autoRefresh,
+    AppSettings::ProviderNotifications& notify, bool resetCredits,
+    std::initializer_list<QuotaRuleRow> rules)
+{
+    DrawSettingsSubHeader("Auto refresh");
+    DrawProviderAutoRefreshSetting(("Refresh " + std::string(name) + " automatically").c_str(), autoRefresh);
+
+    ImGui::Spacing();
+    DrawSettingsSubHeader("Notifications");
+    DrawCleanProviderNotifications(notify, resetCredits);
+
+    ImGui::Spacing();
+    DrawSettingsSubHeader("Quota warnings");
+    DrawCleanQuotaWarnings(rules);
+}
+
+// Z.Ai and Grok have no account picker, so their page is just that.
+static void DrawProviderSettingsCard(const char* name, bool& autoRefresh,
+    AppSettings::ProviderNotifications& notify, std::initializer_list<QuotaRuleRow> rules,
+    float width, float height)
+{
+    ImGui::PushID(name);
+    BeginCleanSettingsCard("##provider_settings_card", name, ImVec2(width, height));
+    DrawProviderAlertSettings(name, autoRefresh, notify, false, rules);
+    EndCleanSettingsCard();
+    ImGui::PopID();
+}
+
 static void DrawCodexSettingsCard(float width, float height)
 {
     ImGui::PushID("##codex_settings_card");
@@ -4897,16 +3180,10 @@ static void DrawCodexSettingsCard(float width, float height)
     DrawSettingsMutedText("The source selection is saved automatically.");
 
     ImGui::Spacing();
-    DrawSettingsSubHeader("Auto refresh");
-    DrawProviderAutoRefreshSetting("Refresh Codex automatically", g_codexAutoRefreshEnabled);
-
-    ImGui::Spacing();
-    DrawSettingsSubHeader("Notifications");
-    DrawCleanProviderNotifications(g_codexNotifySettings, true);
-
-    ImGui::Spacing();
-    DrawSettingsSubHeader("Quota warnings");
-    DrawCleanQuotaWarnings(true);
+    DrawProviderAlertSettings("Codex", g_codexAutoRefreshEnabled, g_codexNotifySettings, true, {
+        { "5-hour limit", g_codexQuotaWarnings.fiveHour },
+        { "Weekly - all models", g_codexQuotaWarnings.weekly }
+    });
 
     EndCleanSettingsCard();
     ImGui::PopID();
@@ -4986,62 +3263,19 @@ static void DrawClaudeSettingsCard(float width, float height)
         g_claudeThinkingShimmerSpeedPercent =
             AppSettings::ClampClaudeThinkingShimmerSpeedPercent(shimmerSpeed);
     }
-    if (ImGui::IsItemDeactivatedAfterEdit() && R().saveAppSettings) {
-        R().saveAppSettings();
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        SaveAppSettings();
     }
-    DrawSettingsMutedText("Controls the white sweep through THINKING. Default: 100%.");
+    DrawSettingsMutedText("How fast the live status text pulses. Default: 100%.");
 
     ImGui::Spacing();
-    DrawSettingsSubHeader("Auto refresh");
-    DrawProviderAutoRefreshSetting("Refresh Claude automatically", g_claudeAutoRefreshEnabled);
-
-    ImGui::Spacing();
-    DrawSettingsSubHeader("Notifications");
-    DrawCleanProviderNotifications(g_claudeNotifySettings, false);
-
-    ImGui::Spacing();
-    DrawSettingsSubHeader("Quota warnings");
-    DrawCleanQuotaWarnings(false);
-
-    EndCleanSettingsCard();
-    ImGui::PopID();
-}
-
-static void DrawZAiSettingsCard(float width, float height)
-{
-    ImGui::PushID("##zai_settings_card");
-    BeginCleanSettingsCard("##zai_settings_card", "Z.Ai", ImVec2(width, height));
-
-    DrawSettingsSubHeader("Auto refresh");
-    DrawProviderAutoRefreshSetting("Refresh Z.Ai automatically", g_zaiAutoRefreshEnabled);
-
-    ImGui::Spacing();
-    DrawSettingsSubHeader("Notifications");
-    DrawCleanZAiNotifications();
-
-    ImGui::Spacing();
-    DrawSettingsSubHeader("Quota warnings");
-    DrawCleanZAiQuotaWarnings();
-
-    EndCleanSettingsCard();
-    ImGui::PopID();
-}
-
-static void DrawGrokSettingsCard(float width, float height)
-{
-    ImGui::PushID("##grok_settings_card");
-    BeginCleanSettingsCard("##grok_settings_card", "Grok", ImVec2(width, height));
-
-    DrawSettingsSubHeader("Auto refresh");
-    DrawProviderAutoRefreshSetting("Refresh Grok automatically", g_grokAutoRefreshEnabled);
-
-    ImGui::Spacing();
-    DrawSettingsSubHeader("Notifications");
-    DrawCleanGrokNotifications();
-
-    ImGui::Spacing();
-    DrawSettingsSubHeader("Quota warnings");
-    DrawCleanGrokQuotaWarnings();
+    DrawProviderAlertSettings("Claude", g_claudeAutoRefreshEnabled, g_claudeNotifySettings, false, {
+        { "Current session", g_claudeQuotaWarnings.currentSession },
+        { "All models", g_claudeQuotaWarnings.allModels },
+        { "Sonnet", g_claudeQuotaWarnings.sonnet },
+        { "Fable", g_claudeQuotaWarnings.fable },
+        { "Usage credits", g_claudeQuotaWarnings.credits }
+    });
 
     EndCleanSettingsCard();
     ImGui::PopID();
@@ -5095,10 +3329,17 @@ static void DrawSelectedSettingsPage(float width, float height)
         DrawClaudeSettingsCard(width, height);
         break;
     case ActiveSettingsTab::Grok:
-        DrawGrokSettingsCard(width, height);
+        DrawProviderSettingsCard("Grok", g_grokAutoRefreshEnabled, g_grokNotifySettings, {
+            { "Weekly limit", g_grokQuotaWarnings.weekly }
+        }, width, height);
         break;
     case ActiveSettingsTab::ZAi:
-        DrawZAiSettingsCard(width, height);
+        // One rule for every Coding Plan window (GLM-5.3, GLM-5.3-Flash...);
+        // the stored setting keeps its old glm52 name.
+        DrawProviderSettingsCard("Z.Ai", g_zaiAutoRefreshEnabled, g_zaiNotifySettings, {
+            { "Coding Plan / GLM", g_zaiQuotaWarnings.glm52 },
+            { "GLM-5-Turbo", g_zaiQuotaWarnings.turbo }
+        }, width, height);
         break;
     }
 }
@@ -5135,19 +3376,27 @@ static void DrawSettingsTab()
     ImGui::PopStyleVar(3);
 }
 
-enum class ActiveMainTab
+// The host the widget shows: picked from its icon tabs, and what the bar
+// follows when nothing is pinned.
+enum class HostTab
 {
     Codex,
     Claude,
     ZAi,
-    Grok,
-    Settings
+    Grok
 };
 
-static ActiveMainTab g_activeTab = ActiveMainTab::Codex;
-// The widget keeps its own selection: it is a different surface, and losing
-// the host you were watching every time you touch the main window is wrong.
-static ActiveMainTab g_widgetTab = ActiveMainTab::Claude;
+static HostTab g_widgetTab = HostTab::Claude;
+
+static const char* HostName(HostTab tab)
+{
+    switch (tab) {
+    case HostTab::Codex: return "Codex";
+    case HostTab::Claude: return "Claude";
+    case HostTab::ZAi: return "Z.Ai";
+    default: return "Grok";
+    }
+}
 
 // Measured every widget frame; the app loop resizes the OS window to match so
 // the panel is exactly as tall as the cards that are actually turned on.
@@ -5160,29 +3409,6 @@ static float g_widgetPeekHeight = 0.0f;
 static float g_widgetContentWidth = 0.0f;
 static float g_widgetContentWidthAccum = 0.0f;
 
-// Cheap per-provider "primary usage" peeks for the tab-strip underline.
-static bool CodexPrimaryUsed(float& out) {
-    std::lock_guard<std::mutex> lock(g_codexMutex);
-    for (const auto& b : g_codexState.bars) if (b.valid) { out = b.usedPercent; return true; }
-    return false;
-}
-static bool ClaudePrimaryUsed(float& out) {
-    std::lock_guard<std::mutex> lock(g_claudeMutex);
-    if (g_claudeState.currentSession.valid) { out = g_claudeState.currentSession.usedPercent; return true; }
-    if (g_claudeState.weeklyAllModels.valid) { out = g_claudeState.weeklyAllModels.usedPercent; return true; }
-    return false;
-}
-static bool ZAiPrimaryUsed(float& out) {
-    std::lock_guard<std::mutex> lock(g_zaiMutex);
-    for (const auto& b : g_zaiState.bars) if (b.valid && !b.spendBalance) { out = b.usedPercent; return true; }
-    return false;
-}
-static bool GrokPrimaryUsed(float& out) {
-    std::lock_guard<std::mutex> lock(g_grokMutex);
-    if (g_grokState.weeklyLimit.valid) { out = g_grokState.weeklyLimit.usedPercent; return true; }
-    return false;
-}
-
 // ---- retracted peek strip -------------------------------------------------
 //
 // When the widget rolls up, the only thing left on screen is the bottom few
@@ -5191,159 +3417,295 @@ static bool GrokPrimaryUsed(float& out) {
 // that remaining band: the selected host's session quota and reset, readable
 // without pulling the panel back down.
 
+// A percentage row: a quota window, or anything else read as a fill level.
+static WidgetPeek BarPeek(const std::string& host, const std::string& window, bool valid,
+    float usedPercent, long long resetAtUnixSeconds, const std::string& resetText,
+    const std::string& plan)
+{
+    WidgetPeek peek;
+    peek.valid = valid;
+    peek.host = host;
+    peek.window = window;
+    peek.plan = plan;
+    peek.usedPercent = usedPercent;
+    peek.resetAtUnixSeconds = resetAtUnixSeconds;
+    peek.resetText = resetText;
+    return peek;
+}
 
 // The context meter as a pinnable row. It has a percentage and a bar like any
 // quota window, but nothing resets on a clock, so the right-hand slot carries
 // the token counts instead of a countdown.
-static void AddContextCandidate(std::vector<WidgetPeek>& out, const std::string& host,
-    const std::string& plan, const UsageTelemetry::ContextUsage& context,
-    const std::string& liveState = std::string{})
+static WidgetPeek ContextPeek(const std::string& host, const std::string& plan,
+    const UsageTelemetry::ContextUsage& context)
 {
-    if (!context.valid || context.contextWindowTokens <= 0) return;
-
-    WidgetPeek peek;
-    peek.valid = true;
-    peek.host = host;
-    peek.window = "Context";
-    peek.plan = plan;
+    WidgetPeek peek = BarPeek(host, "Context", context.valid && context.contextWindowTokens > 0,
+        Math::get_instance()->PercentUsed(
+            static_cast<double>(context.usedTokens),
+            static_cast<double>(context.contextWindowTokens)),
+        0, std::string{}, plan);
     peek.resets = false;
-    peek.usedPercent = Math::get_instance()->PercentUsed(
-        static_cast<double>(context.usedTokens),
-        static_cast<double>(context.contextWindowTokens));
+    peek.primary = false;
     peek.detail = FormatCompactTokenCount(context.usedTokens) + " / " +
         FormatCompactTokenCount(context.contextWindowTokens);
-    peek.key = host + ":Context";
-
-    for (const WidgetPeek& existing : out) {
-        if (existing.key == peek.key) return;
-    }
-    out.push_back(std::move(peek));
+    return peek;
 }
 
-// Every quota window across every host, as stable "<provider>:<window>" keys.
-// The collapsed bar picks from this, so the key has to survive a restart -
-// hence the window title rather than an index into a list that reorders.
-static std::vector<WidgetPeek> WidgetPeekCandidates()
+// Every row the bar can show across every host, as stable "<provider>:<window>"
+// keys: each quota window and every info card the panel draws. The key has to
+// survive a restart - hence the window title rather than an index into a list
+// that reorders.
+static std::vector<WidgetPeek> BuildWidgetPeekCandidates()
 {
     std::vector<WidgetPeek> out;
+    const long long now = static_cast<long long>(std::time(nullptr));
 
     LiveState liveState;
     std::string liveModel;
 
-    const auto add = [&out, &liveState, &liveModel](const std::string& host, const std::string& window,
-        bool valid, float used, long long resetAt, const std::string& resetText,
-        const std::string& plan, const std::string& detail = std::string{},
-        bool resets = true, const std::string& stableKey = std::string{},
-        const std::string& legacyKey = std::string{}) {
-        if (!valid || (host.empty() && window.empty())) return;
+    // Keys default to "<host>:<window>". Providers can report the same window
+    // twice (a server-driven limit plus its legacy named field); first wins.
+    const auto push = [&out, &liveState, &liveModel](WidgetPeek peek) {
+        if (!peek.valid || (peek.host.empty() && peek.window.empty())) return;
+        if (peek.key.empty()) peek.key = PinKey(peek.host, peek.window);
 
-        WidgetPeek peek;
-        peek.valid = true;
-        peek.host = host;
-        peek.window = window;
-        peek.plan = plan;
-        peek.detail = detail;
-        peek.resets = resets;
-        if (WindowTakesLiveState(window, liveModel)) peek.liveState = liveState;
-        peek.usedPercent = used;
-        peek.resetAtUnixSeconds = resetAt;
-        peek.resetText = resetText;
-        peek.key = stableKey.empty() ? host + ":" + window : stableKey;
-        peek.legacyKey = legacyKey;
+        // A renamed Z.Ai row carries its window in the host ("ZAi - Session").
+        if (peek.resets && WindowTakesLiveState(peek.window.empty() ? peek.host : peek.window, liveModel)) {
+            peek.liveState = liveState;
+        }
 
-        // Providers can report the same window twice (a server-driven limit
-        // plus its legacy named field); first one wins.
         for (const WidgetPeek& existing : out) {
             if (existing.key == peek.key) return;
         }
         out.push_back(std::move(peek));
     };
 
+    // Info cards, keyed like PanelInfoCard: the first line is the value and
+    // the second the right-hand detail.
+    const auto addInfo = [&push](const std::string& host, const std::string& title,
+        const std::vector<std::string>& lines, const std::string& plan) {
+        if (lines.empty() || lines.front().empty() || title.empty()) return;
+
+        WidgetPeek peek;
+        peek.valid = true;
+        peek.hasPercent = false;
+        peek.resets = false;
+        peek.primary = false;
+        peek.host = host;
+        peek.window = title;
+        peek.plan = plan;
+        peek.valueText = lines.front();
+        if (lines.size() > 1) peek.detail = lines[1];
+        push(std::move(peek));
+    };
+
+    // The cards every host can show.
+    const auto addCommonInfo = [&addInfo](const char* host, const std::string& plan,
+        const std::vector<std::string>& planLines,
+        const UsageTelemetry::RunUsage& run, const UsageTelemetry::ContextUsage& context) {
+        addInfo(host, "Plan", planLines, plan);
+        addInfo(host, "Activity", ActivityCardLines(run, context), plan);
+        addInfo(host, "Session info", run.sessionDetails, plan);
+        addInfo(host, "Timing", TimingCardLines(run), plan);
+        addInfo(host, "Context breakdown", BreakdownCardLines(context), plan);
+        addInfo(host, "Cache", CacheCardLines(context), plan);
+        addInfo(host, "Last compaction", CompactionCardLines(context), plan);
+        addInfo(host, "Model", ModelCardLines(context), plan);
+    };
+
     {
         std::lock_guard<std::mutex> lock(g_codexMutex);
-        const std::string plan = PlanBeside("Codex", g_codexState.plan);
-        liveState = LiveRunState(g_codexState.run, g_codexState.context);
-        liveModel = g_codexState.context.model;
-        for (const Codex::UsageBar& b : g_codexState.bars) {
-            add("Codex", !b.label.empty() ? b.label : b.sublabel,
-                b.valid, b.usedPercent, b.resetAtUnixSeconds, b.rightText, plan);
+        const Codex::Snapshot& s = g_codexState;
+        const std::string plan = PlanBeside("Codex", s.plan);
+        liveState = LiveRunState(s.run, s.context);
+        liveModel = s.context.model;
+
+        for (const Codex::UsageBar& b : s.bars) {
+            push(BarPeek("Codex", CodexBarName(b), b.valid, b.usedPercent,
+                b.resetAtUnixSeconds, std::string{}, plan));
         }
-        AddContextCandidate(out, "Codex", plan, g_codexState.context);
+        push(ContextPeek("Codex", plan, s.context));
+
+        if (s.extraUsage.valid && s.extraUsage.hasUsedPercent) {
+            WidgetPeek extra = BarPeek("Codex", CodexExtraUsageTitle(s), true, s.extraUsage.usedPercent,
+                s.extraUsage.resetAtUnixSeconds, s.extraUsage.resetText, plan);
+            extra.primary = false;
+            push(std::move(extra));
+        }
+        else if (s.extraUsage.valid) {
+            // The bar row shows "(warning only)" as its muted detail.
+            addInfo("Codex", CodexExtraUsageTitle(s), CodexExtraUsageCardLines(s), plan);
+        }
+        addInfo("Codex", "Accounts", CodexAccountsCardLines(s), plan);
+        addInfo("Codex", "Usage source", CodexUsageSourceCardLines(s), plan);
+        addInfo("Codex", "Credits", CodexCreditCardLines(s), plan);
+        addInfo("Codex", "Workspace credits", { s.workspaceCredits }, plan);
+        addInfo("Codex", "Auto top-up", CodexAutoTopUpCardLines(s.autoTopUp), plan);
+        addInfo("Codex", "Credit usage", CodexCreditUsageCardLines(s), plan);
+        addInfo("Codex", "Reset credits", CodexResetCreditCardLines(s), plan);
+        addInfo("Codex", "Reset history", CodexResetHistoryCardLines(s), plan);
+        addInfo("Codex", "Plan limit history", CodexPlanLimitHistoryCardLines(s), plan);
+        addInfo("Codex", "Usage by surface", CodexSurfaceShareCardLines(s), plan);
+        addInfo("Codex", "Daily usage", CodexDailyUsageCardLines(s), plan);
+        addInfo("Codex", "Profile", CodexProfileCardLines(s.profile), plan);
+        addCommonInfo("Codex", plan, CodexPlanCardLines(s), s.run, s.context);
     }
     {
         std::lock_guard<std::mutex> lock(g_claudeMutex);
-        const Claude::UsageWindow* windows[] = {
-            &g_claudeState.currentSession, &g_claudeState.weeklyAllModels,
-            &g_claudeState.weeklySonnet, &g_claudeState.weeklyFable
-        };
-        const std::string plan = PlanBeside("Claude", g_claudeState.plan);
-        liveState = LiveRunState(g_claudeState.run, g_claudeState.context);
-        liveModel = g_claudeState.context.model;
-        for (const Claude::UsageWindow* w : windows) {
-            add("Claude", w->title, w->valid, w->usedPercent,
-                w->resetAtUnixSeconds, w->resetText, plan);
+        const Claude::Snapshot& s = g_claudeState;
+        const std::string plan = PlanBeside("Claude", s.plan);
+        liveState = LiveRunState(s.run, s.context);
+        liveModel = s.context.model;
+
+        // An invalid window adds no row: Ultra's null session window included.
+        for (const Claude::UsageWindow* w : { &s.currentSession, &s.weeklyAllModels, &s.weeklySonnet, &s.weeklyFable }) {
+            push(BarPeek("Claude", w->title, w->valid, w->usedPercent,
+                w->resetAtUnixSeconds, w->resetText, plan));
         }
-        for (const Claude::UsageWindow& w : g_claudeState.additionalLimits) {
-            add("Claude", w.title, w.valid, w.usedPercent,
-                w.resetAtUnixSeconds, w.resetText, plan);
+        for (const Claude::UsageWindow& w : s.additionalLimits) {
+            push(BarPeek("Claude", w.title, w.valid, w.usedPercent,
+                w.resetAtUnixSeconds, w.resetText, plan));
         }
-        AddContextCandidate(out, "Claude", plan, g_claudeState.context);
+        addInfo("Claude", "Pace", { Claude::PaceText(ClaudeWeeklyPace(s, now), now) }, plan);
+        addInfo("Claude", "This week by surface", ClaudeBreakdownCardLines(s), plan);
+        addInfo("Claude", "Limit resets", ClaudeLimitResetCardLines(s.limitResets, now), plan);
+
+        for (const Claude::PromoCredit& credit : s.promoCredits) {
+            WidgetPeek peek = BarPeek("Claude", credit.title, true, credit.usedPercent, 0, std::string{}, plan);
+            peek.key = PromoCreditKey(credit);
+            peek.detail = PromoCreditLeft(credit);
+            peek.resets = false;
+            peek.primary = false;
+            push(std::move(peek));
+        }
+        push(ContextPeek("Claude", plan, s.context));
+
+        if (s.credits.valid && s.credits.hasUsedPercent) {
+            WidgetPeek credits = BarPeek("Claude", ClaudeCreditsTitle(s), true, s.credits.usedPercent,
+                s.credits.resetAtUnixSeconds, s.credits.resetText, plan);
+            credits.primary = false;
+            push(std::move(credits));
+        }
+        else if (s.credits.valid) {
+            // The bar row shows the disabled reason as its muted detail.
+            addInfo("Claude", ClaudeCreditsTitle(s), ClaudeCreditsCardLines(s), plan);
+        }
+        addInfo("Claude", "Cost", ClaudeCostCardLines(s.run), plan);
+        addInfo("Claude", "Auto-resume", ClaudeAutoResumeCardLines(s.autoResume), plan);
+        addInfo("Claude", ClaudeLedgerTitle(s.ledger), ClaudeLedgerCardLines(s.ledger), plan);
+        addCommonInfo("Claude", plan, ClaudePlanCardLines(s), s.run, s.context);
     }
     {
         std::lock_guard<std::mutex> lock(g_zaiMutex);
-        const std::string plan = PlanBeside("Z.Ai", g_zaiState.plan);
-        liveState = LiveRunState(g_zaiState.run, g_zaiState.context);
-        liveModel = g_zaiState.context.model;
-        for (const ZAi::UsageBar& b : g_zaiState.bars) {
-            if (b.spendBalance) continue;
+        const ZAi::Snapshot& s = g_zaiState;
+        const std::string plan = PlanBeside("Z.Ai", s.plan);
+        liveState = LiveRunState(s.run, s.context);
+        liveModel = s.context.model;
+
+        for (const ZAi::UsageBar& b : s.bars) {
             const std::string rawLabel = !b.label.empty() ? b.label : b.sublabel;
-            const std::string stableKey = ZAiWidgetKey(b, rawLabel);
             const std::string displayLabel = ZAiWidgetDisplayLabel(b);
             const bool renamed = displayLabel == "ZAi - Session" || displayLabel == "ZAi - Weekly";
-            add(renamed ? displayLabel : "Z.Ai",
-                renamed ? std::string{} : rawLabel,
+
+            WidgetPeek peek = BarPeek(renamed ? displayLabel : "Z.Ai", renamed ? std::string{} : rawLabel,
                 b.valid, b.usedPercent, b.resetAtUnixSeconds, b.resetText,
-                renamed ? std::string{} : plan, std::string{}, true,
-                stableKey, "Z.Ai:" + rawLabel);
+                renamed ? std::string{} : plan);
+            peek.key = ZAiWidgetKey(b, rawLabel);
+            peek.legacyKey = "Z.Ai:" + rawLabel;
+            // A spend balance is money, not the plan's quota window.
+            peek.primary = !b.spendBalance;
+            push(std::move(peek));
         }
-        if (g_zaiState.mcp.valid && g_zaiState.mcp.limit > 0) {
-            const float used = Math::get_instance()->PercentUsed(
-                static_cast<double>(g_zaiState.mcp.used),
-                static_cast<double>(g_zaiState.mcp.limit));
-            add("MCP Usage", std::string{}, true, used,
-                g_zaiState.mcp.nextRefreshAtUnixSeconds, std::string{},
-                std::string{}, std::string{}, true, "Z.Ai:MCP");
+        if (s.mcp.valid && s.mcp.limit > 0) {
+            WidgetPeek mcp = BarPeek("MCP Usage", std::string{}, true,
+                Math::get_instance()->PercentUsed(
+                    static_cast<double>(s.mcp.used), static_cast<double>(s.mcp.limit)),
+                s.mcp.nextRefreshAtUnixSeconds, std::string{}, std::string{});
+            mcp.key = PinKey("Z.Ai", "MCP");
+            push(std::move(mcp));
         }
-        AddContextCandidate(out, "Z.Ai", plan, g_zaiState.context);
+        push(ContextPeek("Z.Ai", plan, s.context));
+
+        for (const ZAi::DetailRow& detail : s.details) {
+            addInfo("Z.Ai", detail.leftLabel.empty() ? "Details" : detail.leftLabel,
+                ZAiDetailCardLines(detail), plan);
+        }
+        addInfo("Z.Ai", "Quota resets", ZAiResetCardLines(s), plan);
+        addInfo("Z.Ai", "Usage history", ZAiHistoryCardLines(s.history), plan);
+        addCommonInfo("Z.Ai", plan, PlanCardLines("Z.Ai", s.plan, s.statusText), s.run, s.context);
     }
     {
         std::lock_guard<std::mutex> lock(g_grokMutex);
-        const std::string plan = PlanBeside("Grok", g_grokState.plan);
-        liveState = LiveRunState(UsageTelemetry::RunUsage{}, g_grokState.context);
-        liveModel = g_grokState.context.model;
-        add("Grok", g_grokState.weeklyLimit.title, g_grokState.weeklyLimit.valid,
-            g_grokState.weeklyLimit.usedPercent,
-            g_grokState.weeklyLimit.resetAtUnixSeconds, g_grokState.weeklyLimit.resetText, plan);
-        for (const Grok::ProductUsage& p : g_grokState.products) {
-            add("Grok", p.product, true, p.usagePercent, 0, std::string{}, plan);
+        const Grok::Snapshot& s = g_grokState;
+        const std::string plan = PlanBeside("Grok", s.plan);
+        liveState = LiveRunState(UsageTelemetry::RunUsage{}, s.context);
+        liveModel = s.context.model;
+
+        push(BarPeek("Grok", s.weeklyLimit.title, s.weeklyLimit.valid, s.weeklyLimit.usedPercent,
+            s.weeklyLimit.resetAtUnixSeconds, s.weeklyLimit.resetText, plan));
+        for (const Grok::ProductUsage& p : s.products) {
+            push(BarPeek("Grok", p.product, true, p.usagePercent, 0, std::string{}, plan));
         }
-        AddContextCandidate(out, "Grok", plan, g_grokState.context);
+        push(ContextPeek("Grok", plan, s.context));
+
+        addInfo("Grok", "Credits", GrokCreditCardLines(s), plan);
+        addCommonInfo("Grok", plan, PlanCardLines("Grok", s.plan, s.statusText), UsageTelemetry::RunUsage{}, s.context);
     }
 
     return out;
+}
+
+// Built once per frame of the current ImGui context: the bar, its height, the
+// host tabs and the Settings picker all ask, and every build locks all four
+// provider mutexes. The widget and Settings windows are separate contexts
+// with their own frame counters.
+static const std::vector<WidgetPeek>& WidgetPeekCandidates()
+{
+    static ImGuiContext* cachedContext = nullptr;
+    static int cachedFrame = -1;
+    static std::vector<WidgetPeek> cached;
+
+    if (cachedContext != ImGui::GetCurrentContext() || cachedFrame != ImGui::GetFrameCount()) {
+        cachedContext = ImGui::GetCurrentContext();
+        cachedFrame = ImGui::GetFrameCount();
+        cached = BuildWidgetPeekCandidates();
+    }
+
+    return cached;
 }
 
 // Punctuation- and case-insensitive form of a pin key, used only as a fallback
 // when an exact match fails.
 static std::string CompactKey(const std::string& key)
 {
-    std::string out;
-    out.reserve(key.size());
+    const size_t colon = key.find(':');
+    if (colon == std::string::npos) return CompactName(key);
+    return CompactName(key.substr(0, colon)) + CompactName(key.substr(colon + 1));
+}
 
-    for (unsigned char c : key) {
-        if (std::isalnum(c)) out.push_back(static_cast<char>(std::tolower(c)));
+// The candidate a stored pin key stands for: an exact key or legacy alias,
+// else one that differs only in punctuation and case. Keys embed the window's
+// display name, so relabelling a window would otherwise orphan every pin that
+// referenced it - fixing "GPT 5 3" to "GPT 5.3" silently broke saved rows.
+// The bar, the Settings picker and the drop handler all resolve through here,
+// so they cannot disagree about which row a key means.
+static const WidgetPeek* ResolveKey(const std::vector<WidgetPeek>& candidates, const std::string& key)
+{
+    for (const WidgetPeek& candidate : candidates) {
+        if (candidate.key == key || (!candidate.legacyKey.empty() && candidate.legacyKey == key)) {
+            return &candidate;
+        }
     }
-    return out;
+
+    const std::string wanted = CompactKey(key);
+    for (const WidgetPeek& candidate : candidates) {
+        if (CompactKey(candidate.key) == wanted ||
+            (!candidate.legacyKey.empty() && CompactKey(candidate.legacyKey) == wanted)) {
+            return &candidate;
+        }
+    }
+
+    return nullptr;
 }
 
 // The stored pick list, unresolved. Kept separate from WidgetPeekRows because
@@ -5378,31 +3740,40 @@ static void SetWidgetBarKeys(const std::vector<std::string>& keys)
     }
 
     *R().widgetBarRows = joined;
-    if (R().saveAppSettings) R().saveAppSettings();
+    SaveAppSettings();
+}
+
+// The row that stands for a host: its first quota window, in the order the
+// panel lists them. A context meter or a balance never does.
+static const WidgetPeek* PrimaryCandidate(const std::vector<WidgetPeek>& candidates, HostTab tab)
+{
+    // Every key of the host starts "<host>:", the renamed Z.Ai rows included.
+    const std::string prefix = std::string(HostName(tab)) + ":";
+
+    for (const WidgetPeek& candidate : candidates) {
+        if (candidate.primary && candidate.key.rfind(prefix, 0) == 0) return &candidate;
+    }
+    return nullptr;
+}
+
+// Nothing pinned: the bar follows the widget's open host tab, reading "No
+// data" until that host reports a window.
+static WidgetPeek WidgetPeekSummary()
+{
+    if (const WidgetPeek* primary = PrimaryCandidate(WidgetPeekCandidates(), g_widgetTab)) {
+        return *primary;
+    }
+
+    WidgetPeek peek;
+    peek.host = HostName(g_widgetTab);
+    return peek;
 }
 
 // The rows the collapsed bar should show: the user's picks in their order,
 // falling back to the selected host's primary window when nothing is picked.
 //
 // Cached for the frame: the height helpers ask for this several times per
-// frame and each uncached answer locks all four provider mutexes and rebuilds
-// the candidate list.
-static std::vector<WidgetPeek> WidgetPeekRowsUncached();
-
-static const std::vector<WidgetPeek>& WidgetPeekRows()
-{
-    static int cachedFrame = -1;
-    static std::vector<WidgetPeek> cached;
-
-    const int frame = ImGui::GetFrameCount();
-    if (frame != cachedFrame) {
-        cachedFrame = frame;
-        cached = WidgetPeekRowsUncached();
-    }
-
-    return cached;
-}
-
+// frame.
 static std::vector<WidgetPeek> WidgetPeekRowsUncached()
 {
     std::vector<WidgetPeek> rows;
@@ -5410,34 +3781,10 @@ static std::vector<WidgetPeek> WidgetPeekRowsUncached()
     const std::vector<std::string> storedKeys = WidgetBarKeys();
 
     if (!storedKeys.empty()) {
-        const std::vector<WidgetPeek> all = WidgetPeekCandidates();
+        const std::vector<WidgetPeek>& all = WidgetPeekCandidates();
 
-        for (const std::string& storedKey : storedKeys) {
-            const std::string& key = storedKey;
-
-            const WidgetPeek* found = nullptr;
-            for (const WidgetPeek& candidate : all) {
-                if (WidgetPeekKeyMatches(candidate, key)) { found = &candidate; break; }
-            }
-
-            // Keys embed the window's display name, so relabelling a window
-            // orphans every pin that referenced it - fixing "GPT 5 3" to
-            // "GPT 5.3" silently broke the saved rows. Fall back to a match
-            // that ignores punctuation and case so a cosmetic rename keeps
-            // resolving.
-            if (!found) {
-                const std::string wanted = CompactKey(key);
-                for (const WidgetPeek& candidate : all) {
-                    if (WidgetPeekKeyMatches(candidate, key) ||
-                        CompactKey(candidate.key) == wanted ||
-                        (!candidate.legacyKey.empty() && CompactKey(candidate.legacyKey) == wanted)) {
-                        found = &candidate;
-                        break;
-                    }
-                }
-            }
-
-            if (found) {
+        for (const std::string& key : storedKeys) {
+            if (const WidgetPeek* found = ResolveKey(all, key)) {
                 rows.push_back(*found);
                 continue;
             }
@@ -5468,91 +3815,18 @@ static std::vector<WidgetPeek> WidgetPeekRowsUncached()
     return rows;
 }
 
-static WidgetPeek WidgetPeekSummary()
+static const std::vector<WidgetPeek>& WidgetPeekRows()
 {
-    WidgetPeek peek;
+    static int cachedFrame = -1;
+    static std::vector<WidgetPeek> cached;
 
-    switch (g_widgetTab) {
-    case ActiveMainTab::Codex: {
-        std::lock_guard<std::mutex> lock(g_codexMutex);
-        peek.host = "Codex";
-        peek.plan = PlanBeside("Codex", g_codexState.plan);
-        for (const Codex::UsageBar& b : g_codexState.bars) {
-            if (!b.valid) continue;
-            peek.valid = true;
-            peek.window = !b.label.empty() ? b.label : b.sublabel;
-            peek.usedPercent = b.usedPercent;
-            peek.resetAtUnixSeconds = b.resetAtUnixSeconds;
-            peek.resetText = b.rightText;
-            break;
-        }
-        break;
-    }
-    case ActiveMainTab::Claude: {
-        std::lock_guard<std::mutex> lock(g_claudeMutex);
-        peek.host = "Claude";
-        peek.plan = PlanBeside("Claude", g_claudeState.plan);
-        const Claude::UsageWindow* w = g_claudeState.currentSession.valid
-            ? &g_claudeState.currentSession
-            : (g_claudeState.weeklyAllModels.valid ? &g_claudeState.weeklyAllModels : nullptr);
-        if (w) {
-            peek.valid = true;
-            peek.window = w->title;
-            peek.usedPercent = w->usedPercent;
-            peek.resetAtUnixSeconds = w->resetAtUnixSeconds;
-            peek.resetText = w->resetText;
-        }
-        break;
-    }
-    case ActiveMainTab::ZAi: {
-        std::lock_guard<std::mutex> lock(g_zaiMutex);
-        peek.host = "Z.Ai";
-        peek.plan = PlanBeside("Z.Ai", g_zaiState.plan);
-        for (const ZAi::UsageBar& b : g_zaiState.bars) {
-            if (!b.valid || b.spendBalance) continue;
-            peek.valid = true;
-            const std::string displayLabel = ZAiWidgetDisplayLabel(b);
-            if (displayLabel == "ZAi - Session" || displayLabel == "ZAi - Weekly") {
-                peek.host = displayLabel;
-                peek.window.clear();
-                peek.plan.clear();
-            }
-            else {
-                peek.window = !b.label.empty() ? b.label : b.sublabel;
-            }
-            peek.usedPercent = b.usedPercent;
-            peek.resetAtUnixSeconds = b.resetAtUnixSeconds;
-            peek.resetText = b.resetText;
-            break;
-        }
-        if (!peek.valid && g_zaiState.mcp.valid && g_zaiState.mcp.limit > 0) {
-            peek.valid = true;
-            peek.host = "MCP Usage";
-            peek.window.clear();
-            peek.plan.clear();
-            peek.usedPercent = Math::get_instance()->PercentUsed(
-                static_cast<double>(g_zaiState.mcp.used),
-                static_cast<double>(g_zaiState.mcp.limit));
-            peek.resetAtUnixSeconds = g_zaiState.mcp.nextRefreshAtUnixSeconds;
-        }
-        break;
-    }
-    default: {
-        std::lock_guard<std::mutex> lock(g_grokMutex);
-        peek.host = "Grok";
-        peek.plan = PlanBeside("Grok", g_grokState.plan);
-        if (g_grokState.weeklyLimit.valid) {
-            peek.valid = true;
-            peek.window = g_grokState.weeklyLimit.title;
-            peek.usedPercent = g_grokState.weeklyLimit.usedPercent;
-            peek.resetAtUnixSeconds = g_grokState.weeklyLimit.resetAtUnixSeconds;
-            peek.resetText = g_grokState.weeklyLimit.resetText;
-        }
-        break;
-    }
+    const int frame = ImGui::GetFrameCount();
+    if (frame != cachedFrame) {
+        cachedFrame = frame;
+        cached = WidgetPeekRowsUncached();
     }
 
-    return peek;
+    return cached;
 }
 
 // Height of the strip for the current font. The app reads this to decide how
@@ -5567,19 +3841,27 @@ static float WidgetPeekRowHeight()
         + WidgetPeekBarHeight() + WidgetPeekStripPad();
 }
 
-// The bar is as tall as the rows the user picked. One row is the default.
-static int WidgetPeekRowCount()
-{
-    const std::string spec = R().widgetBarRows ? *R().widgetBarRows : std::string{};
-    if (spec.empty()) return 1;
-
-    const int rows = static_cast<int>(WidgetPeekRows().size());
-    return rows > 0 ? rows : 1;
-}
-
+// The bar is as tall as its rows: the picks, or the one followed window.
 static float WidgetPeekStripHeight()
 {
-    return WidgetPeekRowHeight() * static_cast<float>(WidgetPeekRowCount());
+    return WidgetPeekRowHeight() * static_cast<float>(WidgetPeekRows().size());
+}
+
+// `text` cut to `maxWidth` on a whole UTF-8 code point and ended with an
+// ellipsis; unchanged when it fits, empty when not even the ellipsis does.
+static std::string Ellipsize(std::string text, float maxWidth)
+{
+    if (ImGui::CalcTextSize(text.c_str()).x <= maxWidth) return text;
+
+    const std::string ellipsis = "\xe2\x80\xa6";
+    while (!text.empty() && ImGui::CalcTextSize((text + ellipsis).c_str()).x > maxWidth) {
+        // The continuation bytes first, then the lead byte they belong to.
+        while (!text.empty() && (static_cast<unsigned char>(text.back()) & 0xC0) == 0x80) {
+            text.pop_back();
+        }
+        if (!text.empty()) text.pop_back();
+    }
+    return text.empty() ? text : text + ellipsis;
 }
 
 static void DrawWidgetPeekRow(const WidgetPeek& peek, float width)
@@ -5593,19 +3875,19 @@ static void DrawWidgetPeekRow(const WidgetPeek& peek, float width)
 
     const float x = c0.x + 13.0f;
     const float innerW = width - 26.0f;
+    const float labelX = x + 13.0f;
     float y = c0.y + pad;
 
-    const ImU32 severity = peek.valid ? PanelSeverity(peek.usedPercent) : Color(70, 76, 92);
+    const ImU32 severity = peek.valid && peek.hasPercent ? PanelSeverity(peek.usedPercent)
+        : (peek.valid ? Color(110, 150, 220) : Color(70, 76, 92));
 
     // Row: severity dot, host + window, then the reset, then the headline
     // number hard against the right edge.
     dl->AddCircleFilled(ImVec2(x + 3.5f, y + lineH * 0.5f), 3.5f, severity);
 
-    const std::string value = peek.valid
-        ? Format::get_instance()->Percent(
-              g_showRemaining ? 100.0f - peek.usedPercent : peek.usedPercent) +
-          (g_showRemaining ? " left" : " used")
-        : "No data";
+    const std::string value = !peek.valid ? "No data"
+        : !peek.valueText.empty() ? peek.valueText
+        : UsageText(peek.usedPercent);
 
     // Reset without the date suffix: 360px is not enough for both, and the
     // relative time is the part worth reading at a glance.
@@ -5619,77 +3901,63 @@ static void DrawWidgetPeekRow(const WidgetPeek& peek, float width)
         right = peek.usedPercent <= 0.0f ? "Not started yet" : "Reset not reported";
     }
 
-    const float valueW = ImGui::CalcTextSize(value.c_str()).x;
     const bool showLive = !peek.liveState.empty();
-    const float rightW = showLive
+    float rightW = showLive
         ? MeasureLiveState(peek.liveState)
         : (right.empty() ? 0.0f : ImGui::CalcTextSize(right.c_str()).x);
 
-    const float valueX = x + innerW - valueW;
-    dl->AddText(ImVec2(valueX, y), Color(228, 234, 246), value.c_str());
+    // "Codex (Pro 20x)  ·  Weekly", degrading by what matters least first.
+    const std::string sep = "  ·  ";
+    const std::string planned = peek.plan.empty()
+        ? peek.host : peek.host + " (" + peek.plan + ")";
+
+    // What this row would need to show everything untrimmed. Accumulated across
+    // rows so the window can widen to the longest one.
+    {
+        const std::string widest = peek.window.empty()
+            ? planned : planned + sep + peek.window;
+
+        const float needed = 13.0f + 13.0f + ImGui::CalcTextSize(widest.c_str()).x
+            + 10.0f + rightW + 12.0f + ImGui::CalcTextSize(value.c_str()).x + 13.0f;
+
+        g_widgetContentWidthAccum = (std::max)(g_widgetContentWidthAccum, needed);
+    }
+
+    // When the window cannot widen that far: the value is the headline and
+    // clips only when it alone overflows the row (a long info line). The
+    // reset comes next. The label yields first: a percentage without a reset
+    // time is half an answer, whereas the window name is recoverable from the
+    // panel.
+    const std::string shownValue = Ellipsize(value, x + innerW - labelX);
+    const float valueX = x + innerW - ImGui::CalcTextSize(shownValue.c_str()).x;
+    dl->AddText(ImVec2(valueX, y), Color(228, 234, 246), shownValue.c_str());
 
     if (showLive) {
         DrawLiveState(ImVec2(valueX - 12.0f - rightW, y), peek.liveState);
     }
     else if (!right.empty()) {
+        right = Ellipsize(right, valueX - 12.0f - labelX);
+        rightW = right.empty() ? 0.0f : ImGui::CalcTextSize(right.c_str()).x;
         dl->AddText(ImVec2(valueX - 12.0f - rightW, y), Color(132, 140, 160), right.c_str());
     }
 
-    // The label yields, not the reset: a percentage without a reset time is
-    // half an answer, whereas the window name is recoverable from the panel.
-    const float labelX = x + 13.0f;
     const float labelRoom = (valueX - 12.0f - rightW) - labelX - 10.0f;
-
-    // "Codex (Pro 20x)  ·  Weekly", degrading by what matters least first.
-    //
-    // The window name is what tells two rows of the same host apart, so it is
-    // the LAST thing to go - dropping it first left two Codex rows both
-    // reading just "Codex". Order of sacrifice: plan, then host, then finally
-    // truncate the window name itself.
     const auto fits = [labelRoom](const std::string& text) {
         return ImGui::CalcTextSize(text.c_str()).x <= labelRoom;
     };
 
-    // What this row would need to show everything untrimmed. Accumulated across
-    // rows so the window can widen to the longest one.
-    {
-        const std::string sep = "  ·  ";
-        const std::string planned = peek.plan.empty()
-            ? peek.host : peek.host + " (" + peek.plan + ")";
-        const std::string widest = peek.window.empty()
-            ? planned : planned + sep + peek.window;
-
-        const float needed = 13.0f + 13.0f + ImGui::CalcTextSize(widest.c_str()).x
-            + 10.0f + rightW + 12.0f + valueW + 13.0f;
-
-        g_widgetContentWidthAccum = (std::max)(g_widgetContentWidthAccum, needed);
-    }
-
+    // The window name is what tells two rows of the same host apart, so it is
+    // the LAST thing to go - dropping it first left two Codex rows both
+    // reading just "Codex". Order of sacrifice: plan, then host, then finally
+    // truncate the window name itself.
     std::string label;
-    if (peek.window.empty()) {
-        label = peek.plan.empty() ? peek.host : peek.host + " (" + peek.plan + ")";
-    }
-    else {
-        const std::string sep = "  ·  ";
-        const std::string planned = peek.plan.empty()
-            ? peek.host : peek.host + " (" + peek.plan + ")";
+    if (peek.window.empty()) label = planned;
+    else if (fits(planned + sep + peek.window)) label = planned + sep + peek.window;
+    else if (fits(peek.host + sep + peek.window)) label = peek.host + sep + peek.window;
+    else label = peek.window;
 
-        if (fits(planned + sep + peek.window)) label = planned + sep + peek.window;
-        else if (fits(peek.host + sep + peek.window)) label = peek.host + sep + peek.window;
-        else label = peek.window;
-    }
-
-    if (!fits(label)) {
-        // Still too wide: clip with an ellipsis rather than print nothing.
-        const std::string ellipsis = "\xe2\x80\xa6";
-        while (!label.empty() && !fits(label + ellipsis)) {
-            // Step back over a whole UTF-8 code point, not a single byte.
-            do { label.pop_back(); }
-            while (!label.empty() &&
-                (static_cast<unsigned char>(label.back()) & 0xC0) == 0x80);
-        }
-        if (!label.empty()) label += ellipsis;
-    }
+    // Still too wide: clip with an ellipsis rather than print nothing.
+    label = Ellipsize(label, labelRoom);
 
     if (!label.empty()) {
         dl->AddText(ImVec2(labelX, y), Color(158, 166, 186), label.c_str());
@@ -5698,12 +3966,14 @@ static void DrawWidgetPeekRow(const WidgetPeek& peek, float width)
     y += lineH + 5.0f;
 
     // The same bar the cards use, so the strip is a real reading and not a
-    // second visual language for the same number.
-    ImGui::SetCursorScreenPos(ImVec2(x, y));
-    const float shown = peek.valid
-        ? (g_showRemaining ? 100.0f - peek.usedPercent : peek.usedPercent)
-        : 0.0f;
-    DrawThinBar(shown, innerW, severity, barH, Color(48, 52, 63));
+    // second visual language for the same number. Info rows have no number.
+    if (peek.hasPercent) {
+        ImGui::SetCursorScreenPos(ImVec2(x, y));
+        const float shown = peek.valid
+            ? (g_showRemaining ? 100.0f - peek.usedPercent : peek.usedPercent)
+            : 0.0f;
+        DrawThinBar(shown, innerW, severity, barH, Color(48, 52, 63));
+    }
 
     ImGui::SetCursorScreenPos(ImVec2(c0.x, c0.y + height));
     ImGui::Dummy(ImVec2(width, 0.0f));
@@ -5728,13 +3998,16 @@ static void DrawWidgetPeekStrip(float width, bool onTop)
     std::vector<std::string> keys = WidgetBarKeys();
 
     // Applied after the loop: mutating the list mid-iteration invalidates the
-    // indices the drop handlers were computed from.
+    // indices the drop handlers were computed from. Drop positions are slots
+    // between rows: the upper half of a row drops before it, the lower half
+    // after, so the last row's lower half appends.
     bool keysChanged = false;
     int dropAt = -1;
     std::string dropKey;
     int removeAt = -1;
     int moveFrom = -1;
     int moveTo = -1;
+    float dropLineY = -1.0f;
 
     const float rowH = WidgetPeekRowHeight();
 
@@ -5764,21 +4037,24 @@ static void DrawWidgetPeekStrip(float width, bool onTop)
             ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
             const int from = static_cast<int>(i);
             ImGui::SetDragDropPayload("AQC_BAR_MOVE", &from, sizeof(from));
-            ImGui::TextUnformatted(keys[i].c_str());
+            ImGui::TextUnformatted(WidgetPeekLabel(rows[i]).c_str());
             ImGui::EndDragDropSource();
         }
 
         if (ImGui::BeginDragDropTarget()) {
+            const bool after = ImGui::GetMousePos().y >= rowTop.y + rowH * 0.5f;
+            const int slot = static_cast<int>(i) + (after ? 1 : 0);
+
             if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("AQC_BAR_KEY")) {
                 dropKey.assign(static_cast<const char*>(p->Data));
-                dropAt = static_cast<int>(i);
+                dropAt = slot;
             }
             if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("AQC_BAR_MOVE")) {
                 moveFrom = *static_cast<const int*>(p->Data);
-                moveTo = static_cast<int>(i);
+                moveTo = slot;
             }
-            dl->AddLine(rowTop, ImVec2(rowTop.x + width, rowTop.y),
-                Color(96, 156, 240), 2.0f);
+            // Drawn after the loop, or the next row's divider would cover it.
+            dropLineY = after ? rowTop.y + rowH : rowTop.y;
             ImGui::EndDragDropTarget();
         }
         else if (hovered && !keys.empty()) {
@@ -5793,51 +4069,40 @@ static void DrawWidgetPeekStrip(float width, bool onTop)
         DrawWidgetPeekRow(rows[i], width);
     }
 
-    // Below the last row: dropping here appends rather than inserting.
-    {
-        const float tailTop = c0.y + rowH * static_cast<float>(rows.size());
-        const float tailH = (c0.y + height) - tailTop;
-
-        if (tailH > 1.0f) {
-            ImGui::SetCursorScreenPos(ImVec2(c0.x, tailTop));
-            ImGui::InvisibleButton("##bar_tail", ImVec2(width, tailH));
-
-            if (ImGui::BeginDragDropTarget()) {
-                if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("AQC_BAR_KEY")) {
-                    dropKey.assign(static_cast<const char*>(p->Data));
-                    dropAt = static_cast<int>(keys.size());
-                }
-                ImGui::EndDragDropTarget();
-            }
-        }
+    if (dropLineY >= 0.0f) {
+        dl->AddLine(ImVec2(c0.x, dropLineY), ImVec2(c0.x + width, dropLineY),
+            Color(96, 156, 240), 2.0f);
     }
 
     if (!dropKey.empty()) {
         // Dropping onto the implicit "follow the open tab" bar makes the list
-        // explicit, starting with what was just dropped.
-        const std::vector<WidgetPeek> candidates = WidgetPeekCandidates();
-        const WidgetPeek* dropped = nullptr;
-        for (const WidgetPeek& candidate : candidates) {
-            if (WidgetPeekKeyMatches(candidate, dropKey)) {
-                dropped = &candidate;
-                break;
+        // explicit, starting with what was just dropped. A pin that already
+        // stands for the same row gives way to it, and every one removed from
+        // above the slot moves the slot up with it.
+        const std::vector<WidgetPeek>& candidates = WidgetPeekCandidates();
+        const WidgetPeek* dropped = ResolveKey(candidates, dropKey);
+
+        size_t at = std::min(static_cast<size_t>(std::max(0, dropAt)), keys.size());
+        for (size_t k = keys.size(); k-- > 0;) {
+            if (keys[k] == dropKey || (dropped && ResolveKey(candidates, keys[k]) == dropped)) {
+                if (k < at) --at;
+                keys.erase(keys.begin() + static_cast<std::ptrdiff_t>(k));
             }
         }
 
-        keys.erase(std::remove_if(keys.begin(), keys.end(), [&](const std::string& key) {
-            return key == dropKey || (dropped && WidgetPeekKeyMatches(*dropped, key));
-        }), keys.end());
-
-        const size_t at = std::min(static_cast<size_t>(std::max(0, dropAt)), keys.size());
-        keys.insert(keys.begin() + static_cast<long long>(at), dropKey);
+        keys.insert(keys.begin() + static_cast<std::ptrdiff_t>(at), dropKey);
         keysChanged = true;
     }
-    else if (moveFrom >= 0 && moveTo >= 0 && moveFrom != moveTo &&
-        moveFrom < static_cast<int>(keys.size()) && moveTo < static_cast<int>(keys.size())) {
-        const std::string moved = keys[static_cast<size_t>(moveFrom)];
-        keys.erase(keys.begin() + moveFrom);
-        keys.insert(keys.begin() + moveTo, moved);
-        keysChanged = true;
+    else if (moveFrom >= 0 && moveFrom < static_cast<int>(keys.size()) &&
+        moveTo >= 0 && moveTo <= static_cast<int>(keys.size())) {
+        // Taking the row out first shifts every slot below it up by one.
+        const int to = moveTo > moveFrom ? moveTo - 1 : moveTo;
+        if (to != moveFrom) {
+            const std::string moved = keys[static_cast<size_t>(moveFrom)];
+            keys.erase(keys.begin() + moveFrom);
+            keys.insert(keys.begin() + to, moved);
+            keysChanged = true;
+        }
     }
     else if (removeAt >= 0 && removeAt < static_cast<int>(keys.size())) {
         keys.erase(keys.begin() + removeAt);
@@ -5855,39 +4120,23 @@ static void DrawWidgetPeekStrip(float width, bool onTop)
     g_widgetContentWidthAccum = 0.0f;
 }
 
-// One custom pill tab: provider icon, optional name, selected highlight, and a
-// tiny usage underline. `compact` (widget) drops the name for an icon-only pill.
-static void DrawProviderTabPill(
-    const char* name,
-    TabImage* image,
-    ActiveMainTab tab,
-    ActiveMainTab& sel,
-    bool compact,
-    bool hasUsage,
-    float usedPercent
-)
+// One custom icon-only pill tab: provider icon, selected highlight, and a tiny
+// underline showing the host's primary window.
+static void DrawProviderTabPill(const char* id, TabImage& image, HostTab tab, const WidgetPeek* primary)
 {
-    const bool selected = sel == tab;
-    ImFont* f = g_widgetFont ? g_widgetFont : ImGui::GetFont();
-    const float fs = compact ? 13.0f : 15.0f;
-    const float iconS = compact ? 18.0f : 20.0f;
-    const float padX = compact ? 9.0f : 12.0f;
-    const float gap = 7.0f;
-    const bool showName = !compact;
-    const bool showIcon = image && image->srv;
-    const float nameW = showName ? f->CalcTextSizeA(fs, FLT_MAX, 0.0f, name).x : 0.0f;
-    const float pillW = padX
-        + (showIcon ? iconS : 0.0f)
-        + (showName ? (showIcon ? gap : 0.0f) + nameW : 0.0f)
-        + padX;
-    const float pillH = compact ? 36.0f : 40.0f;
+    const bool selected = g_widgetTab == tab;
+    const float iconS = 18.0f;
+    const float padX = 9.0f;
+    const bool showIcon = image.srv != nullptr;
+    const float pillW = padX + (showIcon ? iconS : 0.0f) + padX;
+    const float pillH = 36.0f;
 
     const ImVec2 pos = ImGui::GetCursorScreenPos();
-    ImGui::PushID(name);
+    ImGui::PushID(id);
     const bool clicked = ImGui::InvisibleButton("##pill", ImVec2(pillW, pillH));
     const bool hovered = ImGui::IsItemHovered();
     ImGui::PopID();
-    if (clicked) sel = tab;
+    if (clicked) g_widgetTab = tab;
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImU32 fill = selected ? Color(46, 92, 150, 255)
@@ -5896,89 +4145,30 @@ static void DrawProviderTabPill(
     dl->AddRect(pos, ImVec2(pos.x + pillW, pos.y + pillH),
         selected ? Color(96, 156, 240, 255) : Color(52, 56, 70, 200), 9.0f, 0, selected ? 1.4f : 1.0f);
 
-    const float yShift = hasUsage ? 2.0f : 0.0f;
+    const float yShift = primary ? 2.0f : 0.0f;
     const ImVec2 ic(pos.x + padX, pos.y + (pillH - iconS) * 0.5f - yShift);
     if (showIcon) {
-        dl->AddImage(reinterpret_cast<ImTextureID>(image->srv), ic, ImVec2(ic.x + iconS, ic.y + iconS));
-    }
-    if (showName) {
-        const ImU32 tcol = selected ? Color(242, 246, 253) : Color(198, 205, 219);
-        const float textX = showIcon ? ic.x + iconS + gap : pos.x + padX;
-        dl->AddText(f, fs, ImVec2(textX, pos.y + (pillH - fs) * 0.5f - yShift - 1.0f), tcol, name);
+        dl->AddImage(reinterpret_cast<ImTextureID>(image.srv), ic, ImVec2(ic.x + iconS, ic.y + iconS));
     }
 
-    if (hasUsage) {
+    if (primary) {
         const float bw = pillW - padX * 2.0f;
         const float bx = pos.x + padX;
         const float by = pos.y + pillH - 7.0f;
         dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + 3.0f), Color(60, 64, 78, 255), 1.5f);
-        const float shown = g_showRemaining ? 100.0f - usedPercent : usedPercent;
+        const float shown = g_showRemaining ? 100.0f - primary->usedPercent : primary->usedPercent;
         dl->AddRectFilled(ImVec2(bx, by),
             ImVec2(bx + bw * std::clamp(shown / 100.0f, 0.0f, 1.0f), by + 3.0f),
-            PanelSeverity(usedPercent), 1.5f);
-    }
-}
-
-static void DrawProviderTabStrip()
-{
-    TabImage& codex = EnsureTabImage(g_codexTabImage, L"Codex.ico");
-    TabImage& claude = EnsureTabImage(g_claudeTabImage, L"Claude.ico");
-    TabImage& zai = EnsureTabImage(g_zaiTabImage, L"ZAi.ico");
-    TabImage& grok = EnsureTabImage(g_grokTabImage, L"Grok.ico");
-
-    if (g_widgetFont) ImGui::PushFont(g_widgetFont);
-
-    float u = 0.0f;
-    bool has;
-    has = CodexPrimaryUsed(u);  DrawProviderTabPill("Codex", &codex, ActiveMainTab::Codex, g_activeTab, false, has, u);
-    ImGui::SameLine(0.0f, 8.0f);
-    has = ClaudePrimaryUsed(u); DrawProviderTabPill("Claude", &claude, ActiveMainTab::Claude, g_activeTab, false, has, u);
-    ImGui::SameLine(0.0f, 8.0f);
-    has = ZAiPrimaryUsed(u);    DrawProviderTabPill("Z.Ai", &zai, ActiveMainTab::ZAi, g_activeTab, false, has, u);
-    ImGui::SameLine(0.0f, 8.0f);
-    has = GrokPrimaryUsed(u);   DrawProviderTabPill("Grok", &grok, ActiveMainTab::Grok, g_activeTab, false, has, u);
-
-    // Settings sits in the same row, just after a wider gap. Right-aligning it
-    // flung it against the window edge and clipped it.
-    ImGui::SameLine(0.0f, 20.0f);
-    DrawProviderTabPill("Settings", nullptr, ActiveMainTab::Settings, g_activeTab, false, false, 0.0f);
-
-    if (g_widgetFont) ImGui::PopFont();
-
-    ImGui::Dummy(ImVec2(0.0f, 8.0f));
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    const ImVec2 rp = ImGui::GetCursorScreenPos();
-    dl->AddLine(rp, ImVec2(rp.x + ImGui::GetContentRegionAvail().x, rp.y), Color(44, 48, 60), 1.0f);
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
-}
-
-static void DrawActiveMainTab()
-{
-    switch (g_activeTab) {
-    case ActiveMainTab::Codex:
-        DrawCodexTab();
-        break;
-    case ActiveMainTab::Claude:
-        DrawClaudeTab();
-        break;
-    case ActiveMainTab::ZAi:
-        DrawZAiTab();
-        break;
-    case ActiveMainTab::Grok:
-        DrawGrokTab();
-        break;
-    case ActiveMainTab::Settings:
-        DrawSettingsTab();
-        break;
+            PanelSeverity(primary->usedPercent), 1.5f);
     }
 }
 
 // ---------------------------------------------------------------------------
 // Widget mode
 //
-// The same CodexBar-style sectioned panel the main window uses, in a docked
-// column: a compact icon tab strip picks the host, then that host's header and
-// sections render underneath. Everything is drawn from primitives.
+// The CodexBar-style sectioned panel in a docked column: a compact icon tab
+// strip picks the host, then that host's header and sections render
+// underneath. Everything is drawn from primitives.
 // ---------------------------------------------------------------------------
 
 // Small custom icon button. `icon`: 0 pin, 1 restore, 2 close.
@@ -6053,23 +4243,23 @@ static void DrawWidgetUi()
 
     if (g_widgetFont) ImGui::PushFont(g_widgetFont);
 
+    // A bottom-row anchor rolls the panel downwards, so the peek strip lives on
+    // the top edge there and the header has to start below it.
+    const int widgetAnchor = R().widgetAnchor
+        ? *R().widgetAnchor : AppSettings::WidgetAnchorTopRight;
+    const bool peekOnTop = AppSettings::WidgetAnchorRow(widgetAnchor) == 1;
+    const float peekStripHeight = WidgetPeekStripHeight();
+
     // Rolled away: the window has been collapsed to the peek band, so draw only
     // that. The full layout does not fit and BeginChild with a negative height
     // reservation would not survive it anyway.
-    {
-        const int anchor = R().widgetAnchor
-            ? *R().widgetAnchor : AppSettings::WidgetAnchorTopRight;
-        const bool onTop = AppSettings::WidgetAnchorRow(anchor) == 1;
-        const float stripHeight = WidgetPeekStripHeight();
-
-        if (panelSize.y < stripHeight + 24.0f) {
-            ImGui::SetCursorScreenPos(ImVec2(panelMin.x,
-                onTop ? panelMin.y : panelMax.y - stripHeight));
-            DrawWidgetPeekStrip(panelSize.x, onTop);
-            g_widgetPeekHeight = stripHeight;
-            if (g_widgetFont) ImGui::PopFont();
-            return;
-        }
+    if (panelSize.y < peekStripHeight + 24.0f) {
+        ImGui::SetCursorScreenPos(ImVec2(panelMin.x,
+            peekOnTop ? panelMin.y : panelMax.y - peekStripHeight));
+        DrawWidgetPeekStrip(panelSize.x, peekOnTop);
+        g_widgetPeekHeight = peekStripHeight;
+        if (g_widgetFont) ImGui::PopFont();
+        return;
     }
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(13.0f, 11.0f));
@@ -6079,13 +4269,6 @@ static void DrawWidgetUi()
 
     ImDrawList* inner = ImGui::GetWindowDrawList();
     const float contentWidth = ImGui::GetContentRegionAvail().x;
-
-    // A bottom-row anchor rolls the panel downwards, so the peek strip lives on
-    // the top edge there and the header has to start below it.
-    const int widgetAnchor = R().widgetAnchor
-        ? *R().widgetAnchor : AppSettings::WidgetAnchorTopRight;
-    const bool peekOnTop = AppSettings::WidgetAnchorRow(widgetAnchor) == 1;
-    const float peekStripHeight = WidgetPeekStripHeight();
 
     if (peekOnTop) {
         ImGui::Dummy(ImVec2(contentWidth, peekStripHeight - 4.0f));
@@ -6117,7 +4300,7 @@ static void DrawWidgetUi()
 
     if (pin) {
         g_widgetPinned = !g_widgetPinned;
-        if (R().saveAppSettings) R().saveAppSettings();
+        SaveAppSettings();
     }
     if (close) {
         g_shouldClose = true;
@@ -6126,21 +4309,20 @@ static void DrawWidgetUi()
     ImGui::SetCursorScreenPos(ImVec2(headerOrigin.x, headerOrigin.y + 32.0f));
 
     // ---- compact icon tab strip ----
+    // Each underline is the window the bar would follow for that host.
     {
-        TabImage& codex = EnsureTabImage(g_codexTabImage, L"Codex.ico");
-        TabImage& claude = EnsureTabImage(g_claudeTabImage, L"Claude.ico");
-        TabImage& zai = EnsureTabImage(g_zaiTabImage, L"ZAi.ico");
-        TabImage& grok = EnsureTabImage(g_grokTabImage, L"Grok.ico");
+        const std::vector<WidgetPeek>& candidates = WidgetPeekCandidates();
+        const auto pill = [&candidates](const char* id, TabImage& image, const wchar_t* file, HostTab tab) {
+            DrawProviderTabPill(id, EnsureTabImage(image, file), tab, PrimaryCandidate(candidates, tab));
+        };
 
-        float u = 0.0f;
-        bool has;
-        has = CodexPrimaryUsed(u);  DrawProviderTabPill("wCodex", &codex, ActiveMainTab::Codex, g_widgetTab, true, has, u);
+        pill("wCodex", g_codexTabImage, L"Codex.ico", HostTab::Codex);
         ImGui::SameLine(0.0f, 7.0f);
-        has = ClaudePrimaryUsed(u); DrawProviderTabPill("wClaude", &claude, ActiveMainTab::Claude, g_widgetTab, true, has, u);
+        pill("wClaude", g_claudeTabImage, L"Claude.ico", HostTab::Claude);
         ImGui::SameLine(0.0f, 7.0f);
-        has = ZAiPrimaryUsed(u);    DrawProviderTabPill("wZAi", &zai, ActiveMainTab::ZAi, g_widgetTab, true, has, u);
+        pill("wZAi", g_zaiTabImage, L"ZAi.ico", HostTab::ZAi);
         ImGui::SameLine(0.0f, 7.0f);
-        has = GrokPrimaryUsed(u);   DrawProviderTabPill("wGrok", &grok, ActiveMainTab::Grok, g_widgetTab, true, has, u);
+        pill("wGrok", g_grokTabImage, L"Grok.ico", HostTab::Grok);
     }
 
     ImGui::Dummy(ImVec2(contentWidth, 9.0f));
@@ -6162,7 +4344,7 @@ static void DrawWidgetUi()
         ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
 
     switch (g_widgetTab) {
-    case ActiveMainTab::Codex: {
+    case HostTab::Codex: {
         Codex::Snapshot s;
         { std::lock_guard<std::mutex> lock(g_codexMutex); s = g_codexState; }
         DrawProviderHeader("Codex", s.lastUpdated, PlanBeside("Codex", s.plan),
@@ -6170,7 +4352,7 @@ static void DrawWidgetUi()
         RenderCodexSections(s);
         break;
     }
-    case ActiveMainTab::Claude: {
+    case HostTab::Claude: {
         Claude::Snapshot s;
         { std::lock_guard<std::mutex> lock(g_claudeMutex); s = g_claudeState; }
         DrawProviderHeader("Claude", s.lastUpdated, PlanBeside("Claude", s.plan),
@@ -6178,7 +4360,7 @@ static void DrawWidgetUi()
         RenderClaudeSections(s);
         break;
     }
-    case ActiveMainTab::ZAi: {
+    case HostTab::ZAi: {
         ZAi::Snapshot s;
         { std::lock_guard<std::mutex> lock(g_zaiMutex); s = g_zaiState; }
         DrawProviderHeader("Z.Ai", s.lastUpdated, PlanBeside("Z.Ai", s.plan),
@@ -6327,44 +4509,9 @@ void RenderMainUi(State& state)
 
     ImGui::PopStyleVar(2);
 
-    // UI mode is selected at build time:
-    //   GUI_AND_WIDGET - tabbed form plus widget, switchable at runtime
-    //   GUI_ONLY       - tabbed form only
-    //   (neither)      - widget only (default)
-#if defined(GUI_AND_WIDGET)
-    if (g_widgetMode) {
-        DrawWidgetUi();
-        ImGui::End();
-        return;
-    }
-#elif defined(GUI_ONLY)
-    // always the form
-#else
     DrawWidgetUi();
+
     ImGui::End();
-    return;
-#endif
-
-#if defined(GUI_AND_WIDGET) || defined(GUI_ONLY)
-    DrawCustomTitleBar();
-
-    // AlwaysUseWindowPadding + an explicit padding: without it the panel content
-    // sat flush on x=0 and ran off the right edge, which is what made the whole
-    // window look unfinished.
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(18.0f, 14.0f));
-    ImGui::BeginChild("##main_panel", ImVec2(0.0f, 0.0f),
-        ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding,
-        ImGuiWindowFlags_NoScrollbar);
-    ImGui::PopStyleVar(3);
-
-    DrawProviderTabStrip();
-    DrawActiveMainTab();
-
-    ImGui::EndChild();
-    ImGui::End();
-#endif
 }
 
 

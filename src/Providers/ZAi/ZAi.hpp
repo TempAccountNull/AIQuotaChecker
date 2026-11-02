@@ -16,10 +16,6 @@ namespace ZAi
         float usedPercent = 0.0f;
         long long resetAtUnixSeconds = 0;
         bool valid = false;
-        bool red = false;
-        bool white = false;
-        bool green = false;
-        bool thin = false;
         bool spendBalance = false;
         bool sharedRateLimit = false; // Coding windows that all gate the same requests.
     };
@@ -51,6 +47,34 @@ namespace ZAi
         long long nextRefreshAtUnixSeconds = 0;
     };
 
+    // Coding Plan usage history (credit-usage/activity and usage-detail
+    // MODEL / MCP), refreshed at most every 10 minutes. -1 = not reported.
+    struct UsageHistory
+    {
+        bool valid = false;
+        long long todayTokens = -1;
+        long long todayModelCalls = -1;
+        long long todayToolCalls = -1;
+        long long totalTokens = -1;      // 365-day window
+        long long peakDailyTokens = -1;
+        std::string peakDate;
+        long long totalUsageSeconds = -1; // 365-day window
+        int currentStreakDays = -1;
+        int longestStreakDays = -1;
+        std::vector<std::pair<std::string, long long>> models; // name -> tokens, last 7 days
+        std::vector<std::pair<std::string, long long>> tools;  // name -> calls, last 7 days
+        // Latest daily decode speed (model-performance-day), tokens/s; -1 = not reported.
+        double proDecodeTps = -1.0;  // Pro / Max tier
+        double liteDecodeTps = -1.0; // Lite tier
+    };
+
+    // An unexpired banked quota reset from /api/v1/coding-plan/reset/status.
+    struct QuotaReset
+    {
+        std::string type; // "5-hour" or "Weekly"
+        long long expiresAtUnixSeconds = 0;
+    };
+
     struct Snapshot
     {
         std::string plan = "Z.Ai";
@@ -59,6 +83,13 @@ namespace ZAi
         std::vector<UsageBar> bars;
         std::vector<DetailRow> details;
         McpUsage mcp;
+        // Soonest expiry first; resetsReported distinguishes "none banked"
+        // from "not asked".
+        bool resetsReported = false;
+        std::vector<QuotaReset> resets;
+        long long lastFiveHourResetUnixSeconds = 0;
+        long long lastWeeklyResetUnixSeconds = 0;
+        UsageHistory history;
         UsageTelemetry::AccessStatus access;
         UsageTelemetry::ContextUsage context;
         UsageTelemetry::RunUsage run;
