@@ -162,6 +162,19 @@ namespace
             return;
         }
 
+        // Free plans now get a 30-day main window; it is not the weekly quota.
+        if (label.find("Monthly") != std::string::npos) {
+            point.key = "codex_monthly";
+            point.notificationName = "monthly limit";
+            return;
+        }
+
+        if (label.find("Daily") != std::string::npos) {
+            point.key = "codex_daily";
+            point.notificationName = "daily limit";
+            return;
+        }
+
         point.key = "codex_weekly_all_models";
         point.notificationName = "weekly - all models";
     }

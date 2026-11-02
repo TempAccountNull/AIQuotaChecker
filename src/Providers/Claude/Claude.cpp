@@ -43,6 +43,9 @@ namespace Claude {
         double expiresAtMs = 0.0;
         std::string subscriptionType;
         std::string rateLimitTier;
+        // Server-provided plan name (organization.plan_display_name, e.g.
+        // "Ultra"). Desktop shows it in place of the generic tier name.
+        std::string displayName;
         // Granted scopes as stored by `claude login`. Older credentials predate
         // the field, so an empty list means "unknown", not "none".
         std::vector<std::string> scopes;
@@ -774,6 +777,10 @@ namespace Claude {
     }
 
     static std::string FormatPlan(const ClaudeOAuth& oauth) {
+        if (!oauth.displayName.empty()) {
+            return "Claude " + oauth.displayName;
+        }
+
         std::string plan = "Claude";
         std::string subscription = PrettySubscriptionType(oauth.subscriptionType);
         std::string multiplier = ExtractRateLimitMultiplier(oauth.rateLimitTier);
@@ -1014,8 +1021,8 @@ namespace Claude {
         const json& limits = root.at("limits");
 
         if (limits.begin() == limits.end()) {
-            // An explicitly empty list means the server currently exposes no
-            // quota windows. Do not fabricate legacy rows.
+            // An explicitly empty list carries no rows of its own; only the
+            // named session/weekly/Sonnet fields still apply (ParseSnapshot).
             return true;
         }
 
@@ -1062,18 +1069,13 @@ namespace Claude {
                 );
                 parsedAny = snapshot.weeklySonnet.valid || parsedAny;
             }
-            else if (group == "weekly" && (lower.find("fable") != std::string::npos ||
-                lower.find("design") != std::string::npos ||
-                lower.find("omelette") != std::string::npos)) {
-                // "omelette" is the internal codename for Claude Design, not
-                // for Fable - the bundle renders omelette_promotional as
-                // "{product} grant" with product "Claude Design", and fable
-                // exists only as a model family tier (sonnet/opus/haiku/fable/
-                // mythos), never as a quota window.
+            else if (group == "weekly" && lower.find("fable") != std::string::npos) {
+                // Live Desktop 4.4212 data has a real per-model window:
+                // kind "weekly_scoped", scope.model.display_name "Fable".
                 snapshot.weeklyFable = ParseServerLimitWindow(
                     limit,
-                    displayName.empty() ? "Claude Design" : displayName,
-                    "Product-specific weekly limit"
+                    displayName,
+                    "Model-specific weekly limit"
                 );
                 parsedAny = snapshot.weeklyFable.valid || parsedAny;
             }
@@ -1139,6 +1141,17 @@ namespace Claude {
                 "credit_balance", "creditBalance", "balance"
             }
         );
+        // /api/oauth/usage now names the currency; Desktop defaults to USD.
+        const std::string currency = ToLowerAscii(ClaudeStringAny(object, { "currency" }));
+        const auto FormatDollars = [&](double value) {
+            if (currency.empty() || currency == "usd") {
+                return Claude::FormatDollars(value);
+            }
+
+            std::ostringstream out;
+            out << std::fixed << std::setprecision(2) << value << ' ' << ClaudeStringAny(object, { "currency" });
+            return out.str();
+        };
 
         credits.hasSpentAmount = usedCents.has_value();
         credits.hasMonthlyLimit = limitCents.has_value();
@@ -1256,14 +1269,9 @@ namespace Claude {
             return true;
         }
 
-        // A full-spend response always supplies used_credits when the feature
-        // is enabled. A reported disabled object with no spend fields can be a
-        // lightweight/stale response, so verify it through the remaining
-        // official authentication/host paths before displaying Off.
-        if (!credits.enabled && !credits.hasSpentAmount && !credits.hasMonthlyLimit) {
-            return true;
-        }
-
+        // Desktop treats is_enabled:false as final; only skip_spend=1 replies
+        // (which this app never sends) omit spend data. A full-spend response
+        // always supplies used_credits when the feature is enabled.
         return credits.enabled && !credits.hasSpentAmount;
     }
 
@@ -1346,21 +1354,22 @@ namespace Claude {
         return text;
     }
 
-    static std::filesystem::path ClaudeDesktopSessionsRoot() {
-        // Claude Desktop 3p uses LOCALAPPDATA\\Claude-3p\\claude-code-sessions
-        // on Windows. This mirrors the path visible in the supplied unpacked
-        // ASAR and is read-only here.
-        const std::string customUserData =
-            Network::get_instance()->GetEnvText("CLAUDE_USER_DATA_DIR");
-        if (!customUserData.empty()) {
-            return std::filesystem::path(customUserData) / "claude-code-sessions";
+    // Desktop keeps claude-code-sessions\<acct>\<org>\local_<uuid>.json and
+    // local-agent-mode-sessions\<acct>\<org>\ under its userData: %APPDATA%\Claude
+    // for a normal install, Claude-3p for the 3P build, or an MSIX package
+    // cache. Scan every candidate; the newest file wins. Read-only.
+    static std::vector<std::filesystem::path> ClaudeDesktopDataDirs(const char* child) {
+        std::vector<std::filesystem::path> dirs;
+
+        for (const std::filesystem::path& root : ClaudeDesktopAuth::UserDataCandidates()) {
+            std::error_code ec;
+
+            if (std::filesystem::is_directory(root / child, ec)) {
+                dirs.push_back(root / child);
+            }
         }
 
-        const std::string localAppData = Network::get_instance()->GetEnvText("LOCALAPPDATA");
-        if (localAppData.empty()) {
-            return {};
-        }
-        return std::filesystem::path(localAppData) / "Claude-3p" / "claude-code-sessions";
+        return dirs;
     }
 
     struct ClaudeDesktopSessionHint {
@@ -1430,17 +1439,43 @@ namespace Claude {
         return {};
     }
 
-    static std::filesystem::path ClaudeDesktopUserDataRoot() {
-        const std::string customUserData =
-            Network::get_instance()->GetEnvText("CLAUDE_USER_DATA_DIR");
-        if (!customUserData.empty()) {
-            return std::filesystem::path(customUserData);
+    // The Desktop ASAR stores account settings under
+    // userData/local-agent-mode-sessions/<account>/<org>/; newest first.
+    static std::vector<std::filesystem::path> ClaudeCoworkSettingsFiles() {
+        struct Candidate {
+            std::filesystem::path path;
+            std::filesystem::file_time_type writeTime{};
+        };
+        std::vector<Candidate> files;
+        std::error_code ec;
+        for (const std::filesystem::path& root : ClaudeDesktopDataDirs("local-agent-mode-sessions")) {
+            std::filesystem::recursive_directory_iterator it(
+                root,
+                std::filesystem::directory_options::skip_permission_denied,
+                ec
+            );
+            const std::filesystem::recursive_directory_iterator end;
+            for (; it != end; it.increment(ec)) {
+                if (ec) { ec.clear(); continue; }
+                const auto& entry = *it;
+                if (!entry.is_regular_file(ec) || ec) { ec.clear(); continue; }
+                if (ToLowerAscii(entry.path().filename().string()) != "cowork_account_settings.json") {
+                    continue;
+                }
+                const auto writeTime = entry.last_write_time(ec);
+                if (ec) { ec.clear(); continue; }
+                files.push_back({ entry.path(), writeTime });
+            }
+            ec.clear();
         }
-        const std::string localAppData = Network::get_instance()->GetEnvText("LOCALAPPDATA");
-        if (localAppData.empty()) {
-            return {};
-        }
-        return std::filesystem::path(localAppData) / "Claude-3p";
+        std::sort(files.begin(), files.end(), [](const Candidate& a, const Candidate& b) {
+            return a.writeTime > b.writeTime;
+        });
+        if (files.size() > 16) files.resize(16);
+
+        std::vector<std::filesystem::path> paths;
+        for (const Candidate& file : files) paths.push_back(file.path);
+        return paths;
     }
 
     static std::string LatestClaudeDesktopSelectedModel() {
@@ -1459,51 +1494,8 @@ namespace Claude {
         cache.checkedAt = now;
         cache.model.clear();
 
-        std::filesystem::path root = ClaudeDesktopUserDataRoot();
-        std::error_code ec;
-        if (root.empty()) {
-            return {};
-        }
-        // The Desktop ASAR stores account settings under
-        // userData/local-agent-mode-sessions/<account>/<org>/.
-        const std::filesystem::path accountRoot = root / "local-agent-mode-sessions";
-        if (std::filesystem::exists(accountRoot, ec) && !ec) {
-            root = accountRoot;
-        }
-        ec.clear();
-        if (!std::filesystem::exists(root, ec) || ec) {
-            return {};
-        }
-
-        struct Candidate {
-            std::filesystem::path path;
-            std::filesystem::file_time_type writeTime{};
-        };
-        std::vector<Candidate> files;
-        std::filesystem::recursive_directory_iterator it(
-            root,
-            std::filesystem::directory_options::skip_permission_denied,
-            ec
-        );
-        const std::filesystem::recursive_directory_iterator end;
-        for (; it != end; it.increment(ec)) {
-            if (ec) { ec.clear(); continue; }
-            const auto& entry = *it;
-            if (!entry.is_regular_file(ec) || ec) { ec.clear(); continue; }
-            if (ToLowerAscii(entry.path().filename().string()) != "cowork_account_settings.json") {
-                continue;
-            }
-            const auto writeTime = entry.last_write_time(ec);
-            if (ec) { ec.clear(); continue; }
-            files.push_back({ entry.path(), writeTime });
-        }
-        std::sort(files.begin(), files.end(), [](const Candidate& a, const Candidate& b) {
-            return a.writeTime > b.writeTime;
-        });
-        if (files.size() > 16) files.resize(16);
-
-        for (const Candidate& file : files) {
-            const std::string raw = ReadClaudeTailSharedReadOnly(file.path, 4ULL * 1024ULL * 1024ULL);
+        for (const std::filesystem::path& file : ClaudeCoworkSettingsFiles()) {
+            const std::string raw = ReadClaudeTailSharedReadOnly(file, 4ULL * 1024ULL * 1024ULL);
             if (raw.empty()) continue;
             const json value = json::parse(raw, nullptr, false);
             if (value.is_discarded()) continue;
@@ -1533,44 +1525,43 @@ namespace Claude {
     }
 
     static ClaudeDesktopSessionHint LatestClaudeDesktopSessionHint() {
-        const std::filesystem::path root = ClaudeDesktopSessionsRoot();
-        std::error_code ec;
-        if (root.empty() || !std::filesystem::exists(root, ec) || ec) {
-            return {};
-        }
-
         struct Candidate {
             std::filesystem::path path;
             std::filesystem::file_time_type writeTime{};
         };
         std::vector<Candidate> files;
-        std::filesystem::recursive_directory_iterator it(
-            root,
-            std::filesystem::directory_options::skip_permission_denied,
-            ec
-        );
-        const std::filesystem::recursive_directory_iterator end;
+        std::error_code ec;
 
-        for (; it != end; it.increment(ec)) {
-            if (ec) {
-                ec.clear();
-                continue;
+        for (const std::filesystem::path& root : ClaudeDesktopDataDirs("claude-code-sessions")) {
+            std::filesystem::recursive_directory_iterator it(
+                root,
+                std::filesystem::directory_options::skip_permission_denied,
+                ec
+            );
+            const std::filesystem::recursive_directory_iterator end;
+
+            for (; it != end; it.increment(ec)) {
+                if (ec) {
+                    ec.clear();
+                    continue;
+                }
+                const auto& entry = *it;
+                if (!entry.is_regular_file(ec) || ec || entry.path().extension() != ".json") {
+                    ec.clear();
+                    continue;
+                }
+                const std::string filename = ToLowerAscii(entry.path().filename().string());
+                if (filename.rfind("local_", 0) != 0) {
+                    continue;
+                }
+                const auto writeTime = entry.last_write_time(ec);
+                if (ec) {
+                    ec.clear();
+                    continue;
+                }
+                files.push_back({ entry.path(), writeTime });
             }
-            const auto& entry = *it;
-            if (!entry.is_regular_file(ec) || ec || entry.path().extension() != ".json") {
-                ec.clear();
-                continue;
-            }
-            const std::string filename = ToLowerAscii(entry.path().filename().string());
-            if (filename.rfind("local_", 0) != 0) {
-                continue;
-            }
-            const auto writeTime = entry.last_write_time(ec);
-            if (ec) {
-                ec.clear();
-                continue;
-            }
-            files.push_back({ entry.path(), writeTime });
+            ec.clear();
         }
 
         std::sort(files.begin(), files.end(), [](const Candidate& a, const Candidate& b) {
@@ -2320,20 +2311,21 @@ namespace Claude {
 
         struct Entry { const char* id; long long window; };
         static const Entry kRegistry[] = {
-            // Native 1M-context models.
+            // Native 1M-context models (Desktop 4.4212 catalog max_input_tokens).
             { "claude-opus-5",     1000000 },
             { "claude-sonnet-5",   1000000 },
             { "claude-fable-5",    1000000 },
+            { "claude-haiku-5",    1000000 },
             { "claude-mythos-5",   1000000 },
             { "claude-opus-4-8",   1000000 },
             { "claude-opus-4-7",   1000000 },
+            { "claude-opus-4-6",   1000000 },
+            { "claude-sonnet-4-6", 1000000 },
             // 200K models. Listed explicitly so a sibling 1M model in the same
             // family can never be matched by a shorter prefix.
-            { "claude-opus-4-6",    200000 },
             { "claude-opus-4-5",    200000 },
             { "claude-opus-4-1",    200000 },
             { "claude-opus-4-0",    200000 },
-            { "claude-sonnet-4-6",  200000 },
             { "claude-sonnet-4-5",  200000 },
             { "claude-sonnet-4-0",  200000 },
             { "claude-haiku-4-5",   200000 },
@@ -3493,37 +3485,50 @@ namespace Claude {
 
         const bool hasServerDrivenLimits = ParseServerDrivenLimits(root, snapshot);
 
-        if (!hasServerDrivenLimits) {
+        // Desktop's Code tab reads 5-hour, weekly and Sonnet from the named
+        // fields and only per-model rows from limits[], so a limits[] array
+        // (even an empty one) must not hide them. Fill whatever it left empty.
+        if (!snapshot.currentSession.valid) {
             snapshot.currentSession = ParseWindow(
                 root,
                 "five_hour",
                 "Session",
                 "Starts when a message is sent"
             );
+        }
 
+        if (!snapshot.weeklyAllModels.valid) {
             snapshot.weeklyAllModels = ParseWindow(
                 root,
                 "seven_day",
                 "Weekly",
                 "All models"
             );
+        }
 
+        if (!snapshot.weeklySonnet.valid) {
             snapshot.weeklySonnet = ParseWindow(
                 root,
                 "seven_day_sonnet",
                 "Sonnet",
                 "Sonnet only"
             );
+        }
 
-            snapshot.weeklyFable = ParseFirstAvailableWindow(
-                root,
-                { "seven_day_omelette", "omelette_promotional" },
-                "Claude Design",
-                "Product-specific weekly limit"
+        if (!hasServerDrivenLimits) {
+            // "omelette" is Claude Design, a product - not the Fable model.
+            AddAdditionalLimit(
+                snapshot,
+                ParseFirstAvailableWindow(
+                    root,
+                    { "seven_day_omelette" },
+                    "Claude Design",
+                    "Product-specific weekly limit"
+                )
             );
 
             if (!snapshot.weeklyFable.valid) {
-                snapshot.weeklyFable = ParseWindow(root, "seven_day_fable", "Fable", "Fable");
+                snapshot.weeklyFable = ParseWindow(root, "seven_day_fable", "Fable", "Model-specific weekly limit");
             }
 
             AddAdditionalLimit(
@@ -3541,14 +3546,12 @@ namespace Claude {
                 ParseWindow(root, "seven_day_cowork", "Cowork", "Cowork only")
             );
         }
-        else if (!snapshot.weeklyFable.valid) {
-            snapshot.weeklyFable = ParseWindow(
-                root,
-                "omelette_promotional",
-                "Claude Design grant",
-                "Promotional grant"
-            );
-        }
+
+        // Desktop's tray shows this grant beside the limits[] rows.
+        AddAdditionalLimit(
+            snapshot,
+            ParseWindow(root, "omelette_promotional", "Claude Design grant", "Promotional grant")
+        );
 
         snapshot.credits = ParseCredits(root, oauth);
         FinalizeClaudeAccess(snapshot);
@@ -3557,8 +3560,7 @@ namespace Claude {
 
     static Network::HttpResponse FetchDesktopOrganizationUsage(
         const ClaudeDesktopAuth::Result& desktop,
-        const std::string& baseUrl,
-        bool explicitSpend
+        const std::string& baseUrl
     ) {
         const std::string cookie = Network::get_instance()->StripHeaderValue(desktop.cookieHeader);
 
@@ -3573,16 +3575,11 @@ namespace Claude {
         headers += "Cookie: " + cookie + "\r\n";
         headers += "Referer: " + baseUrl + "/settings/usage\r\n";
         headers += "Origin: " + baseUrl + "\r\n";
-        headers += "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Claude/1.25927.0\r\n";
+        headers += "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Claude/4.4212.0\r\n";
 
-        std::string url = baseUrl + "/api/organizations/" + desktop.organizationId + "/usage";
-
-        // Claude Desktop normally omits the query for a full-spend refresh.
-        // The explicit false form is retained as a compatibility retry for
-        // deployments that distinguish it from an omitted query parameter.
-        if (explicitSpend) {
-            url += "?skip_spend=0";
-        }
+        // Desktop omits the query for a full-spend fetch and sends only
+        // skip_spend=1 to skip spend; there is no skip_spend=0 form.
+        const std::string url = baseUrl + "/api/organizations/" + desktop.organizationId + "/usage";
 
         return Network::get_instance()->RequestUrl(
             url,
@@ -3613,7 +3610,7 @@ namespace Claude {
         headers += "Cookie: " + cookie + "\r\n";
         headers += "Referer: " + baseUrl + "/settings/usage\r\n";
         headers += "Origin: " + baseUrl + "\r\n";
-        headers += "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Claude/1.25927.0\r\n";
+        headers += "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Claude/4.4212.0\r\n";
 
         return Network::get_instance()->RequestUrl(
             baseUrl + "/api/account",
@@ -3628,13 +3625,33 @@ namespace Claude {
     static std::string SubscriptionFromOrganizationType(const std::string& raw) {
         const std::string lower = ToLowerAscii(raw);
 
+        // Before "max": an Ultra tier string can contain both.
+        if (lower.find("ultra") != std::string::npos) return "ultra";
         if (lower.find("max") != std::string::npos) return "max";
         if (lower.find("pro") != std::string::npos) return "pro";
         if (lower.find("enterprise") != std::string::npos) return "enterprise";
         if (lower.find("team") != std::string::npos) return "team";
-        if (lower.find("ultra") != std::string::npos) return "ultra";
         if (lower.find("free") != std::string::npos) return "free";
 
+        return {};
+    }
+
+    // claude.ai organization objects carry capabilities, not organization_type:
+    // claude_max / claude_pro, and raven (Team) or raven_enterprise.
+    static std::string SubscriptionFromCapabilities(const json& org) {
+        if (!org.contains("capabilities") || !org.at("capabilities").is_array()) {
+            return {};
+        }
+
+        const json& capabilities = org.at("capabilities");
+        const auto has = [&](const char* name) {
+            return std::find(capabilities.begin(), capabilities.end(), name) != capabilities.end();
+        };
+
+        if (has("claude_max")) return "max";
+        if (has("claude_pro")) return "pro";
+        if (has("raven_enterprise")) return "enterprise";
+        if (has("raven")) return "team";
         return {};
     }
 
@@ -3694,7 +3711,18 @@ namespace Claude {
             JsonUtils::get_instance()->String(org, "organization_type"));
 
         if (subscription.empty()) {
+            subscription = SubscriptionFromCapabilities(org);
+        }
+
+        if (subscription.empty()) {
             subscription = SubscriptionFromOrganizationType(tier);
+        }
+
+        // The tray labels the plan with this when present, e.g. "Ultra".
+        const std::string displayName = JsonUtils::get_instance()->String(org, "plan_display_name");
+
+        if (plan.displayName.empty() && !displayName.empty()) {
+            plan.displayName = displayName;
         }
 
         // A team seat refines to Standard/Premium, which is a real distinction
@@ -3723,7 +3751,7 @@ namespace Claude {
 
     static Network::HttpResponse FetchDesktopUsage(const ClaudeDesktopAuth::Result& desktop) {
         const std::string baseUrl = desktop.baseUrl.empty() ? "https://claude.ai" : desktop.baseUrl;
-        return FetchDesktopOrganizationUsage(desktop, baseUrl, false);
+        return FetchDesktopOrganizationUsage(desktop, baseUrl);
     }
 
     static bool MergeCreditsFromBody(
@@ -3752,18 +3780,6 @@ namespace Claude {
         return false;
     }
 
-    static Network::HttpResponse FetchDesktopUsageFromBase(
-        const ClaudeDesktopAuth::Result& desktop,
-        const std::string& baseUrl,
-        bool explicitSpend = false
-    ) {
-        return FetchDesktopOrganizationUsage(
-            desktop,
-            baseUrl,
-            explicitSpend
-        );
-    }
-
     static void FetchDesktopCreditsSupplement(
         Snapshot& snapshot,
         const ClaudeDesktopAuth::Result& desktop,
@@ -3782,17 +3798,6 @@ namespace Claude {
                 MergeCreditsFromBody(snapshot, response.body, desktopPlan);
             }
         };
-
-        if (desktop.source == ClaudeDesktopAuth::AuthSource::BrowserCookies) {
-            // A full-spend refresh normally has no query. Retry with an
-            // explicit skip_spend=0 only when the successful primary response
-            // omitted extra_usage.
-            mergeSuccessful(FetchDesktopUsageFromBase(
-                desktop,
-                primaryBase,
-                true
-            ));
-        }
 
         // The matching Desktop OAuth cache belongs to the same active
         // organization. The token remains in memory only.
@@ -3814,11 +3819,7 @@ namespace Claude {
             ? "https://claude.ai"
             : "https://claude.com";
 
-        mergeSuccessful(FetchDesktopUsageFromBase(
-            desktop,
-            alternate,
-            false
-        ));
+        mergeSuccessful(FetchDesktopOrganizationUsage(desktop, alternate));
     }
 
     static Snapshot FailedSnapshot(
@@ -3974,19 +3975,36 @@ namespace Claude {
             );
         }
 
-        // The plan is not in the usage payload, so ask for it separately - but
-        // only when the OAuth cache did not already supply it, since that is a
-        // free answer and this is an extra round trip.
-        if (desktopPlan.subscriptionType.empty() && desktopPlan.rateLimitTier.empty()) {
-            const std::string accountBase = desktop.baseUrl.empty()
-                ? "https://claude.ai"
-                : desktop.baseUrl;
+        // The plan is not in the usage payload, so ask for it separately. The
+        // OAuth cache usually supplies the tier, but only the account payload
+        // carries the display name Desktop shows (e.g. "Ultra"), so look each
+        // organization up once per run rather than on every refresh.
+        {
+            static std::mutex accountMutex;
+            static std::unordered_map<std::string, ClaudeOAuth> accountPlans;
+            std::lock_guard<std::mutex> lock(accountMutex);
 
-            const Network::HttpResponse account = FetchDesktopAccount(desktop, accountBase);
+            auto known = accountPlans.find(desktop.organizationId);
 
-            if (account.statusCode >= 200 && account.statusCode < 300) {
-                // Best effort: a failure here costs the plan label, nothing else.
-                ApplyAccountPlan(account.body, desktop.organizationId, desktopPlan);
+            if (known == accountPlans.end()) {
+                const std::string accountBase = desktop.baseUrl.empty()
+                    ? "https://claude.ai"
+                    : desktop.baseUrl;
+
+                const Network::HttpResponse account = FetchDesktopAccount(desktop, accountBase);
+                ClaudeOAuth fromAccount;
+
+                if (account.statusCode >= 200 && account.statusCode < 300) {
+                    // Best effort: a failure here costs the plan label, nothing else.
+                    ApplyAccountPlan(account.body, desktop.organizationId, fromAccount);
+                    known = accountPlans.emplace(desktop.organizationId, fromAccount).first;
+                }
+            }
+
+            if (known != accountPlans.end()) {
+                if (desktopPlan.subscriptionType.empty()) desktopPlan.subscriptionType = known->second.subscriptionType;
+                if (desktopPlan.rateLimitTier.empty()) desktopPlan.rateLimitTier = known->second.rateLimitTier;
+                desktopPlan.displayName = known->second.displayName;
             }
         }
 
@@ -4209,8 +4227,82 @@ namespace Claude {
         return FetchEnvironmentSnapshot(false);
     }
 
+    // 3P builds can cap tokens per window by admin policy
+    // (HKLM/HKCU\SOFTWARE\Policies\Claude inferenceMaxTokensPerWindow and
+    // inferenceTokenWindowHours). Desktop counts input + output tokens into
+    // cowork_account_settings.json __token_usage { windowStartMs, inputTokens,
+    // outputTokens } and starts a fresh window once the old one has elapsed.
+    static std::optional<long long> ClaudePolicyNumber(const wchar_t* name) {
+        for (HKEY root : { HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER }) {
+            DWORD number = 0;
+            DWORD size = sizeof(number);
+
+            if (RegGetValueW(root, L"SOFTWARE\\Policies\\Claude", name, RRF_RT_REG_DWORD, nullptr, &number, &size) == ERROR_SUCCESS) {
+                return static_cast<long long>(number);
+            }
+
+            wchar_t text[32]{};
+            size = sizeof(text);
+
+            if (RegGetValueW(root, L"SOFTWARE\\Policies\\Claude", name, RRF_RT_REG_SZ, nullptr, text, &size) == ERROR_SUCCESS) {
+                return _wtoll(text);
+            }
+        }
+
+        return std::nullopt;
+    }
+
+    static void AddClaudeTokenCap(Snapshot& snapshot) {
+        const std::optional<long long> cap = ClaudePolicyNumber(L"inferenceMaxTokensPerWindow");
+        const std::optional<long long> hours = ClaudePolicyNumber(L"inferenceTokenWindowHours");
+
+        if (!cap || !hours || *cap <= 0 || *hours <= 0 || *hours > 720) {
+            return;
+        }
+
+        json usage;
+        const std::vector<std::filesystem::path> files = ClaudeCoworkSettingsFiles();
+
+        if (!files.empty()) {
+            const json settings = json::parse(
+                ReadClaudeTailSharedReadOnly(files.front(), 4ULL * 1024ULL * 1024ULL), nullptr, false);
+
+            if (settings.is_object() && settings.contains("__token_usage")) {
+                usage = settings.at("__token_usage");
+            }
+        }
+
+        using namespace std::chrono;
+        const double nowMs = static_cast<double>(duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
+        const double windowMs = static_cast<double>(*hours) * 3600000.0;
+        const double startMs = ClaudeNumberAny(usage, { "windowStartMs" }).value_or(0.0);
+        const bool current = startMs > 0.0 && startMs <= nowMs && nowMs < startMs + windowMs;
+        const double used = current
+            ? ClaudeNumberAny(usage, { "inputTokens" }).value_or(0.0) + ClaudeNumberAny(usage, { "outputTokens" }).value_or(0.0)
+            : 0.0;
+        const float percent = static_cast<float>(
+            Math::get_instance()->ClampPercentDouble(used / static_cast<double>(*cap) * 100.0));
+
+        UsageWindowModel::Builder window;
+        window.Title("Token limit").Subtitle(std::to_string(*hours) + "-hour admin cap").UsedPercent(percent);
+
+        if (current) {
+            const system_clock::time_point resetAt{ milliseconds(static_cast<long long>(startMs + windowMs)) };
+            window.Reset(TimePointToUnixSeconds(resetAt), FormatResetLong(resetAt));
+        }
+
+        AddAdditionalLimit(snapshot, window.Valid().Build());
+
+        // In 3P mode this cap is the quota: hitting it stops every request.
+        if (UsageTelemetry::IsExhausted(percent)) {
+            snapshot.access.state = UsageTelemetry::AccessState::OutOfUsage;
+            snapshot.access.detail = "Token limit reached";
+        }
+    }
+
     Snapshot FetchSnapshot(AccountSource source) {
         Snapshot snapshot = FetchSnapshotForSource(source);
+        AddClaudeTokenCap(snapshot);
         LocalTelemetry local = ReadLatestClaudeLocalTelemetry();
         snapshot.context = std::move(local.context);
         snapshot.run = std::move(local.run);

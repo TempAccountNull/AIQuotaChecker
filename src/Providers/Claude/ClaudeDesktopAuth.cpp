@@ -293,10 +293,15 @@ namespace {
     }
 
     static std::filesystem::path ClaudeDesktopUserDataPath() {
-        std::string overridePath = Network::get_instance()->GetEnvText("CLAUDE_DESKTOP_USER_DATA_DIR");
+        // The first candidate that actually holds Desktop's sign-in state.
+        for (const std::filesystem::path& root : UserDataCandidates()) {
+            std::error_code ec;
 
-        if (!overridePath.empty()) {
-            return std::filesystem::path(overridePath);
+            for (const std::filesystem::path& marker : { root / "config.json", root / "Network" / "Cookies", root / "Cookies" }) {
+                if (std::filesystem::is_regular_file(marker, ec)) {
+                    return root;
+                }
+            }
         }
 
         std::string appData = Network::get_instance()->GetEnvText("APPDATA");
@@ -784,15 +789,30 @@ namespace {
 
     struct OAuthCandidate {
         std::string organizationId;
+        std::string accountUuid;
         std::string accessToken;
         std::string subscriptionType;
         std::string rateLimitTier;
         double expiresAtMs = 0.0;
         int scopeScore = 0;
         bool scopedCache = false;
+        bool canReadUsage = false;
     };
 
-    static std::string CacheOrganizationId(const std::string& cacheKey) {
+    // Desktop 4.4212 keys every cache entry by account:
+    //   acct:<accountUuid>|<clientId>:<orgId>:<apiHost>:<scope>
+    // Older builds wrote the same key without the "acct:...|" prefix.
+    static std::string CacheAccountUuid(const std::string& cacheKey) {
+        const size_t bar = cacheKey.find('|');
+        return cacheKey.rfind("acct:", 0) == 0 && bar != std::string::npos ? cacheKey.substr(5, bar - 5) : std::string{};
+    }
+
+    static std::string CacheOrganizationId(std::string cacheKey) {
+        if (cacheKey.rfind("acct:", 0) == 0) {
+            const size_t bar = cacheKey.find('|');
+            cacheKey = bar == std::string::npos ? std::string{} : cacheKey.substr(bar + 1);
+        }
+
         const size_t first = cacheKey.find(':');
         if (first == std::string::npos) {
             return {};
@@ -809,6 +829,8 @@ namespace {
 
     static int CacheScopeScore(const std::string& cacheKey) {
         int score = 0;
+        // Desktop reads /api/oauth/usage with the Claude Code client's token.
+        if (cacheKey.find("9d1c250a-e61b-44d9-88ed-5944d1962f5e") != std::string::npos) score += 8;
         if (cacheKey.find("user:inference") != std::string::npos) score += 4;
         if (cacheKey.find("user:profile") != std::string::npos) score += 2;
         if (cacheKey.find("user:sessions:claude_code") != std::string::npos) score += 1;
@@ -841,6 +863,9 @@ namespace {
 
             OAuthCandidate candidate;
             candidate.organizationId = organizationId;
+            candidate.accountUuid = CacheAccountUuid(it.key());
+            // /api/oauth/usage rejects a token without user:profile (403).
+            candidate.canReadUsage = it.key().find("user:profile") != std::string::npos;
             candidate.accessToken = token;
             candidate.subscriptionType = JsonUtils::get_instance()->String(entry, "subscriptionType");
             candidate.rateLimitTier = JsonUtils::get_instance()->String(entry, "rateLimitTier");
@@ -963,6 +988,22 @@ namespace {
             return std::nullopt;
         }
 
+        // Several accounts can be signed in; Desktop records the active one in
+        // plaintext. Keep only its entries when any are present.
+        const std::string activeAccount = JsonUtils::get_instance()->String(config, "lastKnownAccountUuid");
+
+        if (!activeAccount.empty() &&
+            std::any_of(candidates.begin(), candidates.end(), [&](const OAuthCandidate& candidate) {
+                return candidate.accountUuid == activeAccount;
+            })) {
+            candidates.erase(
+                std::remove_if(candidates.begin(), candidates.end(), [&](const OAuthCandidate& candidate) {
+                    return !candidate.accountUuid.empty() && candidate.accountUuid != activeAccount;
+                }),
+                candidates.end()
+            );
+        }
+
         // Before any filtering: expiry and organization filters can leave
         // nothing behind, and the plan is still knowable in that case.
         planHint = HarvestPlanHint(candidates, preferredOrganizationId);
@@ -972,12 +1013,14 @@ namespace {
             system_clock::now().time_since_epoch()
         ).count());
 
+        // Desktop marks a token that drew a 401 dead by zeroing expiresAt and
+        // only trusts now < expiresAt, so 0 or a missing expiry is not usable.
         candidates.erase(
             std::remove_if(
                 candidates.begin(),
                 candidates.end(),
                 [&](const OAuthCandidate& candidate) {
-                    return candidate.expiresAtMs > 0.0 && candidate.expiresAtMs <= nowMs;
+                    return candidate.expiresAtMs <= nowMs || !candidate.canReadUsage;
                 }
             ),
             candidates.end()
@@ -1522,6 +1565,57 @@ PlanUsageSample ReadLatestPlanUsage() {
 
     sample.valid = !sample.windows.empty() || !sample.organizationId.empty();
     return sample;
+}
+
+std::vector<std::filesystem::path> UserDataCandidates() {
+    std::vector<std::filesystem::path> roots;
+
+    const auto add = [&](const std::filesystem::path& path) {
+        std::error_code ec;
+
+        if (!path.empty() && std::filesystem::is_directory(path, ec) &&
+            std::find(roots.begin(), roots.end(), path) == roots.end()) {
+            roots.push_back(path);
+        }
+    };
+
+    for (const char* variable : { "CLAUDE_DESKTOP_USER_DATA_DIR", "CLAUDE_USER_DATA_DIR" }) {
+        const std::string value = Network::get_instance()->GetEnvText(variable);
+
+        if (!value.empty()) {
+            add(std::filesystem::path(value));
+        }
+    }
+
+    const std::string localAppData = Network::get_instance()->GetEnvText("LOCALAPPDATA");
+    const std::string appData = Network::get_instance()->GetEnvText("APPDATA");
+
+    if (!localAppData.empty()) {
+        const std::filesystem::path local(localAppData);
+
+        for (const char* family : { "Claude_pzs8sxrjxfjjc", "AnthropicPBC.Claude_fnn82j28hfe8t" }) {
+            add(local / "Packages" / family / "LocalCache" / "Roaming" / "Claude");
+        }
+
+        add(local / "Claude-Data");
+
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(local / "Claude-Data", ec)) {
+            if (entry.is_directory(ec)) {
+                add(entry.path());
+            }
+        }
+    }
+
+    if (!appData.empty()) {
+        add(std::filesystem::path(appData) / "Claude");
+    }
+
+    if (!localAppData.empty()) {
+        add(std::filesystem::path(localAppData) / "Claude-3p");
+    }
+
+    return roots;
 }
 
 } // namespace ClaudeDesktopAuth

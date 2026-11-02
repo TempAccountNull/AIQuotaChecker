@@ -31,6 +31,7 @@ namespace Codex {
     struct ResetCredit {
         std::string title;
         std::string status;
+        std::string resetType;
         std::chrono::system_clock::time_point grantedAt{};
         std::chrono::system_clock::time_point expiresAt{};
     };
@@ -59,6 +60,9 @@ namespace Codex {
         std::string statusText = "Waiting for Codex auto refresh";
         std::string lastUpdated = "never";
         std::string usageNotice;
+        // What Codex is serving requests from: included, credits, reserve or
+        // unavailable. Empty when the server does not say.
+        std::string usageSource;
 
         std::vector<UsageBar> bars;
 

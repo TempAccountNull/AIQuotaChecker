@@ -1,0 +1,43 @@
+Z.Ai (ZCode 3.16.3)
+
+Main fix: 3.16.3 no longer saves the Coding Plan API key the widget relied on. It now creates a short-lived token each session, so the Individual Plan stopped working after any fresh login. The widget now makes that token the same way (reused until about two minutes before it expires). If ZCode hasn’t saved where the key lives yet, the widget looks it up read-only; it never creates a new key.
+Version: app_version is now 3.16.3.
+Newly supported: Team Coding Plans, BigModel (China) accounts, banked 5-hour and weekly quota resets, renew/expiry dates and plan names from your subscription, the models listed under each window, and Start Plan “expired” and “pending” states.
+
+Codex (26.1027)
+
+Out-of-usage fix: the widget no longer says “out of usage” while Codex is still serving you from Luna Reserve or credits. It now reads Codex’s own source signal.
+Labels: gpt-reserve now shows as “Luna Reserve”. Plan names follow the app: Pro 100 / 200 / 500, Business, Enterprise, EDU.
+App-server:
+The widget now prefers the desktop’s own bundled codex.exe (or CODEX_CLI_PATH), and allows a slower startup.
+It no longer forces a token refresh on every poll.
+The plan is taken from the live rate limits, not the possibly stale login value.
+Monthly limits: windows on the free plan now notify as monthly, not weekly. USD workspaces and the “no limit” mode now display correctly.
+Other:
+Reset credits count as usable only when “available” (fixed in check-codex-resets.ps1 too).
+Code-review limits now get their own bars.
+Session-file activity and compaction detection read the new log format.
+
+Claude Desktop (4.4212)
+
+Token cache: Desktop now prefixes every cached-token key with an account ID, so the old parser skipped every entry. It now reads them and picks the active account. A token Desktop has marked dead, or one that can’t read usage, is ignored.
+Session folder: session records were only looked for under Claude-3p. They are now found in %APPDATA%\Claude, the MSIX package folders, Claude-Data or Claude-3p.
+Limit rows:
+Fable now has its own real limit row; Claude Design used to overwrite that slot and now gets a separate row.
+5-hour, weekly and Sonnet are no longer hidden when the newer limits[] list is present.
+Fewer requests: when extra usage is off, the widget no longer makes extra follow-up calls each refresh, which should mean fewer 429s.
+Plan name: it now uses the server’s display name (your account shows “Ultra” in Desktop). It is looked up once per organization per run; whether the account response actually includes that field is unconfirmed until a live run.
+Context windows: Haiku 5.5, Opus 4.6 and Sonnet 4.6 are now 1M.
+Other additions: a non-USD currency on extra usage displays correctly, and the admin token cap used by enterprise (3P) installs appears as an extra row when that policy is set.
+
+Not implemented (minor or niche):
+
+Codex:
+data-residency routing
+the FedRAMP header
+multi-account switching
+usage-history and analytics endpoints
+the workspace credit pool
+an offline fallback that reads limits from session files
+Claude: Desktop’s extra anthropic-client-* headers, and notifications for the new extra rows.
+Z.Ai: “Highspeed” cards (per-task, not a quota) and usage history.

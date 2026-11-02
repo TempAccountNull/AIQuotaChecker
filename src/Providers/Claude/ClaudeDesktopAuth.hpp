@@ -1,9 +1,15 @@
 #pragma once
 
+#include <filesystem>
 #include <string>
 #include <vector>
 
 namespace ClaudeDesktopAuth {
+
+    // Every existing folder Claude Desktop 4.4212 may keep its userData in:
+    // explicit overrides, the MSIX package cache it redirects %APPDATA%\Claude
+    // into, Claude-Data, %APPDATA%\Claude, then the 3P build's Claude-3p.
+    std::vector<std::filesystem::path> UserDataCandidates();
 
     enum class AuthSource {
         None,
@@ -33,9 +39,11 @@ namespace ClaudeDesktopAuth {
     // read on every refresh so switching accounts cannot reuse a stale CLI token.
     Result AcquireCurrentSession();
 
-    // Claude Desktop samples its own plan usage every 4.5 minutes into
-    // userData/plan-usage-history.json (schema v2 in the shipped ASAR:
-    // { version, samples: [{ t, org, u: { <code>: percent } }] }). Reading it is
+    // Claude Desktop records its own plan usage into
+    // userData/plan-usage-history.json when its tray poller runs (every 15
+    // minutes, 5 after recent tray use, skipped while locked or idle, behind a
+    // feature gate; 4.5 minutes is only the minimum gap). Schema v2 in the ASAR:
+    // { version, samples: [{ t, org, u: { <code>: percent } }] }. Reading it is
     // pure file I/O, so it keeps working while Desktop holds its Cookies
     // database open, and the newest sample names the organization that is
     // active *now* - which is what makes an account switch visible before

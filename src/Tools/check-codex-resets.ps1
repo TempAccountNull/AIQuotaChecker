@@ -39,7 +39,7 @@ $credits = @($ledger.credits)
 
 $ledgerUsable = @(
   $credits | Where-Object {
-    $_.status -match "available|pending|active|granted"
+    $_.status -eq "available"
   }
 ).Count
 

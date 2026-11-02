@@ -539,6 +539,19 @@ namespace Codex {
         return out.str();
     }
 
+    // Spend controls count credits, or USD where the workspace's unit /
+    // balance_unit says so.
+    static bool IsUsdUnit(std::string unit) {
+        std::transform(unit.begin(), unit.end(), unit.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return unit == "usd";
+    }
+
+    static std::string FormatCodexAmount(double value, bool usd) {
+        return usd ? Format::get_instance()->Dollars(value) : FormatCreditAmount(value);
+    }
+
     static std::string EncodeUrlPathSegment(const std::string& value) {
         std::ostringstream out;
         out << std::uppercase << std::hex;
@@ -710,7 +723,7 @@ namespace Codex {
             }
             else if (lower == "rate_limit_reached") {
                 AppendUsageNotice(snapshot, reserveActive
-                    ? "Main limit reached - running on reserve"
+                    ? "Main limit reached - running on Luna Reserve"
                     : "Usage exhausted");
             }
         }
@@ -722,8 +735,13 @@ namespace Codex {
 
         if (explicitRateLimitReached && reachedType.empty()) {
             AppendUsageNotice(snapshot, reserveActive
-                ? "Main limit reached - running on reserve"
+                ? "Main limit reached - running on Luna Reserve"
                 : "Usage exhausted");
+        }
+
+        if (const json* credits = FindCreditsObject(body);
+            credits && ReadBoolFlexible(*credits, { "overage_limit_reached", "overageLimitReached" }).value_or(false)) {
+            AppendUsageNotice(snapshot, "Credit overage limit reached");
         }
 
         bool spendReached = ReadBoolFlexible(
@@ -740,6 +758,72 @@ namespace Codex {
 
         if (spendReached) {
             AppendUsageNotice(snapshot, "Monthly usage limit reached");
+        }
+    }
+
+    // What wham/usage says Codex is serving from right now. A full plan window
+    // is not "out of usage" while Luna Reserve or credits still cover requests:
+    //   ambient_usage.default.source.kind = included | credits | reserve | unavailable
+    // Older responses only carry rate_limit.allowed; mirror the app's fallback.
+    static void ParseCodexUsageSource(const json& body, Snapshot& snapshot) {
+        if (const json* ambient = FindObjectField(body, { "ambient_usage", "ambientUsage" })) {
+            if (const json* def = FindObjectField(*ambient, { "default" })) {
+                if (const json* source = FindObjectField(*def, { "source" })) {
+                    std::string kind = ReadStringFlexible(*source, { "kind" });
+                    std::transform(kind.begin(), kind.end(), kind.begin(), [](unsigned char c) {
+                        return static_cast<char>(std::tolower(c));
+                    });
+
+                    if (!kind.empty()) {
+                        snapshot.usageSource = kind;
+                        return;
+                    }
+                }
+            }
+        }
+
+        const json* rateLimit = FindObjectField(body, { "rate_limit", "rateLimit" });
+        const std::optional<bool> allowed = rateLimit
+            ? ReadBoolFlexible(*rateLimit, { "allowed" })
+            : std::nullopt;
+
+        if (!allowed) {
+            return;
+        }
+
+        const bool credits = snapshot.creditBalance.valid &&
+            (snapshot.creditBalance.hasCredits || snapshot.creditBalance.unlimited);
+
+        snapshot.usageSource = *allowed ? "included"
+            : CodexReserveActive(body) ? "reserve"
+            : credits ? "credits"
+            : "unavailable";
+    }
+
+    // A reserve or credit source means the exhausted plan is not the end of the
+    // line; the per-bucket status parser cannot see that, so restate it here.
+    static void ApplyUsageSourceNotice(Snapshot& snapshot) {
+        if (snapshot.usageSource != "reserve" && snapshot.usageSource != "credits") {
+            return;
+        }
+
+        const std::string replacement = snapshot.usageSource == "reserve"
+            ? "Main limit reached - running on Luna Reserve"
+            : "Main limit reached - running on credits";
+        const std::string separator = " · ";
+        const std::string notices = std::move(snapshot.usageNotice);
+        snapshot.usageNotice.clear();
+
+        for (size_t start = 0; start <= notices.size();) {
+            const size_t end = notices.find(separator, start);
+            const std::string part = notices.substr(start, end == std::string::npos ? std::string::npos : end - start);
+            AppendUsageNotice(snapshot, part.rfind("Usage exhausted", 0) == 0 ? replacement : part);
+
+            if (end == std::string::npos) {
+                break;
+            }
+
+            start = end + separator.size();
         }
     }
 
@@ -786,6 +870,12 @@ namespace Codex {
         const std::optional<double> explicitUsedPercent = limit
             ? ReadNumberFlexible(*limit, { "usedPercent", "used_percent" })
             : std::nullopt;
+        const std::optional<double> remainingAmount = limit
+            ? ReadNumberFlexible(*limit, { "remaining" })
+            : std::nullopt;
+        const bool usd = limit && IsUsdUnit(ReadStringFlexible(*limit, { "unit" }));
+        const std::string noun = usd ? "" : " credits";
+        const auto amount = [&](double value) { return FormatCodexAmount(std::max(0.0, value), usd); };
 
         if (!maximum && !used && !remainingPercent && !explicitUsedPercent && !reached) {
             return;
@@ -818,25 +908,24 @@ namespace Codex {
         }
 
         if (used && maximum) {
-            parsed.spentText =
-                FormatCreditAmount(std::max(0.0, *used)) +
-                " of " +
-                FormatCreditAmount(std::max(0.0, *maximum)) +
-                " credits used";
+            parsed.spentText = amount(*used) + " of " + amount(*maximum) + noun + " used";
         }
         else if (used) {
-            parsed.spentText = FormatCreditAmount(std::max(0.0, *used)) + " credits used";
+            parsed.spentText = amount(*used) + noun + " used";
         }
         else if (reached) {
             parsed.spentText = "Monthly usage limit reached";
         }
 
         if (maximum) {
-            parsed.limitText = FormatCreditAmount(std::max(0.0, *maximum)) + " credit limit";
+            parsed.limitText = amount(*maximum) + (usd ? " limit" : " credit limit");
         }
 
         if (maximum && used) {
-            parsed.remainingText = FormatCreditAmount(std::max(0.0, *maximum - *used)) + " credits remaining";
+            parsed.remainingText = amount(*maximum - *used) + noun + " remaining";
+        }
+        else if (remainingAmount) {
+            parsed.remainingText = amount(*remainingAmount) + noun + " remaining";
         }
         else if (remainingPercent) {
             parsed.remainingText = FormatPercent(
@@ -913,14 +1002,45 @@ namespace Codex {
             return;
         }
 
-        const std::optional<double> maximum = ReadNumberFlexible(
-            *effectiveLimit,
-            { "limit" }
-        );
+        // ?supports_usage_limit_modes=true adds limit_amount {unit, amount},
+        // limit_mode and balance_unit (credit | usd) beside the bare limit.
+        const json* limitAmount = FindObjectField(*effectiveLimit, { "limit_amount", "limitAmount" });
+        std::optional<double> maximum = ReadNumberFlexible(*effectiveLimit, { "limit" });
+
+        if (!maximum && limitAmount) {
+            maximum = ReadNumberFlexible(*limitAmount, { "amount" });
+        }
+
         const std::optional<double> used = ReadNumberFlexible(
             source,
             { "currentMonthUsage", "current_month_usage" }
         );
+        std::string unit = ReadStringFlexible(source, { "balance_unit", "balanceUnit" });
+
+        if (unit.empty() && limitAmount) {
+            unit = ReadStringFlexible(*limitAmount, { "unit" });
+        }
+
+        const bool usd = IsUsdUnit(unit);
+        const std::string noun = usd ? "" : " credits";
+        std::string mode = ReadStringFlexible(*effectiveLimit, { "limit_mode", "limitMode" });
+        std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+
+        // An unlimited mode has no cap to measure against: report spend only.
+        if (mode == "unlimited_platform_max") {
+            if (!used) {
+                return;
+            }
+
+            ExtraUsage parsed;
+            parsed.valid = true;
+            parsed.spentText = FormatCodexAmount(std::max(0.0, *used), usd) + noun + " used";
+            parsed.limitText = "No monthly limit";
+            snapshot.extraUsage = std::move(parsed);
+            return;
+        }
 
         // Codex's usage settings require both values. A missing limit or used
         // amount means the monthly row is unavailable, not zero usage.
@@ -940,14 +1060,10 @@ namespace Codex {
                 : Math::get_instance()->ClampPercentDouble((safeUsed / safeMaximum) * 100.0)
         );
         parsed.spentText =
-            FormatCreditAmount(safeUsed) +
-            " of " +
-            FormatCreditAmount(safeMaximum) +
-            " credits used";
-        parsed.limitText = FormatCreditAmount(safeMaximum) + " credit limit";
+            FormatCodexAmount(safeUsed, usd) + " of " + FormatCodexAmount(safeMaximum, usd) + noun + " used";
+        parsed.limitText = FormatCodexAmount(safeMaximum, usd) + (usd ? " limit" : " credit limit");
         parsed.remainingText =
-            FormatCreditAmount(std::max(0.0, safeMaximum - safeUsed)) +
-            " credits remaining";
+            FormatCodexAmount(std::max(0.0, safeMaximum - safeUsed), usd) + noun + " remaining";
 
         std::chrono::system_clock::time_point resetAt = ParseResetAtField(source);
 
@@ -1174,6 +1290,7 @@ namespace Codex {
 
         reset.title = ReadStringFlexible(credit, { "title", "name" });
         reset.status = ReadStringFlexible(credit, { "status" });
+        reset.resetType = ReadStringFlexible(credit, { "reset_type", "resetType" });
 
         for (const char* key : { "granted_at", "grantedAt" }) {
             if (credit.contains(key) && !credit.at(key).is_null()) {
@@ -1311,25 +1428,23 @@ namespace Codex {
         std::string lower = raw;
         std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
-        if (lower == "prolite") {
-            return "Codex Pro 5x";
-        }
+        const auto startsWith = [&](const char* prefix) { return lower.rfind(prefix, 0) == 0; };
 
-        if (lower == "pro") {
-            return "Codex Pro 20x";
-        }
-
-        if (lower == "plus") {
-            return "Codex Plus";
-        }
-
-        if (lower == "team") {
-            return "Codex Team";
-        }
-
-        if (lower == "enterprise") {
+        // Codex Desktop 26.1027 labels. The Pro numbers are fixed SKU names, and
+        // "business" is Enterprise CBP - the self-serve Business plan is "team".
+        if (lower == "prolite") return "Codex Pro 100";
+        if (lower == "pro") return "Codex Pro 200";
+        if (lower == "promax") return "Codex Pro 500";
+        if (lower == "free_workspace") return "Codex Business Free";
+        if (lower == "team" || startsWith("self_serve_business")) return "Codex Business";
+        if (lower == "business" || lower == "enterprise" || lower == "deprecated_enterprise" || lower == "ent26" ||
+            startsWith("enterprise_cbp") || startsWith("hc") || lower == "finserv" || lower == "law") {
             return "Codex Enterprise";
         }
+        if (lower == "education" || lower == "deprecated_edu" || startsWith("edu")) return "Codex EDU";
+        if (lower == "k12") return "Codex for Teachers";
+        if (lower == "quorum") return "Codex for Clinicians";
+        if (startsWith("sci") || lower == "rosalind_academic") return "Codex Academic Researchers";
 
         return "Codex " + TitleCasePlanToken(raw);
     }
@@ -1360,20 +1475,16 @@ namespace Codex {
         const json& accountResult,
         const json& rateLimit
     ) {
-        if (accountResult.is_object() &&
-            accountResult.contains("account") &&
-            accountResult.at("account").is_object()) {
-            const std::string accountPlan = ReadStringFlexible(
-                accountResult.at("account"),
-                { "planType", "plan_type", "plan" }
-            );
+        // The live rate-limit plan wins: Codex Desktop treats account/read's
+        // planType as planAtLogin, which goes stale after an upgrade.
+        const std::string livePlan = ReadStringFlexible(rateLimit, { "planType", "plan_type", "plan" });
 
-            if (!accountPlan.empty()) {
-                return accountPlan;
-            }
+        if (!livePlan.empty() || !accountResult.is_object() ||
+            !accountResult.contains("account") || !accountResult.at("account").is_object()) {
+            return livePlan;
         }
 
-        return ReadStringFlexible(rateLimit, { "planType", "plan_type", "plan" });
+        return ReadStringFlexible(accountResult.at("account"), { "planType", "plan_type", "plan" });
     }
 
     static std::string HumanizeIdentifier(std::string text) {
@@ -1489,17 +1600,32 @@ namespace Codex {
         return out;
     }
 
+    // Codex Desktop shows the "gpt-reserve" pool (limit id base_model_inference)
+    // as "Luna Reserve".
+    static bool IsCodexReserveName(std::string name) {
+        name.erase(std::remove_if(name.begin(), name.end(), [](unsigned char c) {
+            return std::isalnum(c) == 0;
+        }), name.end());
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return name == "gptreserve" || name == "basemodelinference" || name == "lunareserve";
+    }
+
     static std::string AppServerRateLimitName(const json& rateLimit, const std::string& fallbackKey) {
         // limit_name arrives already display-cased from the server; running it
         // through HumanizeIdentifier was destroying it (hyphens to spaces, then
         // "5.3" split into "5 3"). Only the id/key fallbacks are real slugs.
         const std::string display = ReadStringFlexible(rateLimit, { "limitName", "limit_name" });
+        std::string slug = ReadStringFlexible(rateLimit, { "limitId", "limit_id" });
+
+        if (IsCodexReserveName(display) || (display.empty() && IsCodexReserveName(slug.empty() ? fallbackKey : slug))) {
+            return "Luna Reserve";
+        }
 
         if (!display.empty()) {
             return FormatCodexLimitName(display);
         }
-
-        std::string slug = ReadStringFlexible(rateLimit, { "limitId", "limit_id" });
 
         if (slug.empty()) {
             slug = fallbackKey;
@@ -1898,6 +2024,7 @@ namespace Codex {
             ResetCredit reset;
             reset.title = ReadStringFlexible(credit, { "title", "name" });
             reset.status = ReadStringFlexible(credit, { "status" });
+            reset.resetType = ReadStringFlexible(credit, { "resetType", "reset_type" });
 
             for (const char* key : { "grantedAt", "granted_at" }) {
                 if (credit.contains(key) && !credit.at(key).is_null()) {
@@ -2014,6 +2141,25 @@ namespace Codex {
 
         ParseCodexChatPass(result, snapshot);
         ParseCodexSidebarWarnings(result, snapshot);
+
+        // ordinaryUsageAllowed=false with Luna Reserve left is the reserve
+        // state; credits can also keep the account working.
+        if (const std::optional<bool> ordinary = ReadBoolFlexible(
+                result, { "ordinaryUsageAllowed", "ordinary_usage_allowed" })) {
+            const bool reserveLeft = std::any_of(snapshot.bars.begin(), snapshot.bars.end(), [](const UsageBar& bar) {
+                return bar.valid && bar.label.rfind("Luna Reserve", 0) == 0 &&
+                    !UsageTelemetry::IsExhausted(bar.usedPercent);
+            });
+            const bool credits = snapshot.creditBalance.valid &&
+                (snapshot.creditBalance.hasCredits || snapshot.creditBalance.unlimited);
+
+            snapshot.usageSource = *ordinary ? "included"
+                : reserveLeft ? "reserve"
+                : credits ? "credits"
+                : "unavailable";
+            ApplyUsageSourceNotice(snapshot);
+        }
+
         ParseAppServerResetCredits(result, snapshot);
         return snapshot;
     }
@@ -2098,6 +2244,9 @@ namespace Codex {
 
         if (name.empty()) {
             name = AppServerRateLimitName(*body, fallbackName);
+        }
+        else if (IsCodexReserveName(name)) {
+            name = "Luna Reserve";
         }
         else {
             name = HumanizeIdentifier(TrimAscii(name));
@@ -2229,6 +2378,20 @@ namespace Codex {
         // utilization percentage and hide absent/null windows.
         ParseLegacyAdditionalRateLimits(usageJson, snapshot);
 
+        // Code review has its own pool; it never blocks ordinary Codex work.
+        if (const json* codeReview = FindObjectField(usageJson, { "code_review_rate_limit", "codeReviewRateLimit" })) {
+            ParseLegacyRateLimitWindows(*codeReview, "Code review", false, snapshot);
+        }
+
+        // The server's own warning copy, e.g. "You've used 90% of your weekly limit".
+        if (const json* warning = FindObjectField(usageJson, { "rate_limit_warning", "rateLimitWarning" })) {
+            const std::string title = ReadStringFlexible(*warning, { "title" });
+            const std::string description = ReadStringFlexible(*warning, { "description" });
+            AppendUsageNotice(snapshot, title.empty() || description.empty() ? title + description : title + ": " + description);
+        }
+
+        ParseCodexUsageSource(usageJson, snapshot);
+        ApplyUsageSourceNotice(snapshot);
         ParseResetCredits(resetJson, snapshot);
         return snapshot;
     }
@@ -2444,13 +2607,29 @@ namespace Codex {
                 L"Accept: application/json\r\n"
                 L"Origin: https://chatgpt.com\r\n"
                 L"Referer: https://chatgpt.com/codex\r\n"
-                L"originator: Codex Desktop\r\n";
+                L"originator: Codex Desktop\r\n"
+                // Codex Desktop 26.1027 sends these with every wham call.
+                L"User-Agent: Codex Desktop/26.1027.30824 (Windows NT 10.0; x64)\r\n"
+                L"OAI-App-Brand: chatgpt\r\n"
+                L"x-openai-codex-pricing-chooser: 1\r\n";
         };
 
+        // CODEX_API_BASE_URL moves the backend, as it does for Codex Desktop.
+        std::string apiBase = TrimAscii(Network::get_instance()->GetEnvText("CODEX_API_BASE_URL"));
+
+        while (!apiBase.empty() && apiBase.back() == '/') {
+            apiBase.pop_back();
+        }
+
+        if (apiBase.empty()) {
+            apiBase = "https://chatgpt.com/backend-api";
+        }
+
+        const std::string usageUrl = apiBase + "/wham/usage";
         std::wstring headers = buildHeaders(accessToken);
 
         Network::HttpResponse usage = Network::get_instance()->RequestUrl(
-            "https://chatgpt.com/backend-api/wham/usage",
+            usageUrl,
             "GET",
             headers
         );
@@ -2475,7 +2654,7 @@ namespace Codex {
                         accessToken = currentToken;
                         headers = buildHeaders(accessToken);
                         usage = Network::get_instance()->RequestUrl(
-                            "https://chatgpt.com/backend-api/wham/usage",
+                            usageUrl,
                             "GET",
                             headers
                         );
@@ -2491,7 +2670,7 @@ namespace Codex {
                 if (RefreshCodexTokens(authPath, auth, accessToken, refreshDetail)) {
                     headers = buildHeaders(accessToken);
                     usage = Network::get_instance()->RequestUrl(
-                        "https://chatgpt.com/backend-api/wham/usage",
+                        usageUrl,
                         "GET",
                         headers
                     );
@@ -2507,17 +2686,18 @@ namespace Codex {
         }
 
         Network::HttpResponse resets = Network::get_instance()->RequestUrl(
-            "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+            apiBase + "/wham/rate-limit-reset-credits",
             "GET",
             headers
         );
 
+        // The usage-limit-modes flag adds limit_mode / limit_amount / balance_unit.
         Network::HttpResponse monthlyUsage = Network::get_instance()->RequestUrl(
-            "https://chatgpt.com/backend-api/accounts/" +
+            apiBase + "/accounts/" +
                 EncodeUrlPathSegment(safeAccountId) +
-                "/spend-controls/current-user/monthly-usage",
+                "/spend-controls/current-user/monthly-usage?supports_usage_limit_modes=true",
             "GET",
-            headers
+            headers + L"Cache-Control: no-store\r\nPragma: no-cache\r\n"
         );
 
         json resetJson = json::object();
@@ -2697,6 +2877,8 @@ namespace Codex {
         long long totalTokens = 0;
         long long inputTokens = 0;
         long long cachedInputTokens = 0;
+        // Present from Codex 26.1027 (-1 = not reported).
+        long long cacheWriteInputTokens = -1;
         long long outputTokens = 0;
         long long reasoningOutputTokens = 0;
         long long modelContextWindow = 0;
@@ -2958,6 +3140,9 @@ namespace Codex {
             *last,
             { "cached_input_tokens", "cachedInputTokens" }
         );
+        if (ReadNumberFlexible(*last, { "cache_write_input_tokens", "cacheWriteInputTokens" })) {
+            usage.cacheWriteInputTokens = readCount(*last, { "cache_write_input_tokens", "cacheWriteInputTokens" });
+        }
         usage.outputTokens = readCount(*last, { "output_tokens", "outputTokens" });
         usage.reasoningOutputTokens = readCount(
             *last,
@@ -3150,7 +3335,8 @@ namespace Codex {
                 candidate.find("exec_command") != std::string::npos ||
                 candidate.find("execCommand") != std::string::npos ||
                 candidate.find("token_count") != std::string::npos ||
-                candidate.find("tokenCount") != std::string::npos;
+                candidate.find("tokenCount") != std::string::npos ||
+                candidate.find("item_completed") != std::string::npos;
 
             if (!mayAffectRun) {
                 continue;
@@ -3163,9 +3349,26 @@ namespace Codex {
 
             const long long at = CodexRecordUnixSeconds(record);
             const json* payload = FindObjectField(record, { "payload" });
-            const std::string type = payload
+            std::string type = payload
                 ? UsageTelemetry::LowerCopy(ReadStringFlexible(*payload, { "type" }))
                 : std::string{};
+
+            // Since Codex 26.1027 activity arrives as event_msg item_completed
+            // { item: { type: UserMessage | Reasoning | AgentMessage |
+            // CommandExecution | Extension } }; map it onto the old event names.
+            if (type == "item_completed" || type == "itemcompleted") {
+                const json* item = FindObjectField(*payload, { "item" });
+                const std::string itemType = item
+                    ? UsageTelemetry::LowerCopy(ReadStringFlexible(*item, { "type" }))
+                    : std::string{};
+                // A UserMessage item lands after task_started; it must not restart
+                // a running turn, so it maps to the start-if-idle event.
+                type = itemType == "usermessage" ? "turn_started"
+                    : itemType == "reasoning" ? "agent_reasoning"
+                    : itemType == "agentmessage" ? "agent_message"
+                    : itemType == "commandexecution" || itemType == "extension" ? "exec_command"
+                    : std::string{};
+            }
 
             const CodexTokenUsageRecord tokenUsage = ParseCodexTokenUsageRecord(record);
             if (tokenUsage.valid) {
@@ -3297,6 +3500,20 @@ namespace Codex {
             }
 
             const long long at = CodexRecordUnixSeconds(record);
+
+            // Codex 26.1027 records a finished compaction as a single
+            // response_item { payload: { type: "compaction" } }, with no start event.
+            if (const json* payload = FindObjectField(record, { "payload" });
+                payload && UsageTelemetry::LowerCopy(ReadStringFlexible(*payload, { "type" })) == "compaction") {
+                compacting = false;
+                context.compactionStartedAtUnixSeconds = at;
+                context.compactionCompletedAtUnixSeconds = at;
+                preCompactionTokens = lastRetainedTokens;
+                context.compactionPreTokens = preCompactionTokens;
+                waitingForPostCompactionUsage = preCompactionTokens > 0;
+                continue;
+            }
+
             const bool wasCompacting = compacting;
             const bool stateChanged = CodexCompactionStateFromRecord(record, compacting);
 
@@ -3382,6 +3599,17 @@ namespace Codex {
 
                 context.inputTokens = usage.inputTokens;
                 context.cachedInputTokens = usage.cachedInputTokens;
+                if (usage.cacheWriteInputTokens >= 0) {
+                    // Newer rollouts report cache writes too, enough for the cache card.
+                    context.cacheStatsValid = true;
+                    context.cacheInputTokens = usage.inputTokens;
+                    context.cacheReadTokens = usage.cachedInputTokens;
+                    context.cacheWriteTokens = usage.cacheWriteInputTokens;
+                    context.latestCacheHitPercentValid = usage.inputTokens > 0;
+                    context.latestCacheHitPercent = usage.inputTokens > 0
+                        ? 100.0 * static_cast<double>(usage.cachedInputTokens) / static_cast<double>(usage.inputTokens)
+                        : 0.0;
+                }
                 context.outputTokens = usage.outputTokens;
                 context.reasoningOutputTokens = usage.reasoningOutputTokens;
                 latestTotalTokens = usage.totalTokens;
@@ -3562,6 +3790,19 @@ namespace Codex {
         if (monthlySpendReached) {
             snapshot.access.state = UsageTelemetry::AccessState::OutOfUsage;
             snapshot.access.detail = "Monthly usage/credits exhausted";
+        }
+        else if (snapshot.usageSource == "reserve" || snapshot.usageSource == "credits") {
+            // Codex keeps serving from these after the plan windows run out.
+            UsageTelemetry::SetAvailable(snapshot.access, snapshot.usageSource == "reserve"
+                ? "Plan usage is used up; Codex is running on Luna Reserve"
+                : "Plan usage is used up; Codex is running on credits");
+        }
+        else if (snapshot.usageSource == "unavailable") {
+            snapshot.access.state = UsageTelemetry::AccessState::OutOfUsage;
+            snapshot.access.detail = snapshot.usageNotice.empty() ? "Usage exhausted" : snapshot.usageNotice;
+        }
+        else if (snapshot.usageSource == "included") {
+            // The server says ordinary usage is still allowed.
         }
         else {
             std::vector<std::string> exhaustedRateLimits;

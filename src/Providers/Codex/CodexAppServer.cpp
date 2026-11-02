@@ -16,6 +16,9 @@ namespace CodexAppServer {
 namespace {
 
     constexpr DWORD kRequestTimeoutMilliseconds = 15000;
+    // Codex Desktop warns that app-server startup "may take several minutes"
+    // (it can rebuild its SQLite state), so the handshake gets longer.
+    constexpr DWORD kInitializeTimeoutMilliseconds = 60000;
     constexpr size_t kMaximumBufferedOutput = 4u * 1024u * 1024u;
     constexpr size_t kMaximumDiagnosticOutput = 16u * 1024u;
 
@@ -99,10 +102,44 @@ namespace {
         return std::wstring(buffer.data(), length);
     }
 
-    static std::wstring FindCodexExecutable() {
-        std::string configured = Network::get_instance()->GetEnvText("CODEX_EXECUTABLE");
+    // Codex Desktop copies its bundled CLI to
+    // %LOCALAPPDATA%\OpenAI\Codex\bin\<16 hex>\codex.exe. That copy matches the
+    // desktop's protocol; a codex.exe on PATH can be an older standalone CLI.
+    static std::wstring DesktopBundledCodex(const std::string& localAppData) {
+        std::error_code ec;
+        const std::filesystem::path bin = std::filesystem::path(localAppData) / "OpenAI" / "Codex" / "bin";
+        std::wstring newest;
+        std::filesystem::file_time_type newestTime{};
 
-        if (!configured.empty()) {
+        for (const auto& entry : std::filesystem::directory_iterator(bin, ec)) {
+            const std::wstring name = entry.path().filename().wstring();
+            const bool hashDirectory = name.size() == 16 &&
+                std::all_of(name.begin(), name.end(), [](wchar_t c) { return std::iswxdigit(c) != 0; });
+            const std::filesystem::path exe = entry.path() / "codex.exe";
+
+            if (!hashDirectory || !std::filesystem::is_regular_file(exe, ec)) {
+                continue;
+            }
+
+            const auto time = std::filesystem::last_write_time(exe, ec);
+            if (!ec && (newest.empty() || time > newestTime)) {
+                newest = exe.wstring();
+                newestTime = time;
+            }
+        }
+
+        return newest;
+    }
+
+    static std::wstring FindCodexExecutable() {
+        // CODEX_CLI_PATH is the variable Codex Desktop itself honours.
+        for (const char* variable : { "CODEX_EXECUTABLE", "CODEX_CLI_PATH" }) {
+            std::string configured = Network::get_instance()->GetEnvText(variable);
+
+            if (configured.empty()) {
+                continue;
+            }
+
             std::wstring candidate = TrimQuotes(Network::get_instance()->Utf8ToWide(configured));
 
             if (!candidate.empty() && std::filesystem::exists(candidate)) {
@@ -115,12 +152,19 @@ namespace {
             }
         }
 
+        std::string localAppData = Network::get_instance()->GetEnvText("LOCALAPPDATA");
+        if (!localAppData.empty()) {
+            std::wstring bundled = DesktopBundledCodex(localAppData);
+            if (!bundled.empty()) {
+                return bundled;
+            }
+        }
+
         std::wstring found = SearchExecutable(L"codex.exe");
         if (!found.empty()) {
             return found;
         }
 
-        std::string localAppData = Network::get_instance()->GetEnvText("LOCALAPPDATA");
         if (!localAppData.empty()) {
             std::filesystem::path candidate =
                 std::filesystem::path(localAppData) /
@@ -532,6 +576,11 @@ Result ReadCurrentAccountRateLimits() {
                 { "name", "ai_quota_checker" },
                 { "title", "AI Quota Checker" },
                 { "version", "1.0.0" }
+            } },
+            // Same minimal capabilities as Codex Desktop's secondary client.
+            { "capabilities", {
+                { "experimentalApi", true },
+                { "requestAttestation", false }
             } }
         } }
     };
@@ -541,8 +590,9 @@ Result ReadCurrentAccountRateLimits() {
     }
 
     json initializeResponse;
-    if (!server.WaitForResponse(1, initializeResponse, kRequestTimeoutMilliseconds, detail)) {
-        return Failure(ResultKind::Error, detail);
+    if (!server.WaitForResponse(1, initializeResponse, kInitializeTimeoutMilliseconds, detail)) {
+        // A server that never answers is unavailable, so Auto mode can fall back.
+        return Failure(detail.rfind("Timed out", 0) == 0 ? ResultKind::Unavailable : ResultKind::Error, detail);
     }
 
     std::string initializeError = ErrorMessage(initializeResponse);
@@ -557,10 +607,12 @@ Result ReadCurrentAccountRateLimits() {
         return Failure(ResultKind::Error, detail);
     }
 
+    // Codex Desktop never forces a refresh here; true rotated the refresh
+    // token on every poll.
     if (!server.Send(json{
         { "method", "account/read" },
         { "id", 2 },
-        { "params", { { "refreshToken", true } } }
+        { "params", { { "refreshToken", false } } }
     }, detail)) {
         return Failure(ResultKind::Error, detail);
     }

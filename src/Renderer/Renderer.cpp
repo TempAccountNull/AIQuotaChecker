@@ -1358,11 +1358,9 @@ static bool IsUsableResetCreditStatus(const std::string& status)
     std::transform(lower.begin(), lower.end(), lower.begin(),
         [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
-    return lower.empty()
-        || lower == "available"
-        || lower == "pending"
-        || lower == "active"
-        || lower == "granted";
+    // Codex 26.1027 statuses are available, redeeming and redeemed; only
+    // available can still be spent.
+    return lower.empty() || lower == "available";
 }
 
 static void DrawCodexResetCreditsCard(const Codex::Snapshot& snapshot, float cardWidth) {
@@ -1428,6 +1426,11 @@ static void DrawCodexResetCreditsCard(const Codex::Snapshot& snapshot, float car
             if (!credit.title.empty()) {
                 left += " · ";
                 left += credit.title;
+            }
+
+            if (!credit.resetType.empty()) {
+                left += " · ";
+                left += credit.resetType;
             }
 
             std::string expires = credit.expiresAt.time_since_epoch().count() != 0
@@ -3299,6 +3302,7 @@ static void RenderCodexSections(const Codex::Snapshot& snapshot)
             if (when.empty() && credit.title.empty()) continue;
 
             std::string line = credit.title.empty() ? std::string("Credit") : credit.title;
+            if (!credit.resetType.empty()) line += " (" + credit.resetType + ")";
             if (!when.empty()) line += "  ·  " + when;
             lines.push_back(std::move(line));
         }
