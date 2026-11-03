@@ -2267,10 +2267,31 @@ static void RenderZAiSections(const ZAi::Snapshot& snapshot)
     PanelModelSection(snapshot.context, "Z.Ai");
 }
 
+// What the CLI's /usage prints: prepaid credits with their auto top-up, then
+// the legacy pay-as-you-go spend against its cap.
 static std::vector<std::string> GrokCreditCardLines(const Grok::Snapshot& s)
 {
-    if (!s.extraCredits.valid) return {};
-    return { "Balance: " + s.extraCredits.balanceText, "Used: " + s.extraCredits.usedText };
+    const Grok::ExtraCredits& credits = s.extraCredits;
+    if (!credits.valid) return {};
+
+    std::vector<std::string> lines;
+    if (!credits.balanceText.empty()) {
+        lines.push_back("Credits: " + credits.balanceText);
+
+        const Grok::AutoTopUp& topUp = credits.autoTopUp;
+        if (topUp.valid && !topUp.enabled) {
+            lines.push_back("Auto top-up: off");
+        }
+        else if (topUp.valid) {
+            std::string line = "Auto top-up: " + (topUp.amountText.empty() ? std::string("on") : topUp.amountText);
+            if (!topUp.monthlyLimitText.empty()) line += " · max " + topUp.monthlyLimitText + " a month";
+            lines.push_back(std::move(line));
+        }
+    }
+    if (!credits.capText.empty()) {
+        lines.push_back("Pay-as-you-go: " + credits.usedText + " of " + credits.capText);
+    }
+    return lines;
 }
 
 static void RenderGrokSections(const Grok::Snapshot& snapshot)
@@ -2298,6 +2319,7 @@ static void RenderGrokSections(const Grok::Snapshot& snapshot)
     }
     if (PanelShows(AppSettings::WidgetSectionExtra)) {
         PanelInfoCard("Credits", GrokCreditCardLines(snapshot), "Grok");
+        PanelInfoCard("Billing history", snapshot.history, "Grok");
     }
 
     PanelContextSection(snapshot.context, "Grok");
@@ -3649,6 +3671,7 @@ static std::vector<WidgetPeek> BuildWidgetPeekCandidates()
         push(ContextPeek("Grok", plan, s.context));
 
         addInfo("Grok", "Credits", GrokCreditCardLines(s), plan);
+        addInfo("Grok", "Billing history", s.history, plan);
         addCommonInfo("Grok", plan, PlanCardLines("Grok", s.plan, s.statusText), UsageTelemetry::RunUsage{}, s.context);
     }
 

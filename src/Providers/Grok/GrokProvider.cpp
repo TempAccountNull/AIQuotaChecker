@@ -2,6 +2,7 @@
 #include "GrokProvider.hpp"
 
 #include "Network.hpp"
+#include "Text.hpp"
 
 #include <exception>
 #include <string>
@@ -116,7 +117,8 @@ void GrokProvider::PollNotifications()
         if (m_snapshot.weeklyLimit.valid) {
             QuotaNotifier::Point point;
             point.key = "weekly";
-            point.name = "weekly limit";
+            // "weekly limit", or "monthly limit" on a monthly billing period.
+            point.name = Text::get_instance()->ToLowerCopy(m_snapshot.weeklyLimit.title);
             point.usedPercent = m_snapshot.weeklyLimit.usedPercent;
             point.resetAtUnixSeconds = m_snapshot.weeklyLimit.resetAtUnixSeconds;
             point.rule = m_quotaWarnings.weekly;

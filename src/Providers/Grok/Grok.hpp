@@ -10,19 +10,31 @@ namespace Grok
     struct UsageWindow
     {
         std::string title;
-        std::string subtitle;
         std::string resetText;
         float usedPercent = 0.0f;
         long long resetAtUnixSeconds = 0;
         bool valid = false;
     };
 
+    // Auto top-up of prepaid credits. Read only while the account holds
+    // credits, as the CLI does; invalid when unknown.
+    struct AutoTopUp
+    {
+        bool valid = false;
+        bool enabled = false;
+        std::string amountText;
+        std::string monthlyLimitText; // Empty: no monthly maximum.
+    };
+
+    // Money beyond the plan allowance: prepaid credits and the legacy
+    // pay-as-you-go cap. Empty texts are the parts the account doesn't have.
     struct ExtraCredits
     {
         bool valid = false;
-        std::string balanceText = "$0.00";
-        std::string usedText = "$0.00";
-        float usedPercent = 0.0f;
+        std::string balanceText;
+        std::string usedText;
+        std::string capText;
+        AutoTopUp autoTopUp;
     };
 
     struct ProductUsage
@@ -40,6 +52,8 @@ namespace Grok
         UsageWindow weeklyLimit;
         ExtraCredits extraCredits;
         std::vector<ProductUsage> products;
+        // Past billing periods, newest first, as display lines.
+        std::vector<std::string> history;
         UsageTelemetry::AccessStatus access;
         UsageTelemetry::ContextUsage context;
     };
