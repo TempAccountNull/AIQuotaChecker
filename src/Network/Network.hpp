@@ -27,6 +27,10 @@ namespace Network
         std::filesystem::path UserProfilePath() const;
         std::string ReadTextFile(const std::filesystem::path& path) const;
         std::string ReadRequiredTextFile(const std::filesystem::path& path) const;
+        // The last maxBytes of a file another process is writing (opened with
+        // full sharing, read-only), starting at the first whole line; empty
+        // when it can't be read.
+        std::string ReadFileTail(const std::filesystem::path& path, unsigned long long maxBytes) const;
         std::wstring Utf8ToWide(const std::string& value) const;
         std::string StripHeaderValue(std::string value) const;
 

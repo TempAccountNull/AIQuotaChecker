@@ -84,8 +84,11 @@ void GrokProvider::RefreshAsync()
                 self->HandleRateLimit(snapshot.statusText);
             }
 
+            // The session readings are RefreshContextAsync's; keep them.
             std::lock_guard<std::mutex> lock(*self->StateMutex());
-            *self->Snapshot() = snapshot;
+            snapshot.context = std::move(self->Snapshot()->context);
+            snapshot.sessionUsage = std::move(self->Snapshot()->sessionUsage);
+            *self->Snapshot() = std::move(snapshot);
         }
         catch (const std::exception& e) {
             std::string error = std::string("Grok error: ") + e.what();
@@ -100,10 +103,40 @@ void GrokProvider::RefreshAsync()
             failedSnapshot.access = UsageTelemetry::FromText(error);
 
             std::lock_guard<std::mutex> lock(*self->StateMutex());
-            *self->Snapshot() = failedSnapshot;
+            failedSnapshot.context = std::move(self->Snapshot()->context);
+            failedSnapshot.sessionUsage = std::move(self->Snapshot()->sessionUsage);
+            *self->Snapshot() = std::move(failedSnapshot);
         }
 
         *self->Loading() = false;
+    }).detach();
+}
+
+void GrokProvider::RefreshContextAsync()
+{
+    if (m_contextLoading.exchange(true)) {
+        return;
+    }
+
+    std::thread([] {
+        GrokProvider* self = GrokProvider::get_instance();
+
+        try {
+            Grok::LocalSession local = Grok::ReadLocalSession();
+            std::lock_guard<std::mutex> lock(*self->StateMutex());
+
+            // A file caught mid-rename, or a new session before its first
+            // reply, keeps the last reading rather than blanking the card.
+            if (local.context.valid) {
+                self->Snapshot()->context = std::move(local.context);
+                self->Snapshot()->sessionUsage = std::move(local.usageLines);
+            }
+        }
+        catch (...) {
+            // Passive local telemetry never disturbs the quota snapshot.
+        }
+
+        self->m_contextLoading = false;
     }).detach();
 }
 

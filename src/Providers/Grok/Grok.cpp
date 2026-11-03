@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstdlib>
 #include <ctime>
@@ -16,6 +17,8 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <vector>
 
 namespace Grok
@@ -421,6 +424,241 @@ namespace Grok
 
             return error.empty() ? body.substr(0, 240) : error;
         }
+
+        // Cost ticks are 1e10 per USD (status_blocks.rs format_cost).
+        constexpr double kTicksPerUsd = 1e10;
+        constexpr unsigned long long kUpdatesTailBytes = 256 * 1024;
+        // Grok cuts a compaction after 300 s by default; a start this old with
+        // no end was abandoned (grok exited mid-compaction).
+        constexpr long long kCompactionStaleSeconds = 600;
+
+        static Json ReadJson(const std::filesystem::path& path)
+        {
+            return JsonUtils::get_instance()->ParseOrNull(Network::get_instance()->ReadTextFile(path));
+        }
+
+        // The newest top-level session folder. Grok renames a temp file over
+        // signals.json, usage.json and summary.json, so a folder's own write
+        // time moves with its session; subagents live inside their parent's.
+        static std::filesystem::path NewestSessionDir(const std::filesystem::path& sessions)
+        {
+            std::filesystem::path newest;
+            std::filesystem::file_time_type newestTime = std::filesystem::file_time_type::min();
+            std::error_code ec;
+
+            for (const std::filesystem::directory_entry& cwd : std::filesystem::directory_iterator(sessions, ec)) {
+                std::error_code entryError;
+
+                if (!cwd.is_directory(entryError)) {
+                    continue;
+                }
+
+                for (const std::filesystem::directory_entry& session :
+                    std::filesystem::directory_iterator(cwd.path(), entryError)) {
+                    std::error_code timeError;
+                    const std::filesystem::file_time_type written = session.last_write_time(timeError);
+
+                    if (!timeError && written > newestTime && session.is_directory(timeError)) {
+                        newest = session.path();
+                        newestTime = written;
+                    }
+                }
+            }
+
+            return newest;
+        }
+
+        // models_cache.json's entry for a model: name, context_window and
+        // auto_compact_threshold_percent, as /v1/models last returned them.
+        static const Json* CachedModel(const Json& cache, const std::string& id)
+        {
+            const Json* models = JsonUtils::get_instance()->FindObject(cache, { "models" });
+            const Json* model = models && !id.empty()
+                ? JsonUtils::get_instance()->FindObject(*models, { id.c_str() })
+                : nullptr;
+
+            return model ? JsonUtils::get_instance()->FindObject(*model, { "info" }) : nullptr;
+        }
+
+        // resolve_auto_compact_threshold_percent's tiers: the environment, the
+        // user's TOML, the server's per-model then global value, else 85. That
+        // TOML isn't parsed here, so a threshold set in it leaves the trigger
+        // unknown rather than wrong.
+        static std::optional<int> AutoCompactPercent(const Json* model)
+        {
+            const std::string env = Network::get_instance()->EnvText("GROK_AUTO_COMPACT_THRESHOLD_PERCENT");
+            int percent = -1;
+            const auto [parsedTo, error] = std::from_chars(env.data(), env.data() + env.size(), percent);
+
+            if (!env.empty() && error == std::errc() && parsedTo == env.data() + env.size() &&
+                percent >= 0 && percent <= 100) {
+                return percent;
+            }
+
+            for (const char* file : { "config.toml", "managed_config.toml" }) {
+                const std::string toml = Network::get_instance()->ReadTextFile(GrokHome() / file);
+
+                if (toml.find("auto_compact_threshold_percent") != std::string::npos) {
+                    return std::nullopt;
+                }
+            }
+
+            if (model) {
+                if (const std::optional<double> perModel = JsonUtils::get_instance()->NumberOpt(*model, "auto_compact_threshold_percent")) {
+                    return static_cast<int>(*perModel);
+                }
+            }
+
+            const Json payload = JsonUtils::get_instance()->ParseOrNull(JsonUtils::get_instance()->String(
+                ReadJson(GrokHome() / "settings_cache.json"), "payload"));
+
+            if (const Json* settings = JsonUtils::get_instance()->FindObject(payload, { "settings" })) {
+                if (const std::optional<double> global = JsonUtils::get_instance()->NumberOpt(*settings, "auto_compact_threshold_percent")) {
+                    return static_cast<int>(*global);
+                }
+            }
+
+            return 85;
+        }
+
+        // Newest line first, the end of updates.jsonl gives the live context
+        // size (each streamed chunk's _meta.totalTokens, which Grok saves as
+        // contextTokensUsed when the turn ends, or a compaction's result) and
+        // the latest auto-compaction.
+        static void ApplyUpdatesTail(const std::string& tail, long long nowUnixSeconds,
+            UsageTelemetry::ContextUsage& context)
+        {
+            bool haveUsed = false;
+            bool haveCompaction = false;
+
+            for (size_t end = tail.size(); end > 0 && !(haveUsed && haveCompaction);) {
+                const size_t newline = tail.rfind('\n', end - 1);
+                const size_t start = newline == std::string::npos ? 0 : newline + 1;
+                const std::string_view line(tail.data() + start, end - start);
+                end = newline == std::string::npos ? 0 : newline;
+
+                // auto_compact_* and auto_continue_completed.
+                const bool compactionLine = line.find("\"auto_co") != std::string_view::npos;
+
+                if (!compactionLine && (haveUsed || line.find("\"totalTokens\"") == std::string_view::npos)) {
+                    continue;
+                }
+
+                const Json root = JsonUtils::get_instance()->ParseOrNull(std::string(line));
+                const Json* params = JsonUtils::get_instance()->FindObject(root, { "params" });
+
+                if (!params) {
+                    continue;
+                }
+
+                const Json* update = JsonUtils::get_instance()->FindObject(*params, { "update" });
+                const Json* meta = JsonUtils::get_instance()->FindObject(*params, { "_meta" });
+                const std::string kind = update ? JsonUtils::get_instance()->String(*update, "sessionUpdate") : std::string();
+
+                if (!haveUsed) {
+                    std::optional<double> used = meta ? JsonUtils::get_instance()->NumberOpt(*meta, "totalTokens") : std::nullopt;
+
+                    if (!used && update) {
+                        used = JsonUtils::get_instance()->NumberOpt(*update,
+                            kind == "auto_compact_completed" ? "tokens_after"
+                            : kind == "auto_compact_started" ? "tokens_used"
+                            : "total_tokens"); // auto_continue_completed
+                    }
+
+                    if (used) {
+                        context.usedTokens = static_cast<long long>(*used);
+                        haveUsed = true;
+                    }
+                }
+
+                if (haveCompaction || kind.rfind("auto_compact_", 0) != 0) {
+                    continue;
+                }
+
+                // started, completed, failed or cancelled: only the newest counts.
+                haveCompaction = true;
+                const long long at = JsonUtils::get_instance()->UnixSecondsField(root, "timestamp");
+
+                if (kind == "auto_compact_started") {
+                    context.compacting = at <= 0 || nowUnixSeconds - at < kCompactionStaleSeconds;
+                    context.compactionStartedAtUnixSeconds = at;
+                }
+                else if (kind == "auto_compact_completed") {
+                    const std::optional<double> before = JsonUtils::get_instance()->NumberOpt(*update, "tokens_before");
+                    const std::optional<double> after = JsonUtils::get_instance()->NumberOpt(*update, "tokens_after");
+
+                    if (before && after && *before > *after) {
+                        context.compactionPreTokens = static_cast<long long>(*before);
+                        context.compactionSavedTokens = static_cast<long long>(*before - *after);
+                        context.compactionCompletedAtUnixSeconds = at;
+                    }
+                }
+            }
+        }
+
+        // Grok's own /usage session block, condensed
+        // (status_blocks.rs session_usage_block_text).
+        static std::vector<std::string> SessionUsageLines(const Json& session)
+        {
+            const JsonUtils::Client* json = JsonUtils::get_instance();
+            const Format* format = Format::get_instance();
+            const double calls = json->Number(session, "modelCalls");
+
+            if (calls <= 0) {
+                return {};
+            }
+
+            std::vector<std::string> lines = {
+                "Input: " + format->IntegerWithCommas(json->Number(session, "inputTokens")) +
+                    " (" + format->IntegerWithCommas(json->Number(session, "cachedReadTokens")) + " cached)",
+                "Output: " + format->IntegerWithCommas(json->Number(session, "outputTokens")) +
+                    " (" + format->IntegerWithCommas(json->Number(session, "reasoningTokens")) + " reasoning)",
+                "Total: " + format->IntegerWithCommas(json->Number(session, "totalTokens")) + " \xc2\xb7 " +
+                    format->IntegerWithCommas(calls) + (calls == 1 ? " model call" : " model calls"),
+            };
+
+            const std::optional<double> ticks = json->NumberOpt(session, "costUsdTicks");
+            lines.push_back(ticks ? "Cost: " + format->Dollars(*ticks / kTicksPerUsd, 4)
+                : json->Bool(session, "costIsPartial") ? "Cost: not reported for some calls"
+                : "Cost: not reported");
+
+            if (json->Bool(session, "usageIsIncomplete")) {
+                lines.push_back("Incomplete; may under-count");
+            }
+
+            return lines;
+        }
+
+        // Session totals and the latest turn give the average and latest hit.
+        // Grok's input count includes the cached part.
+        static void ApplyCacheStats(const Json& usage, UsageTelemetry::ContextUsage& context)
+        {
+            const JsonUtils::Client* json = JsonUtils::get_instance();
+            const Json* session = json->FindObject(usage, { "session" });
+            const double input = session ? json->Number(*session, "inputTokens") : 0.0;
+
+            if (input <= 0.0) {
+                return;
+            }
+
+            context.cacheStatsValid = true;
+            context.averageCacheHitPercentValid = true;
+            context.averageCacheHitPercent = json->Number(*session, "cachedReadTokens") * 100.0 / input;
+            context.totalCacheInputTokens = static_cast<long long>(input);
+            context.totalCacheReadTokens = static_cast<long long>(json->Number(*session, "cachedReadTokens"));
+            context.totalCacheWriteTokens = static_cast<long long>(json->Number(*session, "cacheCreationTokens"));
+
+            const Json* turns = json->FindArray(usage, { "turns" });
+            const double turnInput = turns && !turns->empty() ? json->Number(turns->back(), "inputTokens") : 0.0;
+
+            if (turnInput > 0.0) {
+                context.latestCacheHitPercentValid = true;
+                context.latestCacheHitPercent = json->Number(turns->back(), "cachedReadTokens") * 100.0 / turnInput;
+                context.cacheInputTokens = static_cast<long long>(turnInput);
+                context.cacheReadTokens = static_cast<long long>(json->Number(turns->back(), "cachedReadTokens"));
+                context.cacheWriteTokens = static_cast<long long>(json->Number(turns->back(), "cacheCreationTokens"));
+            }
+        }
     }
 
     Snapshot FetchSnapshot()
@@ -458,5 +696,65 @@ namespace Grok
         }
 
         return snapshot;
+    }
+
+    LocalSession ReadLocalSession()
+    {
+        LocalSession local;
+        const std::filesystem::path dir = NewestSessionDir(GrokHome() / "sessions");
+
+        if (dir.empty()) {
+            return local;
+        }
+
+        // signals.json and usage.json are written when a turn ends;
+        // updates.jsonl grows while it runs.
+        const Json signals = ReadJson(dir / "signals.json");
+        const Json usage = ReadJson(dir / "usage.json");
+        const Json models = ReadJson(GrokHome() / "models_cache.json");
+        const std::string modelId = JsonUtils::get_instance()->String(ReadJson(dir / "summary.json"), "current_model_id");
+        const Json* model = CachedModel(models, modelId.empty()
+            ? JsonUtils::get_instance()->String(signals, "primaryModelId")
+            : modelId);
+
+        UsageTelemetry::ContextUsage& context = local.context;
+        context.model = model ? JsonUtils::get_instance()->String(*model, "name") : std::string();
+        if (context.model.empty()) {
+            context.model = modelId;
+        }
+
+        // The session's window (256K or 500K, the user's pick), else the model's default.
+        context.contextWindowTokens = static_cast<long long>(JsonUtils::get_instance()->Number(signals, "contextWindowTokens"));
+        if (context.contextWindowTokens <= 0 && model) {
+            context.contextWindowTokens = static_cast<long long>(JsonUtils::get_instance()->Number(*model, "context_window"));
+        }
+
+        context.usedTokens = static_cast<long long>(JsonUtils::get_instance()->Number(signals, "contextTokensUsed", -1.0));
+        ApplyUpdatesTail(Network::get_instance()->ReadFileTail(dir / "updates.jsonl", kUpdatesTailBytes),
+            static_cast<long long>(std::time(nullptr)), context);
+        context.valid = context.usedTokens >= 0 && context.contextWindowTokens > 0;
+        context.sourceLabel = "Newest Grok session \xc2\xb7 direct read-only";
+
+        if (context.valid) {
+            if (const std::optional<int> percent = AutoCompactPercent(model)) {
+                const long long threshold = context.contextWindowTokens * *percent / 100;
+
+                if (threshold > 0) {
+                    context.autoCompactPercentValid = true;
+                    context.autoCompactThresholdTokens = threshold;
+                    context.autoCompactPercentLeft = static_cast<int>(std::clamp(
+                        std::llround(static_cast<double>(threshold - context.usedTokens) * 100.0 / static_cast<double>(threshold)),
+                        0LL, 100LL));
+                }
+            }
+        }
+
+        ApplyCacheStats(usage, context);
+
+        if (const Json* session = JsonUtils::get_instance()->FindObject(usage, { "session" })) {
+            local.usageLines = SessionUsageLines(*session);
+        }
+
+        return local;
     }
 }

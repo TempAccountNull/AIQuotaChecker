@@ -2333,79 +2333,6 @@ namespace Codex {
         return snapshot;
     }
 
-    static std::string ReadTailSharedReadOnly(
-        const std::filesystem::path& path,
-        unsigned long long maximumBytes
-    ) {
-        const std::wstring widePath = path.wstring();
-        HANDLE file = CreateFileW(
-            widePath.c_str(),
-            GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            nullptr,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
-            nullptr
-        );
-
-        if (file == INVALID_HANDLE_VALUE) {
-            return {};
-        }
-
-        LARGE_INTEGER size{};
-
-        if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0) {
-            CloseHandle(file);
-            return {};
-        }
-
-        const unsigned long long fileSize = static_cast<unsigned long long>(size.QuadPart);
-        const unsigned long long readSize = std::min(fileSize, maximumBytes);
-        const unsigned long long start = fileSize - readSize;
-
-        LARGE_INTEGER offset{};
-        offset.QuadPart = static_cast<LONGLONG>(start);
-
-        if (!SetFilePointerEx(file, offset, nullptr, FILE_BEGIN)) {
-            CloseHandle(file);
-            return {};
-        }
-
-        std::string text(static_cast<size_t>(readSize), '\0');
-        size_t totalRead = 0;
-
-        while (totalRead < text.size()) {
-            const DWORD chunkSize = static_cast<DWORD>(std::min<size_t>(
-                text.size() - totalRead,
-                1024 * 1024
-            ));
-            DWORD read = 0;
-
-            if (!ReadFile(file, text.data() + totalRead, chunkSize, &read, nullptr) || read == 0) {
-                break;
-            }
-
-            totalRead += read;
-        }
-
-        CloseHandle(file);
-        text.resize(totalRead);
-
-        // A tail read can start in the middle of one JSONL record. Drop only
-        // that partial first record; the source file is never modified/copied.
-        if (start > 0) {
-            const size_t firstNewline = text.find('\n');
-
-            if (firstNewline == std::string::npos) {
-                return {};
-            }
-
-            text.erase(0, firstNewline + 1);
-        }
-
-        return text;
-    }
-
     static std::filesystem::path LatestCodexSessionFile() {
         const std::filesystem::path sessions = CodexHomePath() / "sessions";
         std::error_code ec;
@@ -2465,7 +2392,7 @@ namespace Codex {
             return lines;
         }
 
-        std::istringstream stream(ReadTailSharedReadOnly(session, 8ULL * 1024ULL * 1024ULL));
+        std::istringstream stream(Network::get_instance()->ReadFileTail(session, 8ULL * 1024ULL * 1024ULL));
 
         for (std::string line; std::getline(stream, line);) {
             if (!line.empty()) {

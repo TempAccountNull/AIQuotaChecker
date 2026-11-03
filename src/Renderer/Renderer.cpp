@@ -2321,10 +2321,14 @@ static void RenderGrokSections(const Grok::Snapshot& snapshot)
         PanelInfoCard("Credits", GrokCreditCardLines(snapshot), "Grok");
         PanelInfoCard("Billing history", snapshot.history, "Grok");
     }
+    if (PanelShows(AppSettings::WidgetSectionCost)) {
+        PanelInfoCard("Session usage", snapshot.sessionUsage, "Grok");
+    }
 
     PanelContextSection(snapshot.context, "Grok");
     PanelBreakdownSection(snapshot.context, "Grok");
     PanelCacheSection(snapshot.context, "Grok");
+    PanelCompactionSection(snapshot.context, "Grok");
     PanelModelSection(snapshot.context, "Grok");
 }
 
@@ -3672,6 +3676,7 @@ static std::vector<WidgetPeek> BuildWidgetPeekCandidates()
 
         addInfo("Grok", "Credits", GrokCreditCardLines(s), plan);
         addInfo("Grok", "Billing history", s.history, plan);
+        addInfo("Grok", "Session usage", s.sessionUsage, plan);
         addCommonInfo("Grok", plan, PlanCardLines("Grok", s.plan, s.statusText), UsageTelemetry::RunUsage{}, s.context);
     }
 

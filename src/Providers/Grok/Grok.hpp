@@ -54,9 +54,20 @@ namespace Grok
         std::vector<ProductUsage> products;
         // Past billing periods, newest first, as display lines.
         std::vector<std::string> history;
+        // The newest session's token and cost totals, as display lines.
+        std::vector<std::string> sessionUsage;
         UsageTelemetry::AccessStatus access;
         UsageTelemetry::ContextUsage context;
     };
 
+    // The newest Grok session as its own files record it.
+    struct LocalSession
+    {
+        UsageTelemetry::ContextUsage context;
+        std::vector<std::string> usageLines;
+    };
+
     Snapshot FetchSnapshot();
+    // Passive and read-only: %GROK_HOME%\sessions plus the models cache.
+    LocalSession ReadLocalSession();
 }
